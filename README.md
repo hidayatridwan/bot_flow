@@ -17,7 +17,7 @@ infrastructure containers.
 | `sidecar` | `sidecar/parser.py` | Python text extractor the worker shells out to. Handles `.pdf` (pypdf), `.txt`, `.md`. |
 | `postgres` | Postgres 16 | Tenants, API keys, document records, conversation history. Row-Level Security enforces tenant isolation. |
 | `qdrant` | Qdrant 1.18 | Vector store. One `documents` collection, partitioned by a `tenant_id` payload index. |
-| `minio` | MinIO (S3 API) | Raw uploaded files, keyed `<tenant_id>/<document_id>`. |
+| `minio` | MinIO (S3 API) | Raw uploaded files, keyed `tenants/{tenant_id}/documents/{document_id}/original.{ext}`. |
 | `rabbitmq` | RabbitMQ 3.13 | Carries MinIO's `ObjectCreated` events on a quorum queue with a dead-letter queue. |
 | `redis` | Redis 7 | Fixed-window per-tenant rate limiting. |
 
