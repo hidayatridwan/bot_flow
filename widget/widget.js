@@ -5,8 +5,6 @@
         mark: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h5.2l6 8.9L8.6 21H3.4l5.3-9L3 3zm10.4 0h5.2l-3.3 5.6-2.6-3.9L13.4 3zm2.6 12.4 2.6 3.9-1.3 1.7h5.2l-4.6-7-1.9 1.4z"/></svg>',
         compose: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4l10-10a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="M14 6l3 3"/></svg>',
         chevron: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>',
-        thumbUp: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M2 10h4v11H2V10zm6 0 4.6-7.6a1.4 1.4 0 0 1 2.6.9L14.4 8H20a2 2 0 0 1 2 2.3l-1.4 8A2 2 0 0 1 18.6 20H8V10z"/></svg>',
-        thumbDown: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M22 14h-4V3h4v11zm-6 0-4.6 7.6a1.4 1.4 0 0 1-2.6-.9L9.6 16H4a2 2 0 0 1-2-2.3l1.4-8A2 2 0 0 1 5.4 4H16v10z"/></svg>',
         send: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="M5 12l7-7 7 7"/></svg>',
     };
 
@@ -51,13 +49,6 @@
         .cw-row-user .cw-bubble{max-width:78%}
         .cw-user{background:var(--cw-user-bg);color:var(--cw-text)}
         .cw-bot{background:var(--cw-bot-bg);white-space:pre-wrap;overflow-wrap:anywhere}
-        .cw-sources{margin-top:6px;font-size:12px;color:var(--cw-muted)}
-        .cw-feedback{display:flex;align-items:center;gap:14px;margin-top:8px;color:var(--cw-muted)}
-        .cw-fb{background:none;border:none;padding:0;cursor:pointer;color:inherit;display:flex}
-        .cw-fb:hover{color:var(--cw-text)}
-        .cw-fb.cw-fb-on{color:var(--cw-text)}
-        .cw-fb-comment{background:none;border:none;padding:0;cursor:pointer;color:var(--cw-text);
-          font:inherit;font-weight:700;font-size:13px}
         #cw-form{display:flex;align-items:center;gap:8px;padding:10px 12px;border-top:1px solid var(--cw-border)}
         #cw-input{flex:1;min-width:0;border:none;background:transparent;padding:8px;
           font:inherit;font-size:14.5px;color:var(--cw-text);outline:none}
@@ -149,11 +140,11 @@
                         answer = this._onEvent(bot, event, data, answer);
                     }
                 }
-                if (answer) this._appendFeedback(bot);
             } catch (err) { bot.textContent = 'Network error: ' + err.message; }
         },
 
         // Dispatch one SSE event; returns the answer accumulated so far.
+        // The server still emits a `sources` event — we ignore it rather than render it.
         _onEvent(bot, event, data, answer) {
             switch (event) {
                 case 'token':
@@ -162,7 +153,6 @@
                     this.log.scrollTop = this.log.scrollHeight;
                     break;
                 case 'conversation': this.conversationId = data; break;
-                case 'sources': this._renderSources(bot, data); break;
                 case 'error': bot.textContent = 'Error: ' + data; break;
             }
             return answer;
@@ -177,32 +167,6 @@
             return { event, data: data.join('\n') };
         },
 
-        _renderSources(bot, data) {
-            let sources; try { sources = JSON.parse(data); } catch { return; }
-            if (!sources.length) return;
-            const d = document.createElement('div'); d.className = 'cw-sources';
-            d.textContent = 'Sources: ' + sources.map(s => `[${s.index}]`).join(' ');
-            d.title = sources.map(s => `[${s.index}] ${(s.text || '').slice(0, 120)}`).join('\n');
-            bot.after(d);
-        },
-
-        // Purely local: no feedback endpoint exists yet.
-        _appendFeedback(bot) {
-            const row = document.createElement('div'); row.className = 'cw-feedback';
-            const up = document.createElement('button'); up.className = 'cw-fb'; up.type = 'button';
-            up.innerHTML = ICONS.thumbUp; up.title = 'Helpful';
-            const down = document.createElement('button'); down.className = 'cw-fb'; down.type = 'button';
-            down.innerHTML = ICONS.thumbDown; down.title = 'Not helpful';
-            for (const [self, other] of [[up, down], [down, up]]) {
-                self.onclick = () => { self.classList.toggle('cw-fb-on'); other.classList.remove('cw-fb-on'); };
-            }
-            const comment = document.createElement('button');
-            comment.className = 'cw-fb-comment'; comment.type = 'button';
-            comment.textContent = 'Leave a comment';
-            comment.onclick = () => { };
-            row.append(up, down, comment);
-            bot.parentElement.appendChild(row);
-        },
     };
     window.ChatWidget = ChatWidget;
 })();

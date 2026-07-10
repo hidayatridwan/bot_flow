@@ -3,18 +3,24 @@
 
 <head>
     <meta charset="utf-8">
-    <title>Acme Support — widget demo</title>
+    <title>Umbrella Support — widget demo</title>
 </head>
 
 <body style="font-family:system-ui;padding:40px;max-width:640px;margin:auto">
-    <h1>Acme Support</h1>
+    <h1>Umbrella Support</h1>
     <p>This page simulates a customer's website embedding the chat widget. The publishable
         key below is safe to expose — it's chat-only and locked to this origin.</p>
-    <script src="widget.js"></script>
+    <!-- Bump the version query whenever the widget changes: browsers cache an unversioned
+         script aggressively, so visitors keep running a stale copy long after a fix ships. -->
+    <script src="widget.js?v=2"></script>
     <script>
         ChatWidget.init({
             apiBase: 'http://localhost:3000',
-            publicKey: 'pk_0a774aeba07d44e0844640df432927526b93840849b44eb0945d41ac7ce580e6'   // the pk_ you minted for acme with origin http://localhost:5500
+            // A publishable key: chat-only, and rejected from any Origin not on its allow-list.
+            // Mint your own -> POST /admin/tenants/{tenant}/keys with
+            //   {"kind":"publishable","allowed_origins":["http://localhost:5500"]}
+            // A 401 here means this key's hash is not in the database (wrong or recreated DB).
+            publicKey: 'pk_cb1c812075f142178c288951131f66da3089832d4b314806b89a5a42aa24fd0f'
         });
     </script>
 </body>

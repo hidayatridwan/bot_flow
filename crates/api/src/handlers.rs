@@ -28,10 +28,13 @@ use std::convert::Infallible;
 /// Qdrant collection name. Hardcoded in Phase 1 — multi-tenancy arrives in Phase 3.
 const COLLECTION: &str = "documents";
 
+// The context passages stay numbered: the numbering is what keeps the model anchored to a specific
+// passage rather than blending them. It just must not surface those numbers to the reader.
 const RAG_SYSTEM_PROMPT: &str = "You are a customer service assistant. Answer the user's question \
-    ONLY using the numbered CONTEXT passages below. After each statement, cite the passage(s) you \
-    used with their bracketed numbers, e.g. [1] or [2][3]. If the answer is not in the context, say \
-    honestly that you don't have that information — do not make anything up. Be concise.";
+    ONLY using the numbered CONTEXT passages below. If the answer is not in the context, say \
+    honestly that you don't have that information — do not make anything up. Be concise. \
+    Write the answer as plain prose: never include citation markers, bracketed numbers, or any \
+    reference to the passage numbers.";
 
 #[derive(serde::Serialize)]
 struct Hit {
@@ -728,6 +731,21 @@ pub async fn mint_key(
             "kind must be 'secret' or 'publishable'",
         ));
     }
+
+    // Without this the INSERT below trips api_keys_tenant_id_fkey and the caller gets an opaque
+    // 500 that says nothing about the actual mistake — a tenant that was never created.
+    let exists = sqlx::query("SELECT 1 FROM tenants WHERE id = $1")
+        .bind(&tenant_id)
+        .fetch_optional(&state.db)
+        .await?
+        .is_some();
+    if !exists {
+        return Err(AppError::client(
+            StatusCode::NOT_FOUND,
+            format!("tenant '{tenant_id}' does not exist; create it first"),
+        ));
+    }
+
     let label = if req.label.is_empty() {
         "default".to_string()
     } else {
