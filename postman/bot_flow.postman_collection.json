@@ -1,0 +1,587 @@
+{
+  "info": {
+    "_postman_id": "bot_flow-collection-0001",
+    "name": "bot_flow",
+    "description": "Multi-tenant RAG chatbot SaaS API.\n\nSet the collection variables first:\n- baseUrl: API base (prod domain or http://localhost:3000)\n- adminKey: the ADMIN_API_KEY (guards /admin/*)\n- apiKey: a SECRET key (sk_...) for ingest/search/documents/ask\n- publicKey: a PUBLISHABLE key (pk_...) for browser/chat (needs an allowed Origin)\n- tenantId: a tenant slug (e.g. acme)\n- uploadUrl: set automatically by Create Upload URL; the presigned PUT target on MinIO :9000\n- documentId: a document_id returned by Create Upload URL\n- conversationId: optional; paste the conversation_id a prior /ask returned to continue that conversation\n\nKey rules: /admin/* needs adminKey. /ingest, /search, /documents (GET+POST) require a SECRET key. /ask + /ask/stream accept secret OR publishable (publishable also requires an allowed Origin header). /health is open.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000",
+      "type": "string"
+    },
+    {
+      "key": "adminKey",
+      "value": "your-admin-api-key",
+      "type": "string"
+    },
+    {
+      "key": "apiKey",
+      "value": "sk_paste_a_secret_key",
+      "type": "string"
+    },
+    {
+      "key": "publicKey",
+      "value": "pk_paste_a_publishable_key",
+      "type": "string"
+    },
+    {
+      "key": "tenantId",
+      "value": "acme",
+      "type": "string"
+    },
+    {
+      "key": "conversationId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "documentId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "uploadUrl",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "auth": {
+          "type": "noauth"
+        },
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Liveness + dependency check (Postgres, Qdrant). No auth."
+      }
+    },
+    {
+      "name": "Admin",
+      "item": [
+        {
+          "name": "Create Tenant",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"umbrella\",\n  \"name\": \"Umbrella Corp\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/admin/tenants",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "tenants"
+              ]
+            },
+            "description": "Create a tenant and mint its first SECRET key (returned once). Requires adminKey."
+          }
+        },
+        {
+          "name": "Mint API Key",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"publishable\",\n  \"label\": \"website-widget\",\n  \"allowed_origins\": [\"http://localhost:5500\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/admin/tenants/{{tenantId}}/keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "tenants",
+                "{{tenantId}}",
+                "keys"
+              ]
+            },
+            "description": "Mint a key for a tenant. kind = \"secret\" or \"publishable\". For publishable, set allowed_origins. Raw key returned once. Requires adminKey."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Documents",
+      "item": [
+        {
+          "name": "Create Upload URL",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"filename\": \"cv-ridwan.pdf\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/documents/upload-url",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "documents",
+                "upload-url"
+              ]
+            },
+            "description": "Mint a presigned PUT. The API never sees the file bytes. Returns 201 {document_id, upload_url, method, expires_at}. Then PUT the file straight at upload_url (no auth header on that request \u2014 the signature IS the authorisation). Only .pdf, .txt and .md are accepted. Requires a SECRET key. Its test script stores upload_url and document_id as collection variables, so 'Upload File to MinIO' can run straight after it."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Stash the presigned URL and id so 'Upload File to MinIO' and 'Refresh Upload URL' just work.",
+                  "if (pm.response.code === 201) {",
+                  "    const d = pm.response.json();",
+                  "    pm.collectionVariables.set('uploadUrl', d.upload_url);",
+                  "    pm.collectionVariables.set('documentId', d.document_id);",
+                  "    console.log('upload_url captured, expires_at =', d.expires_at);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Upload File to MinIO (presigned PUT)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('MinIO accepted the object', () => pm.response.to.have.status(200));",
+                  "pm.test('an ETag came back', () => pm.expect(pm.response.headers.get('ETag')).to.be.ok);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "PUT",
+            "header": [],
+            "body": {
+              "mode": "file",
+              "file": {
+                "src": ""
+              }
+            },
+            "url": {
+              "raw": "{{uploadUrl}}",
+              "host": [
+                "{{uploadUrl}}"
+              ]
+            },
+            "description": "STEP 2 of the upload. Equivalent to:\n    curl -X PUT --upload-file cv-ridwan.pdf \"<upload_url>\"\n\nThis request goes to MinIO on :9000, NOT to the API on :3000. The API never sees the bytes.\n\nBefore sending: open the Body tab (it is set to 'binary') and choose your file. Postman does not save the file path in the collection, so you must pick it once per machine.\n\n{{uploadUrl}} is set automatically by the 'Create Upload URL' request's test script \u2014 run that first and this URL fills itself in.\n\nThree things that will break it:\n  * Body must be 'binary', NOT 'form-data'. form-data wraps your file in a MIME envelope and MinIO stores the envelope, so the worker cannot parse it.\n  * Auth must stay 'No Auth'. The presigned signature lives in the query string; an Authorization header on top of it is rejected.\n  * The URL expires (PRESIGN_TTL_SECS, default 900s). If you get 403 AccessDenied, run 'Refresh Upload URL' rather than minting a new session.\n\nExpect 200 + an ETag. Then poll 'List Documents' until status goes uploading -> processing -> ready."
+          }
+        },
+        {
+          "name": "Refresh Upload URL",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents/{{documentId}}/upload-url",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "documents",
+                "{{documentId}}",
+                "upload-url"
+              ]
+            },
+            "description": "Re-mint a presigned URL for a document still 'uploading' or 'expired'. 404 if it already uploaded, or belongs to another tenant \u2014 the same response either way, so it cannot be used to probe for existence. Requires a SECRET key."
+          }
+        },
+        {
+          "name": "Upload Document (DEPRECATED proxy)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "PDF, TXT, or MD file to ingest"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "documents"
+              ]
+            },
+            "description": "DEPRECATED: proxies the whole file through the API, buffered in memory. Use 'Create Upload URL' instead. Kept only until clients migrate."
+          }
+        },
+        {
+          "name": "List Documents",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "documents"
+              ]
+            },
+            "description": "List this tenant's documents with status (RLS-scoped). Requires a SECRET key."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chat",
+      "item": [
+        {
+          "name": "Search",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"warranty period for electronics\",\n  \"limit\": 3\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/search",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "search"
+              ]
+            },
+            "description": "Raw vector search (debug): returns hits with score/text/document_id. Requires a SECRET key."
+          }
+        },
+        {
+          "name": "Ask",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"how long is the warranty on electronics?\",\n  \"limit\": 3\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/ask",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            },
+            "description": "Turn 1 of a conversation. Send NO conversation_id and the server mints one, returning it as `conversation_id`. The test script captures it into {{conversationId}}.\n\nAn empty string or null is treated the same as omitting the field.\n\nGrounded RAG answer (single JSON) with citations + sources. Accepts a secret OR publishable key. For a publishable key, also send an Origin header matching the key's allowed_origins."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Stash the conversation so 'Ask (continue conversation)' resolves pronouns against it.",
+                  "if (pm.response.code === 200) {",
+                  "    pm.collectionVariables.set('conversationId', pm.response.json().conversation_id);",
+                  "    console.log('conversationId =', pm.collectionVariables.get('conversationId'));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Ask (continue conversation)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"what is his mobile number?\",\n  \"limit\": 3,\n  \"conversation_id\": \"{{conversationId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/ask",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            },
+            "description": "Turn 2+. Passes {{conversationId}}, captured by the 'Ask' request above, so the server rewrites a context-dependent question into a standalone one before retrieval.\n\nRun 'Ask' first (e.g. \"who is ridwan?\"), then this. Without the conversation_id the pronoun \"his\" retrieves nothing and you get 'Sorry, I couldn't find any relevant information.'"
+          }
+        },
+        {
+          "name": "Ask (Stream / SSE)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"query\": \"how long is the warranty on electronics?\",\n  \"limit\": 3\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/ask/stream",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ask",
+                "stream"
+              ]
+            },
+            "description": "Server-Sent Events: a 'conversation' event first (the conversation_id), then 'sources', then incremental 'token' events, then 'done'.\n\nSend no conversation_id to start a new conversation. Postman cannot run a test script against a stream, so copy the id from the first `conversation` event and paste it into the {{conversationId}} collection variable to continue.\n\nAccepts secret OR publishable key (publishable also needs a matching Origin header)."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Dev",
+      "item": [
+        {
+          "name": "Ingest (raw text)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"texts\": [\n    \"The warranty on electronic products is valid for 12 months from the date of purchase.\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/ingest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ingest"
+              ]
+            },
+            "description": "Dev shortcut: synchronously embed + index short raw texts (no file/parse/chunk). Requires a SECRET key."
+          }
+        }
+      ]
+    }
+  ]
+}

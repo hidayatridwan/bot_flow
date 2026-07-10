@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>Acme Support — widget demo</title>
+</head>
+
+<body style="font-family:system-ui;padding:40px;max-width:640px;margin:auto">
+    <h1>Acme Support</h1>
+    <p>This page simulates a customer's website embedding the chat widget. The publishable
+        key below is safe to expose — it's chat-only and locked to this origin.</p>
+    <script src="widget.js"></script>
+    <script>
+        ChatWidget.init({
+            apiBase: 'http://localhost:3000',
+            publicKey: 'pk_0a774aeba07d44e0844640df432927526b93840849b44eb0945d41ac7ce580e6'   // the pk_ you minted for acme with origin http://localhost:5500
+        });
+    </script>
+</body>
+
+</html>
