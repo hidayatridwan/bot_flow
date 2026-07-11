@@ -22,4 +22,5 @@ pub struct AppState {
     pub redis: redis::aio::ConnectionManager,
     pub rate_limit_per_minute: u64,
     pub admin_api_key: String,
+    pub session_ttl_secs: i64,
 }

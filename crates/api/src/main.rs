@@ -1,3 +1,4 @@
+mod accounts;
 mod auth;
 mod config;
 mod conversation;
@@ -15,7 +16,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use anyhow::Context;
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use qdrant_client::Qdrant;
@@ -116,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         redis,
         rate_limit_per_minute: config.rate_limit_per_minute,
         admin_api_key: config.admin_api_key.clone(),
+        session_ttl_secs: config.session_ttl_secs,
     };
 
     // Browsers block cross-origin calls without CORS. We allow any origin here because the REAL
@@ -145,6 +147,18 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::refresh_upload_url),
         )
         .route("/ask/stream", post(handlers::ask_stream))
+        // Self-serve tenant accounts. /register and /login are public (and rate limited); the rest
+        // require a session. The web BFF turns a session into an httpOnly cookie on its own origin —
+        // sessions stay bearer tokens here, so the permissive-CORS/no-cookie reasoning is untouched.
+        .route("/auth/register", post(accounts::register))
+        .route("/auth/login", post(accounts::login))
+        .route("/auth/logout", post(accounts::logout))
+        .route("/auth/me", get(accounts::me))
+        .route(
+            "/auth/keys",
+            get(accounts::list_keys).post(accounts::create_key),
+        )
+        .route("/auth/keys/{key_hash}", delete(accounts::revoke_key))
         .route("/admin/tenants", post(handlers::create_tenant))
         .route("/admin/tenants/{tenant_id}/keys", post(handlers::mint_key))
         .layer(cors)

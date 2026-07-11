@@ -19,7 +19,7 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::upload;
 use common::embedding::EMBEDDING_DIM;
-use sqlx::Row;
+use sqlx::{PgConnection, PgExecutor, Row};
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::{Stream, StreamExt};
@@ -638,6 +638,68 @@ pub async fn list_documents(
     Ok(Json(json!({ "documents": docs })))
 }
 
+/// Insert a fresh API key for a tenant and return the raw key (shown ONCE, only its hash stored).
+/// Shared by the admin `mint_key` and the self-serve `/auth/keys` handler so the two mint paths
+/// cannot drift. Generic over the executor so it works on the pool or inside a transaction.
+pub(crate) async fn insert_api_key<'e, E>(
+    exec: E,
+    tenant_id: &str,
+    kind: &str,
+    label: &str,
+    allowed_origins: &[String],
+) -> Result<String, AppError>
+where
+    E: PgExecutor<'e>,
+{
+    let raw = auth::generate_key(kind);
+    sqlx::query(
+        "INSERT INTO api_keys (key_hash, tenant_id, kind, label, allowed_origins) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(auth::hash_key(&raw))
+    .bind(tenant_id)
+    .bind(kind)
+    .bind(label)
+    .bind(allowed_origins) // &[String] -> text[]
+    .execute(exec)
+    .await?;
+    Ok(raw)
+}
+
+/// Create a tenant row + its initial `sk_` secret key, returning the raw key (shown once).
+/// Shared by `POST /admin/tenants` and `POST /auth/register` so the two provisioning paths can't
+/// drift. Takes a `&mut PgConnection` so a caller that needs atomicity (register: tenant + account
+/// + session in one unit) can hand it a transaction.
+pub(crate) async fn provision_tenant(
+    conn: &mut PgConnection,
+    slug: &str,
+    name: &str,
+) -> Result<String, AppError> {
+    // The slug is interpolated into every object key, and the key is what a presigned URL
+    // authorises. A slug like `a/../b` would escape its own prefix. The DB has the same CHECK;
+    // this exists to return a 400 rather than a 500.
+    if !upload::key::is_valid_slug(slug) {
+        return Err(AppError::client(
+            StatusCode::BAD_REQUEST,
+            "tenant id must match ^[a-z0-9][a-z0-9-]{0,62}$",
+        ));
+    }
+
+    let inserted =
+        sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
+            .bind(slug)
+            .bind(name)
+            .execute(&mut *conn)
+            .await?;
+    if inserted.rows_affected() == 0 {
+        return Err(AppError::client(
+            StatusCode::CONFLICT,
+            "tenant already exists",
+        ));
+    }
+
+    insert_api_key(&mut *conn, slug, "secret", "default", &[]).await
+}
+
 #[derive(Deserialize)]
 pub struct CreateTenantRequest {
     id: String, // human-friendly slug, e.g. "umbrella"
@@ -649,36 +711,8 @@ pub async fn create_tenant(
     State(state): State<AppState>,
     Json(req): Json<CreateTenantRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    // The slug is interpolated into every object key, and the key is what a presigned URL
-    // authorises. A slug like `a/../b` would escape its own prefix. The DB has the same CHECK;
-    // this exists to return a 400 rather than a 500.
-    if !upload::key::is_valid_slug(&req.id) {
-        return Err(AppError::client(
-            StatusCode::BAD_REQUEST,
-            "tenant id must match ^[a-z0-9][a-z0-9-]{0,62}$",
-        ));
-    }
-
-    let inserted =
-        sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
-            .bind(&req.id)
-            .bind(&req.name)
-            .execute(&state.db)
-            .await?;
-    if inserted.rows_affected() == 0 {
-        return Err(AppError::client(
-            StatusCode::CONFLICT,
-            "tenant already exists",
-        ));
-    }
-
-    // Mint an initial secret key. Raw key shown ONCE; only its hash is stored.
-    let raw = auth::generate_key("secret");
-    sqlx::query("INSERT INTO api_keys (key_hash, tenant_id, kind, label) VALUES ($1, $2, 'secret', 'default')")
-        .bind(auth::hash_key(&raw))
-        .bind(&req.id)
-        .execute(&state.db)
-        .await?;
+    let mut conn = state.db.acquire().await?;
+    let raw = provision_tenant(&mut conn, &req.id, &req.name).await?;
 
     Ok((
         StatusCode::CREATED,
@@ -729,21 +763,18 @@ pub async fn mint_key(
     }
 
     let label = if req.label.is_empty() {
-        "default".to_string()
+        "default"
     } else {
-        req.label.clone()
+        &req.label
     };
 
-    let raw = auth::generate_key(&req.kind);
-    sqlx::query(
-        "INSERT INTO api_keys (key_hash, tenant_id, kind, label, allowed_origins) VALUES ($1, $2, $3, $4, $5)",
+    let raw = insert_api_key(
+        &state.db,
+        &tenant_id,
+        &req.kind,
+        label,
+        &req.allowed_origins,
     )
-    .bind(auth::hash_key(&raw))
-    .bind(&tenant_id)
-    .bind(&req.kind)
-    .bind(&label)
-    .bind(&req.allowed_origins) // Vec<String> -> text[]
-    .execute(&state.db)
     .await?;
 
     Ok((

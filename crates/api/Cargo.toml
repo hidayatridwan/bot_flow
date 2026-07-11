@@ -23,6 +23,7 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
+argon2 = { workspace = true }
 futures-util = "0.3"
 eventsource-stream = "0.2"
 async-stream = "0.3"

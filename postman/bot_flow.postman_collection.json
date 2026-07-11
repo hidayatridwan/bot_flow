@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "bot_flow-collection-0001",
     "name": "bot_flow",
-    "description": "Multi-tenant RAG chatbot SaaS API.\n\nSet the collection variables first:\n- baseUrl: API base (prod domain or http://localhost:3000)\n- adminKey: the ADMIN_API_KEY (guards /admin/*)\n- apiKey: a SECRET key (sk_...) for ingest/search/documents/ask\n- publicKey: a PUBLISHABLE key (pk_...) for browser/chat (needs an allowed Origin)\n- tenantId: a tenant slug (e.g. acme)\n- uploadUrl: set automatically by Create Upload URL; the presigned PUT target on MinIO :9000\n- documentId: a document_id returned by Create Upload URL\n- conversationId: optional; paste the conversation_id a prior /ask returned to continue that conversation\n\nKey rules: /admin/* needs adminKey. /ingest, /search, /documents (GET+POST) require a SECRET key. /ask + /ask/stream accept secret OR publishable (publishable also requires an allowed Origin header). /health is open.",
+    "description": "Multi-tenant RAG chatbot SaaS API.\n\nSet the collection variables first:\n- baseUrl: API base (prod domain or http://localhost:3000)\n- adminKey: the ADMIN_API_KEY (guards /admin/*)\n- apiKey: a SECRET key (sk_...) for ingest/search/documents/ask\n- publicKey: a PUBLISHABLE key (pk_...) for browser/chat (needs an allowed Origin)\n- sessionToken: a login session (sess_...) for the /auth/* routes; set automatically by Register / Login\n- keyHash: set automatically by List Keys; the target of Revoke Key\n- tenantId: a tenant slug (e.g. acme); set automatically by Register / Create Tenant\n- uploadUrl: set automatically by Create Upload URL; the presigned PUT target on MinIO :9000\n- documentId: a document_id returned by Create Upload URL\n- conversationId: optional; paste the conversation_id a prior /ask returned to continue that conversation\n\nTwo ways to onboard a tenant: Admin > Create Tenant (needs adminKey), or Auth > Register (self-serve, no admin key). Both return the first sk_ once.\n\nKey rules: /admin/* needs adminKey. /auth/register + /auth/login are public (rate-limited); the other /auth/* routes need a sessionToken. /ingest, /search, /documents (GET+POST) require a SECRET key. /ask + /ask/stream accept secret OR publishable (publishable also requires an allowed Origin header). /health is open.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -43,6 +43,16 @@
     },
     {
       "key": "uploadUrl",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "sessionToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "keyHash",
       "value": "",
       "type": "string"
     }
@@ -177,6 +187,287 @@
       ]
     },
     {
+      "name": "Auth (self-serve)",
+      "item": [
+        {
+          "name": "Register (self-serve)",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"owner@acme.test\",\n  \"password\": \"correct horse battery staple\",\n  \"tenant_name\": \"Acme\",\n  \"slug\": \"acme\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "register"
+              ]
+            },
+            "description": "Self-serve signup: creates a tenant + owner account + session in one transaction, and returns the first SECRET key ONCE. No admin key. Rate-limited. 'slug' is optional (derived from tenant_name when omitted). The test script captures session_token, tenant_id and the one-time api_key."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// session_token and the sk_ are shown once here. Capture both now.",
+                  "if (pm.response.code === 201) {",
+                  "    const d = pm.response.json();",
+                  "    pm.collectionVariables.set('sessionToken', d.session_token);",
+                  "    pm.collectionVariables.set('tenantId', d.tenant_id);",
+                  "    pm.collectionVariables.set('apiKey', d.api_key);",
+                  "    console.log('session + apiKey captured for tenant', d.tenant_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Login",
+          "request": {
+            "auth": {
+              "type": "noauth"
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"owner@acme.test\",\n  \"password\": \"correct horse battery staple\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Verify email + password, get a fresh session. Never re-reveals an API key. A wrong email and a wrong password return the SAME 401 (no account-existence oracle). Rate-limited per email. The test script captures session_token."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const d = pm.response.json();",
+                  "    pm.collectionVariables.set('sessionToken', d.session_token);",
+                  "    pm.collectionVariables.set('tenantId', d.tenant_id);",
+                  "    console.log('session captured for tenant', d.tenant_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Me",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{sessionToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "me"
+              ]
+            },
+            "description": "The account (email) + tenant (id, name) behind the current session. Used by the web app to hydrate the logged-in user."
+          }
+        },
+        {
+          "name": "List Keys",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{sessionToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "keys"
+              ]
+            },
+            "description": "This tenant's API keys as METADATA only (kind, label, allowed_origins, created_at, key_hash) — never the raw key. The test script captures the newest key's key_hash into {{keyHash}} so Revoke Key can target it."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const keys = pm.response.json().keys || [];",
+                  "    if (keys.length) {",
+                  "        pm.collectionVariables.set('keyHash', keys[0].key_hash);",
+                  "        console.log('keyHash captured (newest key):', keys[0].kind, keys[0].label);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Key (self-serve)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{sessionToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"publishable\",\n  \"label\": \"website-widget\",\n  \"allowed_origins\": [\n    \"http://localhost:5500\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/keys",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "keys"
+              ]
+            },
+            "description": "Mint a key for your own tenant with a session instead of the admin key — the dashboard equivalent of Admin > Mint API Key. kind = 'secret' or 'publishable'. Raw key returned once."
+          }
+        },
+        {
+          "name": "Revoke Key",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{sessionToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/keys/{{keyHash}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "keys",
+                "{{keyHash}}"
+              ]
+            },
+            "description": "Revoke one of this tenant's keys by its key_hash (run List Keys first to populate {{keyHash}}). Scoped to your tenant, so you can only revoke your own keys. 204 on success, 404 if the hash isn't yours."
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{sessionToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/auth/logout",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "logout"
+              ]
+            },
+            "description": "Ends the current session (deletes just this token, not all of the account's sessions). 204."
+          }
+        }
+      ]
+    },
+    {
       "name": "Documents",
       "item": [
         {
@@ -218,7 +509,7 @@
                 "upload-url"
               ]
             },
-            "description": "Mint a presigned PUT. The API never sees the file bytes. Returns 201 {document_id, upload_url, method, expires_at}. Then PUT the file straight at upload_url (no auth header on that request \u2014 the signature IS the authorisation). Only .pdf, .txt and .md are accepted. Requires a SECRET key. Its test script stores upload_url and document_id as collection variables, so 'Upload File to MinIO' can run straight after it."
+            "description": "Mint a presigned PUT. The API never sees the file bytes. Returns 201 {document_id, upload_url, method, expires_at}. Then PUT the file straight at upload_url (no auth header on that request — the signature IS the authorisation). Only .pdf, .txt and .md are accepted. Requires a SECRET key. Its test script stores upload_url and document_id as collection variables, so 'Upload File to MinIO' can run straight after it."
           },
           "event": [
             {
@@ -270,7 +561,7 @@
                 "{{uploadUrl}}"
               ]
             },
-            "description": "STEP 2 of the upload. Equivalent to:\n    curl -X PUT --upload-file cv-ridwan.pdf \"<upload_url>\"\n\nThis request goes to MinIO on :9000, NOT to the API on :3000. The API never sees the bytes.\n\nBefore sending: open the Body tab (it is set to 'binary') and choose your file. Postman does not save the file path in the collection, so you must pick it once per machine.\n\n{{uploadUrl}} is set automatically by the 'Create Upload URL' request's test script \u2014 run that first and this URL fills itself in.\n\nThree things that will break it:\n  * Body must be 'binary', NOT 'form-data'. form-data wraps your file in a MIME envelope and MinIO stores the envelope, so the worker cannot parse it.\n  * Auth must stay 'No Auth'. The presigned signature lives in the query string; an Authorization header on top of it is rejected.\n  * The URL expires (PRESIGN_TTL_SECS, default 900s). If you get 403 AccessDenied, run 'Refresh Upload URL' rather than minting a new session.\n\nExpect 200 + an ETag. Then poll 'List Documents' until status goes uploading -> processing -> ready."
+            "description": "STEP 2 of the upload. Equivalent to:\n    curl -X PUT --upload-file cv-ridwan.pdf \"<upload_url>\"\n\nThis request goes to MinIO on :9000, NOT to the API on :3000. The API never sees the bytes.\n\nBefore sending: open the Body tab (it is set to 'binary') and choose your file. Postman does not save the file path in the collection, so you must pick it once per machine.\n\n{{uploadUrl}} is set automatically by the 'Create Upload URL' request's test script — run that first and this URL fills itself in.\n\nThree things that will break it:\n  * Body must be 'binary', NOT 'form-data'. form-data wraps your file in a MIME envelope and MinIO stores the envelope, so the worker cannot parse it.\n  * Auth must stay 'No Auth'. The presigned signature lives in the query string; an Authorization header on top of it is rejected.\n  * The URL expires (PRESIGN_TTL_SECS, default 900s). If you get 403 AccessDenied, run 'Refresh Upload URL' rather than minting a new session.\n\nExpect 200 + an ETag. Then poll 'List Documents' until status goes uploading -> processing -> ready."
           }
         },
         {
@@ -299,7 +590,7 @@
                 "upload-url"
               ]
             },
-            "description": "Re-mint a presigned URL for a document still 'uploading' or 'expired'. 404 if it already uploaded, or belongs to another tenant \u2014 the same response either way, so it cannot be used to probe for existence. Requires a SECRET key."
+            "description": "Re-mint a presigned URL for a document still 'uploading' or 'expired'. 404 if it already uploaded, or belongs to another tenant — the same response either way, so it cannot be used to probe for existence. Requires a SECRET key."
           }
         },
         {

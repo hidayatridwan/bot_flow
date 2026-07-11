@@ -26,6 +26,9 @@ pub struct Config {
     pub rate_limit_per_minute: u64,
     pub app_database_url: String,
     pub admin_api_key: String,
+    /// How long a login session stays valid, in seconds. Bound into the sessions.expires_at
+    /// computed at mint time; there is no refresh — an expired token means log in again.
+    pub session_ttl_secs: i64,
 }
 
 impl Config {
@@ -82,6 +85,12 @@ impl Config {
             app_database_url: std::env::var("APP_DATABASE_URL")
                 .context("APP_DATABASE_URL is not set")?,
             admin_api_key: std::env::var("ADMIN_API_KEY").context("ADMIN_API_KEY is not set")?,
+            // 30 days. Long enough that a dashboard user isn't nagged; short enough that a
+            // stolen token rots. Session rows outlive this until a login/logout touches them.
+            session_ttl_secs: std::env::var("SESSION_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2_592_000),
         })
     }
 }

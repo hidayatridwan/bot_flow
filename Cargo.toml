@@ -26,3 +26,6 @@ tokio-reactor-trait = "1"
 futures-lite = "2"
 rust-s3 = { version = "0.37", default-features = false, features = ["tokio-rustls-tls"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid"] }
+# Password hashing for self-serve tenant accounts (Argon2id). `std` pulls the getrandom-backed
+# OsRng used to draw a per-password salt. api-only, but versioned here so it can't drift.
+argon2 = { version = "0.5", features = ["std"] }

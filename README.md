@@ -60,7 +60,9 @@ Three independent layers, so a single mistake doesn't leak data:
 | `sk_…` | secret | your server only | everything below |
 | `pk_…` | publishable | shipped to browsers | `/ask`, `/ask/stream`, `/search` — and only from an `Origin` on the key's allow-list |
 
-`ADMIN_API_KEY` (an env var, not a database row) guards `/admin/*`.
+`ADMIN_API_KEY` (an env var, not a database row) guards `/admin/*`. A third principal — a **login
+session** (a `sess_` bearer token from `/auth/login`) — authenticates the `/auth/*` dashboard routes;
+see [Self-serve accounts](#self-serve-accounts).
 
 ## Endpoints
 
@@ -69,6 +71,13 @@ Three independent layers, so a single mistake doesn't leak data:
 | `GET` | `/health` | none | Reachability of all five dependencies; `degraded` if any is down |
 | `POST` | `/admin/tenants` | admin key | Creates a tenant, returns its first `sk_` key |
 | `POST` | `/admin/tenants/{tenant_id}/keys` | admin key | Mints a `secret` or `publishable` key |
+| `POST` | `/auth/register` | none | Self-serve: creates a tenant + owner account, returns a session and the first `sk_`. Rate-limited |
+| `POST` | `/auth/login` | none | Verifies email + password, returns a session. Rate-limited per email |
+| `POST` | `/auth/logout` | session | Ends the current session |
+| `GET` | `/auth/me` | session | The account + tenant behind the session |
+| `GET` | `/auth/keys` | session | Lists this tenant's key metadata (never the raw key) |
+| `POST` | `/auth/keys` | session | Self-serve mint of a `secret`/`publishable` key |
+| `DELETE` | `/auth/keys/{key_hash}` | session | Revokes one of this tenant's keys |
 | `POST` | `/documents/upload-url` | secret | `{"filename": "cv.pdf"}` → a presigned PUT. Rate-limited. Returns `201` |
 | `POST` | `/documents/{id}/upload-url` | secret | Re-mint a URL for a document still `uploading` or `expired` |
 | `POST` | `/documents` | secret | **Deprecated** multipart proxy — buffers the file in the API's memory |
@@ -142,13 +151,14 @@ PARSER_PYTHON=sidecar/.venv/bin/python
 PARSER_SCRIPT=sidecar/parser.py
 
 ADMIN_API_KEY=<pick any long random string>
+SESSION_TTL_SECS=2592000         # login session lifetime; default 30 days
 RUST_LOG=info,api=debug
 ```
 
-Only `BIND_ADDR`, `RATE_LIMIT_PER_MINUTE`, `RAG_SCORE_THRESHOLD`, `LLM_MODEL`, `EMBEDDING_BASE_URL`
-(falls back to `LLM_BASE_URL`), `EMBEDDING_MODEL`, `S3_BUCKET`, `S3_REGION` and the two `PARSER_*`
-vars have defaults; everything else — `EMBEDDING_API_KEY` included — is required and the process
-exits at startup if it's missing.
+Only `BIND_ADDR`, `RATE_LIMIT_PER_MINUTE`, `RAG_SCORE_THRESHOLD`, `SESSION_TTL_SECS`, `LLM_MODEL`,
+`EMBEDDING_BASE_URL` (falls back to `LLM_BASE_URL`), `EMBEDDING_MODEL`, `S3_BUCKET`, `S3_REGION` and
+the two `PARSER_*` vars have defaults; everything else — `EMBEDDING_API_KEY` included — is required
+and the process exits at startup if it's missing.
 
 ### 4. Run the two binaries
 
@@ -247,6 +257,42 @@ curl -sX POST localhost:3000/admin/tenants/demo/keys \
   -d '{"kind":"publishable","label":"website","allowed_origins":["http://localhost:5500"]}'
 # {"api_key":"pk_…", …}
 ```
+
+## Self-serve accounts
+
+The admin flow above is the operator escape hatch. A tenant can also **sign up for themselves** — no
+admin key. `POST /auth/register` creates the tenant *and* an owner account (email + password) in one
+transaction, and both paths share the same provisioning code so they can't drift. It hands back a
+**login session** and the tenant's first `sk_` (shown once, exactly like the admin path).
+
+```bash
+# 1. Register. Creates tenant `acme`, an owner account, a session, and the first sk_.
+#    `slug` is optional — omit it and it's derived from tenant_name.
+curl -sX POST localhost:3000/auth/register -H 'content-type: application/json' \
+  -d '{"email":"owner@acme.test","password":"correct horse battery staple","tenant_name":"Acme","slug":"acme"}'
+# {"session_token":"sess_…","tenant_id":"acme","api_key":"sk_…","note":"store the api_key now; …"}
+
+# 2. Log in later to get a fresh session (never re-reveals a key). Wrong email and wrong
+#    password return the SAME 401 — the endpoint won't tell you which emails exist.
+curl -sX POST localhost:3000/auth/login -H 'content-type: application/json' \
+  -d '{"email":"owner@acme.test","password":"correct horse battery staple"}'
+# {"session_token":"sess_…","tenant_id":"acme"}
+
+SESS=sess_…   # the session_token from above
+
+# 3. Self-serve key management — the dashboard equivalent of the admin /keys route.
+curl -s  localhost:3000/auth/me   -H "authorization: Bearer $SESS"   # account + tenant
+curl -s  localhost:3000/auth/keys -H "authorization: Bearer $SESS"   # key metadata (never raw)
+curl -sX POST localhost:3000/auth/keys -H "authorization: Bearer $SESS" -H 'content-type: application/json' \
+  -d '{"kind":"publishable","label":"website","allowed_origins":["http://localhost:5500"]}'
+# {"api_key":"pk_…", …}   ← mint your widget's pk_ without the admin key
+```
+
+Passwords are Argon2id-hashed and session tokens are SHA-256-hashed — like API keys, a database dump
+is not a credential dump. Sessions are **bearer tokens, not cookies**: the browser-facing web app is
+expected to be a thin server (a BFF) that trades a login for an httpOnly cookie on its own origin, so
+the API's permissive-CORS posture is unaffected. `SESSION_TTL_SECS` sets how long a session lasts
+(default 30 days); there is no refresh — an expired session means log in again.
 
 ## Feeding it content
 

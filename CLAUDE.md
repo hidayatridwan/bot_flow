@@ -99,6 +99,18 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     those are the operations that *create* DB rows.
 16. **Internal failure detail never reaches a client.** Unexpected errors are logged in full and
     answered generically. Caller errors describe the caller's mistake and nothing about internals.
+17. **Passwords are Argon2id-hashed; session tokens are SHA-256-hashed. Neither is ever logged.**
+    Same rule as invariant 14, extended from keys to human logins: a database dump is not a
+    credential dump. `accounts` and `sessions` are global tables (no RLS), resolved on the plain pool
+    *before* tenant context exists — a session lookup is what *establishes* that context. A session
+    token carries the `sess_` prefix so it can never be confused with an `sk_`/`pk_` key.
+18. **`/auth/register` and `/auth/login` are the only public credential endpoints, and both are rate
+    limited.** Register is the single path that *creates a tenant* without the admin key, so its cap
+    bounds abuse and `/embeddings` spend; login is a password oracle, throttled per email. Login
+    failures are *uniform* — an unknown email and a wrong password return the identical 401, so the
+    endpoint never reveals which emails exist (the same non-oracle rule as invariant 8). Sessions are
+    Bearer tokens, **never cookies**: the `allow_origin(Any)` reasoning (see Security) depends on
+    there being no cookie/CSRF surface, so the web BFF — not the API — owns any cookie.
 
 ## Tenant isolation — the three layers
 
@@ -168,6 +180,14 @@ writing the code.
 - **`tenant.require_secret()?` is the first line** of any handler that ingests, uploads, lists or
   manages. Present on `/ingest`, `/documents` (both verbs) and the upload-url routes; correctly
   absent on `/ask` and `/ask/stream`; absent **as an outstanding gap** on `/search`.
+- **Two auth principals, do not conflate them.** `AuthTenant` resolves an API key (`sk_`/`pk_`) to a
+  tenant — the *machine* credential (a tenant's server, the widget). `SessionAuth` resolves a
+  `sess_` token to an account + tenant — the *human* credential (the dashboard, the `/auth/*`
+  routes). Both yield a `tenant_id`, so either can drive `db::tenant_tx()` and get RLS unchanged.
+  `/auth/keys` lets a logged-in tenant mint/list/revoke its own keys — the self-serve equivalent of
+  the admin-only `mint_key`; the two share `handlers::provision_tenant` / `insert_api_key` so they
+  cannot drift. Revoke is scoped by `tenant_id` in the `WHERE` clause — that guard, not RLS (api_keys
+  has none), is the isolation boundary for key management.
 - **`allow_origin(Any)` is deliberate. Read this before "fixing" it.** CORS is a *browser* mechanism,
   not a server authorization mechanism — it cannot stop curl. The real check is the publishable key's
   `allowed_origins` list, enforced server-side in `AuthTenant` regardless of what the browser sent.
@@ -186,7 +206,8 @@ writing the code.
 | Routes, CORS layer, RabbitMQ connect | `crates/api/src/main.rs` |
 | Handlers, Qdrant search, SSE stream | `crates/api/src/handlers.rs` |
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
-| `AuthTenant` / `AdminAuth`, `hash_key`, `require_secret` | `crates/api/src/auth.rs` |
+| `AuthTenant` / `AdminAuth` / `SessionAuth`, `hash_key`, `require_secret`, key + session token gen | `crates/api/src/auth.rs` |
+| Self-serve accounts: register / login / logout / me / self-serve key mgmt; Argon2 hashing | `crates/api/src/accounts.rs` |
 | `AppError` and the blanket `From` impl that makes `?` a 500 | `crates/api/src/error.rs` |
 | Env vars and their defaults | `crates/api/src/config.rs` |
 | Worker claim / status machine | `crates/worker/src/lifecycle.rs` |
