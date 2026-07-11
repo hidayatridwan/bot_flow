@@ -12,7 +12,8 @@ dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 qdrant-client = "1.18"
-fastembed = "5"
+# Shared so the api, worker and common agree on one TLS backend and one version.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # v5 = deterministic, name-based ids. The worker derives a Qdrant point id from
 # (document_id, chunk_index) so re-processing overwrites instead of duplicating.
 uuid = { version = "1", features = ["v4", "v5", "serde"] }

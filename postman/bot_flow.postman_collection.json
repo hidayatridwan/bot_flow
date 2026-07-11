@@ -110,8 +110,25 @@
                 "tenants"
               ]
             },
-            "description": "Create a tenant and mint its first SECRET key (returned once). Requires adminKey."
-          }
+            "description": "Create a tenant and mint its first SECRET key (returned once). Requires adminKey. Its test script captures api_key into {{apiKey}} and tenant_id into {{tenantId}} — the key is shown only here, so if you skip this you cannot get it back."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The secret key is returned exactly once. Capture it now or mint a new one later.",
+                  "if (pm.response.code === 201) {",
+                  "    const d = pm.response.json();",
+                  "    pm.collectionVariables.set('apiKey', d.api_key);",
+                  "    pm.collectionVariables.set('tenantId', d.tenant_id);",
+                  "    console.log('apiKey captured for tenant', d.tenant_id);",
+                  "}"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Mint API Key",

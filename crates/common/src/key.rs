@@ -78,7 +78,10 @@ mod tests {
     #[test]
     fn key_round_trips() {
         let key = object_key("acme", &doc(), "pdf");
-        assert_eq!(key, "tenants/acme/documents/7045945d-3a0e-4b69-9749-326871ef7516/original.pdf");
+        assert_eq!(
+            key,
+            "tenants/acme/documents/7045945d-3a0e-4b69-9749-326871ef7516/original.pdf"
+        );
         assert_eq!(parse_key(&key), Some(("acme".to_string(), doc())));
     }
 

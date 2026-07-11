@@ -9,10 +9,13 @@ streamed over SSE.
 > Reach for `cargo`, `sqlx` and `docker compose`.
 
 `crates/api` (Axum HTTP server) · `crates/worker` (RabbitMQ consumer) · `crates/common` (shared
-object-key contract) · `sidecar/` (Python `pypdf` extractor) · `widget/` (vanilla JS, no build step).
+object-key contract **and the embedding client**) · `sidecar/` (Python `pypdf` extractor) ·
+`widget/` (vanilla JS, no build step).
 
-Backing services: Postgres 16, Qdrant, MinIO, RabbitMQ, Redis. Embeddings run locally
-(`MultilingualE5Small`, 384-dim). The LLM is any OpenAI-compatible `/chat/completions` endpoint.
+Backing services: Postgres 16, Qdrant, MinIO, RabbitMQ, Redis. Embeddings are an OpenAI-compatible
+`/embeddings` call (`text-embedding-3-small`, 1536-dim, cosine), authenticated with
+`EMBEDDING_API_KEY` — **a different key from `LLM_API_KEY`**, even when both point at the same
+gateway. The LLM is any OpenAI-compatible `/chat/completions` endpoint.
 
 ## Commands
 
@@ -24,7 +27,7 @@ cargo test                # inline #[cfg(test)] unit tests; no integration suite
 cargo clippy && cargo fmt # stock defaults, no config files
 ```
 
-Rust is pinned to 1.95.0 (`rust-toolchain.toml`). First run downloads ~465 MB of model weights.
+Rust is pinned to 1.95.0 (`rust-toolchain.toml`).
 
 ## Invariants that must never break
 
@@ -54,9 +57,13 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
 5. **The model may only use the passages it is given**, and is forbidden from writing citation
    markers into its prose. The numbering exists for the machine; citations are returned as structured
    data alongside the answer.
-6. **Retrieval depends on asymmetric embedding prefixes.** Stored chunks and questions must be
-   encoded differently. The wrong prefix does not error — it silently degrades retrieval. A
-   correctness rule wearing the costume of a formatting detail.
+6. **Chunks and questions must be embedded by the same model, through the same endpoint.** A
+   collection may never hold vectors from two models: their coordinate spaces are unrelated, so a
+   cosine score across them is noise that still looks like a number. Changing `EMBEDDING_MODEL`
+   invalidates every stored vector. Nothing errors — retrieval silently degrades. A correctness rule
+   wearing the costume of a configuration detail.
+   (`text-embedding-3-small` is *symmetric*: it takes no `passage: ` / `query: ` prefixes. Those were
+   an E5 artifact and were deleted with it. Re-adding them embeds the literal words into every vector.)
 7. **A conversation turn is recorded only once an answer exists.** Otherwise a failed request leaves a
    dangling question, and the next question's rewrite reasons over it.
 8. **An unknown conversation and another tenant's conversation are indistinguishable** — both 404.
@@ -135,14 +142,15 @@ Each of these exists in, or nearly slipped into, this codebase.
 | --- | --- | --- |
 | Remove `tokio-executor-trait` / `tokio-reactor-trait` because they look unused | Leave them | They force `lapin` onto our Tokio runtime, wired in at `Connection::connect`. Without them it spawns a second runtime |
 | Slice text by byte offset | Index over `chars` | Panics on any non-ASCII document — and the model is multilingual |
-| Embed on an async task | `spawn_blocking` (`.await??` — one for the `JoinError`, one for the inner result) | CPU-bound; stalls the whole runtime |
+| Wrap an embedding call in `spawn_blocking` | `.await?` it like any other request | Embedding is a network call now, not local CPU. `spawn_blocking` would park a blocking thread on a socket. The old advice was the exact inverse — it is in the git history, not here |
 | Put `Json` / `Multipart` first in a handler signature | Body extractor **always last** | `FromRequestParts` extractors must precede it. Otherwise you get an opaque `Handler` trait-bound error that says nothing about argument order |
 | `?` on a caller-caused failure | `AppError::client(...)` | A bare `?` **always** yields a 500. Rule of thumb: `?` for what the caller could not have prevented, `AppError::client` for what they could |
 | Return `400` for a bad field value | `422` if the body parsed as JSON | `400` is for a malformed body, unsupported extension, bad `kind`. Pinned by unit tests at the bottom of `handlers.rs` |
 | Renumber `sources[].index` | Leave it 1-based | The model is forbidden from emitting citation markers, so `index` is the *only* way a client maps an answer back to a passage |
 | Guess at an unparseable MinIO event key | Reject it | Keys arrive **percent-encoded** (`tenants%2Facme%2F…`), and a space may be `%20` **or** `+`. It is a schema we do not own |
 | Bulk `UPDATE` across tenants | Loop per tenant | RLS matches zero rows and *reports success* |
-| Version a dep in a member crate | `[workspace.dependencies]` | Two versions of `uuid` or `fastembed` across the binaries produce different ids or different vectors — surfacing as bad search results, not a build error |
+| Version a dep in a member crate | `[workspace.dependencies]` | Two versions of `uuid` across the binaries produce different point ids — surfacing as bad search results, not a build error |
+| Give the api and worker their own embedding code | Both call `common::embedding::EmbeddingClient` | Model name, request shape and `EMBEDDING_DIM` are defined once. Two copies drift, and drift here means the two binaries write vectors the other cannot search |
 | Extend `POST /documents` (multipart) | `POST /documents/upload-url` | Deprecated; buffers whole files in API memory |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
@@ -174,6 +182,7 @@ writing the code.
 | Concern | File |
 | --- | --- |
 | Object-key contract (the upload boundary) — densest tests in the repo | `crates/common/src/key.rs` |
+| Embedding client, `EMBEDDING_DIM`, batching, `EmbedError` — shared by both binaries | `crates/common/src/embedding.rs` |
 | Routes, CORS layer, RabbitMQ connect | `crates/api/src/main.rs` |
 | Handlers, Qdrant search, SSE stream | `crates/api/src/handlers.rs` |
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
@@ -207,8 +216,11 @@ Honest inventory. Each entry states the impact, not merely the fact.
   `POST /documents/upload-url`. It gets deleted along with `crates/api/src/queue.rs` and the worker's
   `consume_legacy` / `LEGACY_QUEUE`. Do not add features to it. Do not add callers.
 - **`/search` accepts publishable (`pk_`) keys and is not rate limited; `/ingest` is also unmetered.**
-  A key printed in a public web page can drive unlimited vector searches. Believed to be an oversight,
-  not a decision — nothing in the code records an intent. Confirm before relying on either behaviour.
+  This was an unmetered-*CPU* oversight while embedding ran locally. It is now an unmetered-**spend**
+  exposure: every search and every question is a billed `/embeddings` call against `EMBEDDING_API_KEY`.
+  A `pk_` key is printed in public page source and is *expected to be stolen* (invariant 15) — the
+  containment for that theft was "it can only ask questions", which no longer bounds the cost. Rate
+  limiting `/search` is a cost control, not a nicety. Still believed an oversight, not a decision.
 - **The isolation guarantee is untested.** No automated test asserts that RLS actually denies a
   cross-tenant read. Invariant 1 is the system's most important promise and it rests on code review
   alone. There is no CI and no integration suite; tests are unit tests over pure functions. Highest-
@@ -219,6 +231,12 @@ Honest inventory. Each entry states the impact, not merely the fact.
   collection and re-indexing every document of every tenant. A **partially** re-indexed collection
   produces quietly degraded retrieval with no error anywhere. Any such change is a migration project,
   not a configuration change.
+  This was paid, not solved, at the `MultilingualE5Small` → `text-embedding-3-small` cutover
+  (384 → 1536 dim): all vectors and all `documents` rows were truncated and re-uploaded. Note the
+  second half of that — `ensure_collection()` **early-returns when the collection exists** and will
+  not rebuild it, and invariant 10 *skips* a redelivered document whose fingerprint is unchanged. So
+  dropping the collection alone leaves it permanently empty, with no error. The document rows must go
+  too. Whoever changes the model next will hit both.
 - The DB permits an `uploaded` document status that **no code path ever assigns**. A vestige. Either
   give it meaning or drop it from the constraint — an unreachable state is a trap for the next reader.
 - **No `.env.example`**, though `.gitignore` expects one. A new contributor reconstructs the required

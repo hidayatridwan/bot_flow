@@ -136,15 +136,19 @@ mod tests {
     #[test]
     fn multipart_completion_is_an_object_created_event() {
         let key = format!("tenants%2Facme%2Fdocuments%2F{DOC}%2Foriginal.pdf");
-        assert!(parse(&body("s3:ObjectCreated:CompleteMultipartUpload", &key))
-            .unwrap()
-            .is_some());
+        assert!(
+            parse(&body("s3:ObjectCreated:CompleteMultipartUpload", &key))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
     fn non_creation_events_are_ignored_not_errors() {
         let key = format!("tenants%2Facme%2Fdocuments%2F{DOC}%2Foriginal.pdf");
-        assert!(parse(&body("s3:ObjectRemoved:Delete", &key)).unwrap().is_none());
+        assert!(parse(&body("s3:ObjectRemoved:Delete", &key))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

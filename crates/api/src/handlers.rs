@@ -15,10 +15,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::conversation;
-use crate::embedding;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::upload;
+use common::embedding::EMBEDDING_DIM;
 use sqlx::Row;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -50,9 +50,10 @@ pub async fn ensure_collection(qdrant: &Qdrant) -> anyhow::Result<()> {
         return Ok(());
     }
     qdrant
-        .create_collection(CreateCollectionBuilder::new(COLLECTION).vectors_config(
-            VectorParamsBuilder::new(embedding::EMBEDDING_DIM, Distance::Cosine),
-        ))
+        .create_collection(
+            CreateCollectionBuilder::new(COLLECTION)
+                .vectors_config(VectorParamsBuilder::new(EMBEDDING_DIM, Distance::Cosine)),
+        )
         .await
         .context("failed to create collection")?;
 
@@ -67,8 +68,7 @@ pub async fn ensure_collection(qdrant: &Qdrant) -> anyhow::Result<()> {
         .context("failed to create tenant_id index")?;
 
     tracing::info!(
-        "collection '{COLLECTION}' created (dim={}, cosine) + tenant_id index",
-        embedding::EMBEDDING_DIM
+        "collection '{COLLECTION}' created (dim={EMBEDDING_DIM}, cosine) + tenant_id index"
     );
     Ok(())
 }
@@ -117,13 +117,7 @@ pub async fn ingest(
     Json(req): Json<IngestRequest>, // FromRequest — consumes body, MUST be last
 ) -> Result<Json<Value>, AppError> {
     tenant.require_secret()?;
-    let embedder = state.embedder.clone();
-    let texts = req.texts.clone();
-    let vectors = tokio::task::spawn_blocking(move || {
-        let mut model = embedder.lock().expect("embedder lock poisoned");
-        embedding::embed_passages(&mut model, &texts)
-    })
-    .await??;
+    let vectors = state.embedder.embed_batch(&req.texts).await?;
 
     // Global UUID IDs: required since going multi-tenant, otherwise points across tenants
     // overwrite each other. tenant_id goes into the payload → becomes the mandatory filter on reads (Step 3).
@@ -169,13 +163,7 @@ pub async fn search(
     tenant: AuthTenant, // FromRequestParts — reads headers, no body
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let embedder = state.embedder.clone();
-    let query = req.query.clone();
-    let vector = tokio::task::spawn_blocking(move || {
-        let mut model = embedder.lock().expect("embedder lock poisoned");
-        embedding::embed_query(&mut model, &query)
-    })
-    .await??;
+    let vector = state.embedder.embed_one(&req.query).await?;
 
     let response = state
         .qdrant
@@ -473,13 +461,7 @@ async fn retrieve(
     query: &str,
     limit: u64,
 ) -> Result<Vec<Hit>, AppError> {
-    let embedder = state.embedder.clone();
-    let query_owned = query.to_string();
-    let vector = tokio::task::spawn_blocking(move || {
-        let mut model = embedder.lock().expect("embedder lock poisoned");
-        embedding::embed_query(&mut model, &query_owned)
-    })
-    .await??;
+    let vector = state.embedder.embed_one(query).await?;
 
     let response = state
         .qdrant
@@ -815,8 +797,9 @@ mod tests {
 
     #[test]
     fn a_real_uuid_is_carried_through() {
-        let req = parse(r#"{"query":"q","conversation_id":"7045945d-3a0e-4b69-9749-326871ef7516"}"#)
-            .unwrap();
+        let req =
+            parse(r#"{"query":"q","conversation_id":"7045945d-3a0e-4b69-9749-326871ef7516"}"#)
+                .unwrap();
         assert_eq!(
             req.conversation_id,
             Some(uuid::Uuid::parse_str("7045945d-3a0e-4b69-9749-326871ef7516").unwrap())

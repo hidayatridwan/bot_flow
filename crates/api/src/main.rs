@@ -2,7 +2,6 @@ mod auth;
 mod config;
 mod conversation;
 mod db;
-mod embedding;
 mod error;
 mod handlers;
 mod llm;
@@ -11,7 +10,7 @@ mod rate_limit;
 mod state;
 mod storage;
 mod upload;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use anyhow::Context;
@@ -27,6 +26,7 @@ use crate::config::Config;
 use crate::llm::LlmClient;
 use crate::state::AppState;
 use axum::extract::DefaultBodyLimit;
+use common::embedding::EmbeddingClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -65,8 +65,6 @@ async fn main() -> anyhow::Result<()> {
 
     handlers::ensure_collection(&qdrant).await?;
 
-    tracing::info!("loading embedding model (the first download may take a while)...");
-
     let redis = redis::Client::open(config.redis_url.clone())
         .context("invalid REDIS_URL")?
         .get_connection_manager()
@@ -95,15 +93,16 @@ async fn main() -> anyhow::Result<()> {
     let amqp = amqp_conn.create_channel().await?;
     tracing::info!("RabbitMQ channel ready");
 
-    let embedder = tokio::task::spawn_blocking(embedding::init_embedder)
-        .await
-        .context("model loading task panicked")??;
-    tracing::info!("embedding model ready");
-
     let state = AppState {
         db,
         qdrant: Arc::new(qdrant),
-        embedder: Arc::new(Mutex::new(embedder)),
+        // No connection is made here. A bad key or an unreachable endpoint surfaces on the first
+        // question, not at boot.
+        embedder: EmbeddingClient::new(
+            config.embedding_base_url.clone(),
+            config.embedding_api_key.clone(),
+            config.embedding_model.clone(),
+        ),
         llm: LlmClient::new(
             config.llm_base_url.clone(),
             config.llm_api_key.clone(),

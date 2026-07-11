@@ -1,15 +1,11 @@
-# Secrets — .env holds LLM_API_KEY, ADMIN_API_KEY and the database/broker passwords.
-# Commit .env.example instead, with the values blanked out.
+# Secrets — .env holds LLM_API_KEY, EMBEDDING_API_KEY, ADMIN_API_KEY and the database/broker
+# passwords. Commit .env.example instead, with the values blanked out.
 .env
 .env.*
 !.env.example
 
 # Rust build output. ~6.7 GB here; fully reproducible from Cargo.toml + Cargo.lock.
 /target
-
-# Embedding model weights, downloaded on first run by fastembed (~465 MB).
-# Both binaries recreate this cache automatically.
-.fastembed_cache/
 
 # Python sidecar virtualenv. Rebuilt with:
 #   python3 -m venv sidecar/.venv && sidecar/.venv/bin/pip install -r sidecar/requirements.txt

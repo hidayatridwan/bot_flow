@@ -1,12 +1,11 @@
 mod chunk;
-mod embedding;
 mod event;
 mod lifecycle;
 mod parser;
 mod reaper;
 
 use anyhow::Context;
-use fastembed::TextEmbedding;
+use common::embedding::{EmbedError, EmbeddingClient};
 use futures_lite::StreamExt;
 use lapin::{
     options::{
@@ -23,7 +22,7 @@ use qdrant_client::Qdrant;
 use s3::{creds::Credentials, Bucket, Region};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Exchange MinIO publishes bucket notifications to. It does NOT declare the queue, so the
@@ -43,7 +42,7 @@ const COLLECTION: &str = "documents";
 struct Ctx {
     bucket: Box<Bucket>,
     qdrant: Qdrant,
-    embedder: Arc<Mutex<TextEmbedding>>,
+    embedder: EmbeddingClient,
     db: PgPool,
     max_upload_bytes: i64,
 }
@@ -72,16 +71,20 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to build Qdrant client")?;
     tracing::info!("Qdrant client ready");
 
-    tracing::info!("loading embedding model (first run downloads it)...");
-    let embedder = tokio::task::spawn_blocking(embedding::init_embedder)
-        .await
-        .context("model load task panicked")??;
-    tracing::info!("embedding model ready");
+    // Must agree with the API's client, or the two write vectors the other cannot search. Both read
+    // the same three vars, and both fall back to LLM_BASE_URL for the endpoint but never for the key.
+    let embedder = EmbeddingClient::new(
+        std::env::var("EMBEDDING_BASE_URL")
+            .or_else(|_| std::env::var("LLM_BASE_URL"))
+            .context("neither EMBEDDING_BASE_URL nor LLM_BASE_URL is set")?,
+        std::env::var("EMBEDDING_API_KEY").context("EMBEDDING_API_KEY not set")?,
+        std::env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "text-embedding-3-small".to_string()),
+    );
 
     let ctx = Arc::new(Ctx {
         bucket,
         qdrant,
-        embedder: Arc::new(Mutex::new(embedder)),
+        embedder,
         db: db.clone(),
         max_upload_bytes: std::env::var("MAX_UPLOAD_BYTES")
             .ok()
@@ -223,11 +226,21 @@ async fn declare_topology(channel: &Channel) -> anyhow::Result<()> {
         ..Default::default()
     };
     channel
-        .exchange_declare(EVENTS_EXCHANGE, ExchangeKind::Direct, durable, FieldTable::default())
+        .exchange_declare(
+            EVENTS_EXCHANGE,
+            ExchangeKind::Direct,
+            durable,
+            FieldTable::default(),
+        )
         .await
         .context("failed to declare events exchange")?;
     channel
-        .exchange_declare(DLX_EXCHANGE, ExchangeKind::Fanout, durable, FieldTable::default())
+        .exchange_declare(
+            DLX_EXCHANGE,
+            ExchangeKind::Fanout,
+            durable,
+            FieldTable::default(),
+        )
         .await
         .context("failed to declare dead-letter exchange")?;
 
@@ -368,9 +381,15 @@ async fn handle(ctx: &Ctx, body: &[u8]) -> Result<(), Failure> {
         return Ok(());
     }
 
-    match lifecycle::claim(&ctx.db, &obj.tenant_id, obj.document_id, obj.size, &obj.etag)
-        .await
-        .map_err(Retryable)?
+    match lifecycle::claim(
+        &ctx.db,
+        &obj.tenant_id,
+        obj.document_id,
+        obj.size,
+        &obj.etag,
+    )
+    .await
+    .map_err(Retryable)?
     {
         lifecycle::Claim::Skip(why) => {
             tracing::info!("skipping {}: {why}", obj.document_id);
@@ -403,7 +422,16 @@ async fn finish(
             let msg = format!("{e:#}");
             // Record the failure, but keep the error for the nack + delivery-limit machinery.
             let _ = lifecycle::mark_failed(&ctx.db, tenant_id, document_id, &msg).await;
-            Err(Retryable(e))
+            // Fatal acks, which destroys the document; Retryable dead-letters it after the delivery
+            // limit, which preserves it. So only a document that can never embed is Fatal — a bad
+            // EMBEDDING_API_KEY is the operator's problem, not the document's. See EmbedError::is_fatal.
+            if e.downcast_ref::<EmbedError>()
+                .is_some_and(EmbedError::is_fatal)
+            {
+                Err(Fatal(e))
+            } else {
+                Err(Retryable(e))
+            }
         }
     }
 }
@@ -477,14 +505,8 @@ async fn ingest(
         chunks.len()
     );
 
-    // Embedding is blocking CPU work -> spawn_blocking so the async runtime isn't stalled.
-    let embedder = ctx.embedder.clone();
-    let to_embed = chunks.clone();
-    let vectors = tokio::task::spawn_blocking(move || {
-        let mut model = embedder.lock().expect("embedder lock poisoned");
-        embedding::embed_passages(&mut model, &to_embed)
-    })
-    .await??;
+    // Batched internally: a large document is more chunks than one request may carry.
+    let vectors = ctx.embedder.embed_batch(&chunks).await?;
 
     // Drop whatever a previous attempt left behind. Deterministic ids alone would overwrite
     // chunks 0..n, but a re-parse yielding FEWER chunks would strand the old tail.
@@ -547,4 +569,3 @@ mod tests {
         assert_ne!(point_id(&doc, 0), point_id(&other, 0));
     }
 }
-

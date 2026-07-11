@@ -13,7 +13,7 @@ infrastructure containers.
 | --- | --- | --- |
 | `api` | `crates/api` — Axum HTTP server on `:3000` | Auth, tenant/key admin, uploads, retrieval, LLM answering (incl. SSE streaming). Runs DB migrations at startup. |
 | `worker` | `crates/worker` — RabbitMQ consumer | Consumes MinIO `ObjectCreated` events: verifies the object, parses, chunks, embeds, upserts into Qdrant, drives the document lifecycle. Also runs the reaper. |
-| `common` | `crates/common` | The object-key contract shared by API and worker, so the writer and reader can't drift apart. |
+| `common` | `crates/common` | Shared by API and worker so the two can't drift apart: the object-key contract, and the embedding client (`EmbeddingClient`, `EMBEDDING_DIM`). |
 | `sidecar` | `sidecar/parser.py` | Python text extractor the worker shells out to. Handles `.pdf` (pypdf), `.txt`, `.md`. |
 | `postgres` | Postgres 16 | Tenants, API keys, document records, conversation history. Row-Level Security enforces tenant isolation. |
 | `qdrant` | Qdrant 1.18 | Vector store. One `documents` collection, partitioned by a `tenant_id` payload index. |
@@ -33,9 +33,10 @@ admits it doesn't know → persist the turn.
 ## Tech stack
 
 - **Rust 1.95** (pinned in `rust-toolchain.toml`), Tokio, Axum 0.8, SQLx 0.8, lapin, rust-s3
-- **Embeddings**: [fastembed](https://github.com/Anush008/fastembed-rs) running
-  `MultilingualE5Small` locally — 384-dim, cosine. No embedding API calls, no per-token cost.
-  E5 requires prefixes, so stored chunks are embedded as `passage: …` and questions as `query: …`.
+- **Embeddings**: any OpenAI-compatible `/embeddings` endpoint, running `text-embedding-3-small` —
+  1536-dim, cosine. Symmetric, so chunks and questions are embedded verbatim with no prefixes.
+  **Every ingested chunk and every question is a billed API call**, authenticated with
+  `EMBEDDING_API_KEY` — separate from `LLM_API_KEY` even when both point at the same gateway.
 - **LLM**: any OpenAI-compatible `/chat/completions` endpoint. Defaults to Gemini via its
   OpenAI compatibility layer.
 - **Chunking**: 800 characters with 100 characters of overlap, UTF-8 safe.
@@ -84,8 +85,9 @@ A ready-made Postman collection lives in [postman/](postman/).
 
 ## Running locally
 
-**Prerequisites:** Docker, Rust (the toolchain file pins 1.95), Python 3, and an API key for
-any OpenAI-compatible LLM.
+**Prerequisites:** Docker, Rust (the toolchain file pins 1.95), Python 3, an API key for any
+OpenAI-compatible LLM, and an API key for any OpenAI-compatible `/embeddings` endpoint. The two
+may be the same gateway, but they are two separate keys.
 
 ### 1. Start the infrastructure
 
@@ -117,11 +119,15 @@ RABBITMQ_URL=amqp://bot_flow:bot_flow@localhost:5672/%2f
 REDIS_URL=redis://localhost:6379
 BIND_ADDR=0.0.0.0:3000
 RATE_LIMIT_PER_MINUTE=60
-RAG_SCORE_THRESHOLD=0.70        # cosine floor for a chunk to count as relevant
+RAG_SCORE_THRESHOLD=0.35        # cosine floor; a starting point for text-embedding-3-small — retune from logs (see note below)
 
 LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 LLM_API_KEY=<your key>
 LLM_MODEL=gemini-2.5-flash-lite
+
+EMBEDDING_BASE_URL=https://ai.sumopod.com/v1  # defaults to LLM_BASE_URL if unset
+EMBEDDING_API_KEY=<your embedding key>        # a DIFFERENT key from LLM_API_KEY
+EMBEDDING_MODEL=text-embedding-3-small        # changing this invalidates every stored vector
 
 S3_ENDPOINT=http://localhost:9000        # what the API and worker use internally
 S3_PUBLIC_ENDPOINT=http://localhost:9000 # what CLIENTS connect to; signed into presigned URLs
@@ -139,25 +145,78 @@ ADMIN_API_KEY=<pick any long random string>
 RUST_LOG=info,api=debug
 ```
 
-Only `BIND_ADDR`, `RATE_LIMIT_PER_MINUTE`, `RAG_SCORE_THRESHOLD`, `LLM_MODEL`, `S3_BUCKET`,
-`S3_REGION` and the two `PARSER_*` vars have defaults; everything else is required and the
-process exits at startup if it's missing.
+Only `BIND_ADDR`, `RATE_LIMIT_PER_MINUTE`, `RAG_SCORE_THRESHOLD`, `LLM_MODEL`, `EMBEDDING_BASE_URL`
+(falls back to `LLM_BASE_URL`), `EMBEDDING_MODEL`, `S3_BUCKET`, `S3_REGION` and the two `PARSER_*`
+vars have defaults; everything else — `EMBEDDING_API_KEY` included — is required and the process
+exits at startup if it's missing.
 
 ### 4. Run the two binaries
 
 ```bash
 cargo run -p api        # terminal 1 — migrates, creates the bucket + collection, serves :3000
-cargo run -p worker     # terminal 2 — consumes ingest_jobs
+cargo run -p worker     # terminal 2 — consumes MinIO upload events (document_events)
 ```
 
-The **first run of each downloads the embedding model** before it starts serving, so give it
-a minute; afterwards it's cached. The API creates the Qdrant collection and the MinIO bucket
-on boot, and both are idempotent.
+The API creates the Qdrant collection and the MinIO bucket on boot, and both are idempotent. Nothing
+is downloaded at startup — both binaries instead reach `EMBEDDING_BASE_URL` on every ingested chunk
+and every question, so an unreachable endpoint or a bad `EMBEDDING_API_KEY` surfaces on first use,
+not at boot.
+
+> **Upgrading from a `MultilingualE5Small` checkout?** Those vectors are 384-dim and the collection is
+> never rebuilt in place — see [Cutover from the local embedding model](#cutover-from-the-local-embedding-model).
 
 ```bash
 curl localhost:3000/health
 # {"status":"ok","postgres":true,"qdrant":true,"redis":true,"rabbitmq":true,"minio":true}
 ```
+
+### Cutover from the local embedding model
+
+Only if you have an existing checkout that indexed documents with `MultilingualE5Small`. A fresh
+install needs none of this.
+
+Those vectors are 384-dim; the new ones are 1536-dim. `ensure_collection()` **early-returns when the
+collection already exists**, so it will not rebuild it — the old collection survives the restart and
+every upsert fails on a dimension mismatch.
+
+Dropping the collection is not enough on its own. A document whose fingerprint is unchanged is
+*skipped* on redelivery (that is what makes redelivery safe), so document rows left at status
+`indexed` mean the worker never re-embeds anything and the collection stays **empty forever, with no
+error anywhere**. The rows have to go too.
+
+With both binaries stopped:
+
+```bash
+# 1. Drop the 384-dim collection.
+curl -X DELETE http://localhost:6333/collections/documents
+
+# 2. Truncate the tenant-scoped tables so the documents become re-ingestible.
+#    As the migration superuser (DATABASE_URL): under RLS this would match zero rows and
+#    report success. Leave `tenants` and `api_keys` alone — that is the tenancy registry,
+#    and truncating it invalidates every key you have minted.
+psql "$DATABASE_URL" -c 'TRUNCATE messages, conversations, documents;'
+```
+
+Then start `cargo run -p api` and confirm it logs `dim=1536`. It recreates the collection with the
+`tenant_id` keyword index *before* any ingest can happen — that ordering is load-bearing, because
+adding the index after data exists does not retroactively restructure Qdrant's HNSW graph. Re-upload
+your documents afterwards.
+
+### Resetting the data
+
+[scripts/reset.sh](scripts/reset.sh) wipes every store back to empty — Postgres, MinIO, Qdrant and
+Redis — for a clean-slate dev run. It leaves `_sqlx_migrations` and the MinIO bucket's event binding
+intact, so the API still boots and uploads still notify the worker.
+
+```bash
+./scripts/reset.sh              # full wipe (incl. tenants + api_keys); prompts for confirmation
+./scripts/reset.sh -y           # same, no prompt
+./scripts/reset.sh --keep-auth  # keep tenants + api_keys, wipe only documents/conversations/messages
+```
+
+It drops the Qdrant collection rather than recreating it, so **restart `cargo run -p api` afterwards**
+(watch for the `dim=1536` log) — the collection is reborn correctly, with its tenant index, only at
+startup. A full wipe also invalidates your `sk_`/`pk_` keys; re-create a tenant to mint new ones.
 
 ### Local dashboards
 
@@ -316,9 +375,15 @@ If nothing clears `RAG_SCORE_THRESHOLD` (default `0.70`), the API returns a cann
 relevant information" rather than letting the model guess. The retrieval scores are logged on
 every request, so compare them against the floor before assuming retrieval is broken.
 
-Don't raise the floor to `0.80` — `MultilingualE5Small` scores a chunk that verbatim answers the
-question at roughly `0.78–0.86`, so `0.80` rejects correct passages. Tune it against your own logged
-scores.
+> **The compiled default is `0.70`, which is wrong for `text-embedding-3-small`** — the `.env` above
+> already overrides it to `0.35`. `0.70` was tuned for `MultilingualE5Small`, which scored a
+> verbatim-matching chunk around `0.78–0.86`; `text-embedding-3-small` scores materially lower (a
+> verbatim CV match lands near `0.53`, noise near `0.27`). Left at `0.70`, the bot refuses every
+> question — and it does so **silently**, because refusing when nothing clears the floor is the
+> designed behaviour, not an error. A system that knows nothing looks exactly like one that works.
+>
+> `0.35` is only a starting point. Set it from your own data: ingest a document, ask a question you
+> know it answers, read the logged retrieval scores, and put the floor just below them.
 
 ## The event pipeline
 
@@ -364,7 +429,7 @@ the last 10 messages, asks the LLM to rewrite your question into a standalone on
 
 ```
 "What is his mobile number?"  ->  "What is Ridwan Hidayat's mobile number?"
-       cosine 0.79 (rejected)              cosine 0.86 (retrieved)
+     scores below the floor              clears the floor, retrieved
 ```
 
 Omit `conversation_id` and the server mints one, returning it in the response body (`/ask`) or as the
