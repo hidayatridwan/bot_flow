@@ -180,6 +180,37 @@ curl localhost:3000/health
 # {"status":"ok","postgres":true,"qdrant":true,"redis":true,"rabbitmq":true,"minio":true}
 ```
 
+### 5. Run the web dashboard (optional)
+
+A SvelteKit app in `web/`. It is a **BFF**, not a static frontend: the browser never talks to the API
+on :3000, and never holds a session token.
+
+```bash
+cd web
+cp .env.example .env    # API_BASE_URL=http://localhost:3000
+bun install
+bun run dev             # http://localhost:5173
+```
+
+Its own `.env` is separate from the root one and holds **no secrets** — just where to find the API.
+Sign up at `/signup`; you land on a page that shows your `sk_` exactly once. See
+[`doc/feature/phase-2-web-auth.md`](doc/feature/phase-2-web-auth.md) for the design.
+
+```bash
+bun run test            # 42 unit tests: the validation mirror, the error map, the api client
+bun run check           # svelte-check, strict
+```
+
+Why the session lives in a cookie on :5173 and not in the browser's JavaScript: the API is
+deliberately cookie-free (that is what makes its permissive CORS safe), so SvelteKit exchanges the
+login for an `httpOnly` cookie on **its own** origin and forwards it to the API as
+`Authorization: Bearer` from the server. An XSS on the dashboard therefore cannot read the token.
+
+`web/src/lib/features/auth/schema.ts` mirrors the Rust validators in TypeScript — the password
+minimum is counted in **bytes**, like `String::len`, and the slug regex is the one from
+`common::key::is_valid_slug`. If it ever drifts, the form calls something valid that the API then
+rejects with a 422, so `schema.test.ts` ports the Rust unit tests verbatim to hold the two in step.
+
 ### Cutover from the local embedding model
 
 Only if you have an existing checkout that indexed documents with `MultilingualE5Small`. A fresh
@@ -287,6 +318,10 @@ curl -sX POST localhost:3000/auth/keys -H "authorization: Bearer $SESS" -H 'cont
   -d '{"kind":"publishable","label":"website","allowed_origins":["http://localhost:5500"]}'
 # {"api_key":"pk_…", …}   ← mint your widget's pk_ without the admin key
 ```
+
+The same flow through a browser is the `web/` dashboard — see
+[Run the web dashboard](#5-run-the-web-dashboard-optional). Sessions are Bearer tokens here and
+**never cookies**; the cookie is the web app's business, on the web app's origin.
 
 Passwords are Argon2id-hashed and session tokens are SHA-256-hashed — like API keys, a database dump
 is not a credential dump. Sessions are **bearer tokens, not cookies**: the browser-facing web app is

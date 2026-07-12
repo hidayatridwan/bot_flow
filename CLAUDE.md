@@ -111,6 +111,30 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     endpoint never reveals which emails exist (the same non-oracle rule as invariant 8). Sessions are
     Bearer tokens, **never cookies**: the `allow_origin(Any)` reasoning (see Security) depends on
     there being no cookie/CSRF surface, so the web BFF — not the API — owns any cookie.
+19. **The uniform login failure must stay uniform in the UI.** Invariant 18 buys the non-oracle
+    property at the API; the web app can hand it straight back. Under the *email* field, "invalid
+    email or password" reads as *this email is wrong*; under *password*, as *this email exists, but
+    the password is wrong*. So a login 401 is **form-level, always** — `error-map.ts` returns no
+    field for it, and `error-map.test.ts` pins that. The two register **409s** are the mirror case:
+    they share a status and are told apart **only** by their message, and they must land on
+    different fields. An invariant is not enforced where it is written; it is enforced where it is
+    displayed.
+20. **The browser never holds a session token.** `web/` is a BFF: the `sess_` token lives in an
+    `httpOnly` cookie on the *web* origin and is forwarded to the API as `Authorization: Bearer`
+    from the server. `locals.session.token` is therefore never returned from a `load` — `locals`
+    keeps the credential (`session`) and the identity (`user`) in separate fields precisely so a
+    careless `return { user }` cannot leak it. The API itself stays cookie-free, which is what keeps
+    invariant 18's CORS reasoning sound.
+21. **An API outage is not a logout.** `hooks.server.ts` deletes the session cookie on a **401**
+    only. A 5xx or an unreachable API leaves the cookie in place and merely renders the visitor as
+    logged out for that request — otherwise a thirty-second blip silently signs out every user, and
+    they cannot tell a dead session from a dead backend. This is the whole reason `ApiError.kind`
+    distinguishes `client` / `server` / `transport` instead of just carrying a status.
+22. **The one-time `sk_` shown at register is unrecoverable.** It reaches its reveal page in a
+    5-minute `httpOnly` flash cookie that is read *and deleted* in the same request — never a query
+    param (browser history, `Referer`, access logs) and never `localStorage`. Refreshing that page
+    therefore loses the key, which is correct: it mirrors the API's own promise rather than papering
+    over it. `POST /auth/keys` is the recovery path.
 
 ## Tenant isolation — the three layers
 
@@ -216,6 +240,11 @@ writing the code.
 | Reaper — `UPLOAD_GRACE` and `PROCESSING_LEASE` are named constants; read them there | `crates/worker/src/reaper.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |
 | Embeddable widget | `widget/widget.js` |
+| Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |
+| Typed API client: `ApiResult`, the JSON-vs-`text/plain` split, timeouts | `web/src/lib/server/api/` |
+| Session + one-time-key cookies; the route guard | `web/src/lib/server/auth/` |
+| Login-401 and the two register-409s → which field (invariant 19) | `web/src/lib/features/auth/error-map.ts` |
+| The TS mirror of the Rust validators — drift here 422s the user | `web/src/lib/features/auth/schema.ts` |
 | Migrations — forward-only, run at API startup on the admin pool, which is then closed | `crates/api/migrations/` |
 
 ## Known state & debt

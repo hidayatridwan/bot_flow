@@ -172,21 +172,20 @@ the same commit,"* implementation must land these in CLAUDE.md alongside the cod
   `/auth/*` + the tenant's own key. Extending `SessionAuth` onto data routes is a clean phase-3 step
   once the account model is proven.
 
-## Web integration (phase 2 — sketch only)
+## Web integration (phase 2)
 
-The API stays cookie-free; SvelteKit is a **BFF** that turns a login into an httpOnly cookie on its
-own origin, so the browser never holds the token and the API's CORS posture is untouched.
+**Designed in full in [`phase-2-web-auth.md`](./phase-2-web-auth.md).** Not implemented.
 
-- Add a `(auth)` route group: `/login`, `/register` pages (shadcn `card`/`form`/`label`/`input` —
-  `input` exists, `card`/`form`/`label` need `shadcn-svelte add`).
-- `+page.server.ts` **form actions** call the API `/auth/login|register`, then `cookies.set('session',
-  token, { httpOnly, secure, sameSite:'lax' })`.
-- `hooks.server.ts`: read the cookie, call `GET /auth/me`, populate `event.locals.{account,tenant}`.
-  Define `App.Locals` in `web/src/app.d.ts` (currently commented out).
-- `(tenant)/+layout.server.ts`: redirect to `/login` when `locals` is empty — guards the group.
-- Logout action: `POST /auth/logout` + `cookies.delete` — wire the dead "Log out" item in
-  `nav-user.svelte`; feed real `{ name, email }` from `locals` instead of the hardcoded `shadcn`.
-- Introduce an `API_BASE_URL` env var in `web/` (none exists today) for the server-side fetch.
+The shape, in one paragraph: the API stays cookie-free; SvelteKit is a **BFF** that turns a login into
+an httpOnly cookie on its own origin and forwards it to the API as `Authorization: Bearer`, so the
+browser never holds the token and the CORS posture of invariant 18 is untouched. `hooks.server.ts`
+resolves the cookie through `GET /auth/me` into `event.locals`; `+layout.server.ts` guards the
+authenticated route group; form actions drive `/auth/register|login|logout`.
+
+Read the phase-2 doc before touching `web/` — it pins the details that are easy to get wrong: the two
+**409s** that share a status and must land on different fields, the login **401** that must stay
+form-level (rendering it under a field rebuilds the account-enumeration oracle this phase deliberately
+destroyed), and the one-time `sk_` reveal, which is unrecoverable if the BFF drops it.
 
 ## Implementation order
 

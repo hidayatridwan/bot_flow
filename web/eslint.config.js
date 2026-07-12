@@ -1,15 +1,16 @@
 import prettier from 'eslint-config-prettier';
-import path from 'node:path';
 import js from '@eslint/js';
 import svelte from 'eslint-plugin-svelte';
-import { defineConfig, includeIgnoreFile } from 'eslint/config';
+import { defineConfig } from 'eslint/config';
 import globals from 'globals';
 import ts from 'typescript-eslint';
 
-const gitignorePath = path.resolve(import.meta.dirname, '.gitignore');
-
 export default defineConfig(
-	includeIgnoreFile(gitignorePath),
+	// This used to be `includeIgnoreFile(path.resolve(import.meta.dirname, '.gitignore'))`, but this
+	// repo keeps a single .gitignore at the workspace root — so eslint threw on a file that was never
+	// there, and linted nothing. includeIgnoreFile only works with an ignore file beside the config,
+	// so the patterns are listed here rather than duplicating the root .gitignore into web/.
+	{ ignores: ['.svelte-kit/', 'build/', 'node_modules/'] },
 	js.configs.recommended,
 	ts.configs.recommended,
 	svelte.configs.recommended,
@@ -32,6 +33,19 @@ export default defineConfig(
 				parser: ts.parser
 			}
 		}
+	},
+	{
+		// shadcn-svelte generates these and `shadcn-svelte add` overwrites them. They are not ours to
+		// hand-edit, so they are not ours to lint — linting them only tempts someone into editing them.
+		files: ['src/lib/components/ui/**'],
+		rules: { 'svelte/no-navigation-without-resolve': 'off' }
+	},
+	{
+		// The sidebar nav is still mock data: every item is a placeholder `href="#"` with nothing
+		// behind it. resolve() cannot type a route that does not exist. Drop this override as each
+		// section gets a real route.
+		files: ['src/lib/components/nav-main.svelte', 'src/lib/components/nav-projects.svelte'],
+		rules: { 'svelte/no-navigation-without-resolve': 'off' }
 	},
 	{
 		// Override or add rule settings here, such as:
