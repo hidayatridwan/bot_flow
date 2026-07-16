@@ -61,8 +61,14 @@ Three independent layers, so a single mistake doesn't leak data:
 | `pk_…` | publishable | shipped to browsers | `/ask`, `/ask/stream`, `/search` — and only from an `Origin` on the key's allow-list |
 
 `ADMIN_API_KEY` (an env var, not a database row) guards `/admin/*`. A third principal — a **login
-session** (a `sess_` bearer token from `/auth/login`) — authenticates the `/auth/*` dashboard routes;
-see [Self-serve accounts](#self-serve-accounts).
+session** (a `sess_` bearer token from `/auth/login`) — authenticates the `/auth/*` dashboard routes
+*and* the document-management routes; see [Self-serve accounts](#self-serve-accounts).
+
+A session is accepted wherever an `sk_` is, **except** `/ingest` and the deprecated multipart
+`POST /documents`. It is never accepted in place of a `pk_`'s chat-only limits: a publishable key is
+printed in public page source and stays chat-only, which is the whole reason it is safe to print.
+The dashboard has no key to present — the one-time `sk_` is unrecoverable by design — so the session
+is the only credential it holds.
 
 ## Endpoints
 
@@ -78,10 +84,10 @@ see [Self-serve accounts](#self-serve-accounts).
 | `GET` | `/auth/keys` | session | Lists this tenant's key metadata (never the raw key) |
 | `POST` | `/auth/keys` | session | Self-serve mint of a `secret`/`publishable` key |
 | `DELETE` | `/auth/keys/{key_hash}` | session | Revokes one of this tenant's keys |
-| `POST` | `/documents/upload-url` | secret | `{"filename": "cv.pdf"}` → a presigned PUT. Rate-limited. Returns `201` |
-| `POST` | `/documents/{id}/upload-url` | secret | Re-mint a URL for a document still `uploading` or `expired` |
+| `POST` | `/documents/upload-url` | secret **or** session | `{"filename": "cv.pdf"}` → a presigned PUT. Rate-limited. Returns `201` |
+| `POST` | `/documents/{id}/upload-url` | secret **or** session | Re-mint a URL for a document still `uploading` or `expired`. Only safe for *the same file* — see the note below |
 | `POST` | `/documents` | secret | **Deprecated** multipart proxy — buffers the file in the API's memory |
-| `GET` | `/documents` | secret | Lists this tenant's documents and their status |
+| `GET` | `/documents` | secret **or** session | Lists this tenant's documents and their status |
 | `POST` | `/ingest` | secret | `{"texts": [...]}` — indexes raw strings, skipping the upload pipeline |
 | `POST` | `/search` | any key | `{"query": "…", "limit": 3}` — returns raw scored chunks, no LLM |
 | `POST` | `/ask` | any key | Retrieval + LLM answer as one JSON blob. Rate-limited |
@@ -193,23 +199,39 @@ bun run dev             # http://localhost:5173
 ```
 
 Its own `.env` is separate from the root one and holds **no secrets** — just where to find the API.
-Sign up at `/signup`; you land on a page that shows your `sk_` exactly once. See
-[`doc/feature/phase-2-web-auth.md`](doc/feature/phase-2-web-auth.md) for the design.
+Sign up at `/signup`; you land on a page that shows your `sk_` exactly once. Then `/documents` lists
+your library and uploads to it. See [`doc/feature/`](doc/feature/) for the design of each phase.
 
 ```bash
-bun run test            # 42 unit tests: the validation mirror, the error map, the api client
+bun run test            # 89 unit tests: the validation mirrors, the error maps, the api client
 bun run check           # svelte-check, strict
 ```
+
+**Run the worker too** if you want uploads to reach `Ready` — the dashboard shows
+`Uploading → Processing → Ready` by polling, but it is the worker that does the indexing.
 
 Why the session lives in a cookie on :5173 and not in the browser's JavaScript: the API is
 deliberately cookie-free (that is what makes its permissive CORS safe), so SvelteKit exchanges the
 login for an `httpOnly` cookie on **its own** origin and forwards it to the API as
 `Authorization: Bearer` from the server. An XSS on the dashboard therefore cannot read the token.
 
-`web/src/lib/features/auth/schema.ts` mirrors the Rust validators in TypeScript — the password
-minimum is counted in **bytes**, like `String::len`, and the slug regex is the one from
-`common::key::is_valid_slug`. If it ever drifts, the form calls something valid that the API then
-rejects with a 422, so `schema.test.ts` ports the Rust unit tests verbatim to hold the two in step.
+**Uploading from the browser does not contradict that.** The bytes go from the browser *straight to
+MinIO on :9000*, never through SvelteKit or the API. What the browser receives is a presigned URL,
+which authorises one object key, one method, for 15 minutes — a capability, not a credential. The
+session stays in Node. This is also why uploading is the one page that requires JavaScript: a
+multipart `<form>` would proxy the file through Node, which is exactly the deprecated
+`POST /documents` route rebuilt one layer up. Reading the list still works without JS.
+
+Two TypeScript files mirror Rust validators, and both drift into the same failure — the form accepts
+something the API then rejects:
+
+- `web/src/lib/features/auth/schema.ts` — the password minimum is counted in **bytes**, like
+  `String::len`, and the slug regex is `common::key::is_valid_slug`.
+- `web/src/lib/features/documents/schema.ts` — `extensionOf` mirrors `common::key::extension_of`,
+  which is `Path::extension()` and **not** `split('.').pop()`: `.pdf` is a dotfile with *no*
+  extension and must be rejected, while `..pdf` has one.
+
+Both `schema.test.ts` files port the Rust unit tests verbatim to hold the two languages in step.
 
 ### Cutover from the local embedding model
 
@@ -361,6 +383,11 @@ curl -s localhost:3000/documents -H "authorization: Bearer $SK"
 
 # If the URL expired before you uploaded, refresh it. Do NOT mint a new session —
 # that would orphan the document row you already created.
+#
+# Refresh re-signs the row's EXISTING object key, whose extension was fixed when the row
+# was created — it takes no filename and revalidates nothing. So upload the SAME file you
+# asked for. Refresh a `handbook.pdf` row and then PUT a .md, and the bytes land at
+# `original.pdf`; the parser dispatches on that suffix, and a perfectly good file fails.
 curl -sX POST localhost:3000/documents/$document_id/upload-url -H "authorization: Bearer $SK"
 
 # Or skip files entirely and index raw strings:

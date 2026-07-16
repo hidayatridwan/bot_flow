@@ -469,6 +469,12 @@ commit"*, the implementation commit must also:
   `keys.ts` API module and a `features/keys/` slice; no change to the plumbing.
 - **Documents** — list, upload via `POST /documents/upload-url`, status. Needs `empty` for the
   zero-documents state.
+  **Shipped in phase 3** — see [`phase-3-documents.md`](./phase-3-documents.md). The prediction above
+  held exactly: `client.ts`, `parse.ts`, `ApiResult`, the cookies and `hooks.server.ts` were all
+  untouched, and the slice was additive. Two things this doc did not foresee: the API had to change
+  first (`/documents` would not accept a session, and the BFF has no key to offer instead), and the
+  upload path is the app's **first route with no form action** — the bytes go browser → MinIO
+  directly, so there is nothing to progressively enhance towards.
 - **Chat** — the `/ask/stream` SSE surface.
 - **Not backed by any API, and the mockup lies about them:** OAuth ("Login with Apple/Google"), password
   reset ("Forgot your password?"), team switching, and everything under the sidebar's nav. They stay as

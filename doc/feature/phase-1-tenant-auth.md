@@ -171,6 +171,12 @@ the same commit,"* implementation must land these in CLAUDE.md alongside the cod
   *Recommend:* phase 1 keeps those on `AuthTenant` (keys); the dashboard reads documents via
   `/auth/*` + the tenant's own key. Extending `SessionAuth` onto data routes is a clean phase-3 step
   once the account model is proven.
+  **Resolved in phase 3** — see [`phase-3-documents.md`](./phase-3-documents.md). The recommendation
+  held for the document-management routes and was taken; `/search` and `/ask` stay key-only, since a
+  `pk_` is meant to reach those. Note the *"the dashboard reads documents via the tenant's own key"*
+  half turned out to be impossible: the BFF never has a key. The one-time `sk_` is unrecoverable by
+  design (invariant 22) and `GET /auth/keys` returns hashes, so the session is the only credential the
+  dashboard holds. A new `Actor` union principal resolves it.
 
 ## Web integration (phase 2)
 

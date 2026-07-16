@@ -4,14 +4,16 @@
 	import BotIcon from '@lucide/svelte/icons/bot';
 	import ChartPieIcon from '@lucide/svelte/icons/chart-pie';
 	import CommandIcon from '@lucide/svelte/icons/command';
+	import FileTextIcon from '@lucide/svelte/icons/file-text';
 	import FrameIcon from '@lucide/svelte/icons/frame';
 	import GalleryVerticalEndIcon from '@lucide/svelte/icons/gallery-vertical-end';
 	import MapIcon from '@lucide/svelte/icons/map';
 	import Settings2Icon from '@lucide/svelte/icons/settings-2';
 	import SquareTerminalIcon from '@lucide/svelte/icons/square-terminal';
 
-	// This is sample data. `user` now comes from the session (see the `user` prop below); the teams,
-	// nav and projects below are still mocked — nothing backs them yet.
+	// This is sample data. `user` now comes from the session (see the `user` prop below), and
+	// Documents in `navOverview` is a real route — the teams, projects and every remaining `#` are
+	// still mocked. Nothing backs them yet.
 	const data = {
 		teams: [
 			{
@@ -30,7 +32,20 @@
 				plan: 'Free'
 			}
 		],
-		navMain: [
+		navOverview: [
+			{
+				title: 'Documents',
+				url: '/documents',
+				icon: FileTextIcon
+			},
+			{
+				title: 'Playground',
+				url: '#',
+				icon: SquareTerminalIcon,
+				isActive: true
+			}
+		],
+		navCore: [
 			{
 				title: 'Playground',
 				url: '#',
@@ -159,7 +174,8 @@
 		<TeamSwitcher teams={data.teams} />
 	</Sidebar.Header>
 	<Sidebar.Content>
-		<NavMain items={data.navMain} />
+		<NavMain items={data.navOverview} />
+		<NavMain items={data.navCore} />
 		<NavProjects projects={data.projects} />
 	</Sidebar.Content>
 	<Sidebar.Footer>

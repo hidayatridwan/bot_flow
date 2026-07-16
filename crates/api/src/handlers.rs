@@ -1,4 +1,4 @@
-use crate::auth::{self, AdminAuth, AuthTenant};
+use crate::auth::{self, Actor, AdminAuth, AuthTenant};
 use crate::queue::{self, IngestJob};
 use crate::rate_limit;
 use anyhow::Context;
@@ -327,16 +327,18 @@ pub struct UploadUrlRequest {
 /// sees them, which is the entire point of the endpoint.
 pub async fn create_upload_url(
     State(state): State<AppState>,
-    tenant: AuthTenant,
+    actor: Actor,
     Json(req): Json<UploadUrlRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    tenant.require_secret()?;
-    rate_limit::check(&state, &tenant.tenant_id).await?;
+    actor.require_management()?;
+    // Keyed on the tenant, not the credential: spend is per tenant, so a dashboard upload and an
+    // `sk_` upload draw on the same bucket.
+    rate_limit::check(&state, &actor.tenant_id).await?;
 
     let session = upload::create_session(
         &state.db,
         &state.s3_public,
-        &tenant.tenant_id,
+        &actor.tenant_id,
         &req.filename,
         state.presign_ttl_secs,
     )
@@ -356,16 +358,16 @@ pub async fn create_upload_url(
 /// Re-mint a URL whose TTL lapsed before the client finished uploading.
 pub async fn refresh_upload_url(
     State(state): State<AppState>,
-    tenant: AuthTenant,
+    actor: Actor,
     Path(document_id): Path<uuid::Uuid>,
 ) -> Result<Json<Value>, AppError> {
-    tenant.require_secret()?;
-    rate_limit::check(&state, &tenant.tenant_id).await?;
+    actor.require_management()?;
+    rate_limit::check(&state, &actor.tenant_id).await?;
 
     let session = upload::refresh_session(
         &state.db,
         &state.s3_public,
-        &tenant.tenant_id,
+        &actor.tenant_id,
         document_id,
         state.presign_ttl_secs,
     )
@@ -609,10 +611,13 @@ pub async fn ask_stream(
 
 pub async fn list_documents(
     State(state): State<AppState>,
-    tenant: AuthTenant,
+    actor: Actor,
 ) -> Result<Json<Value>, AppError> {
-    tenant.require_secret()?;
-    let mut tx = crate::db::tenant_tx(&state.db, &tenant.tenant_id).await?;
+    actor.require_management()?;
+    // The dashboard reads this with a `sess_`; a tenant's own server reads it with an `sk_`. Both
+    // yield the same tenant_id, so RLS below is identical either way — it is keyed on the string,
+    // not on how the string was obtained.
+    let mut tx = crate::db::tenant_tx(&state.db, &actor.tenant_id).await?;
     // Note: NO `WHERE tenant_id` — RLS scopes this to the current tenant automatically.
     // That's the whole point: forgetting the filter can't leak other tenants' rows.
     let rows = sqlx::query(

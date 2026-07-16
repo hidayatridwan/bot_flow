@@ -1,5 +1,6 @@
 import type { NumericRange } from '@sveltejs/kit';
 import type { ApiError } from '$lib/types/api';
+import { GENERIC, RATE_LIMITED, UNREACHABLE } from '$lib/utils/api-copy';
 
 /** Every field an auth error can land on. `null` means the form itself, not an input. */
 export type AuthField = 'name' | 'slug' | 'email' | 'password';
@@ -8,10 +9,6 @@ export interface MappedError {
 	field: AuthField | null;
 	message: string;
 }
-
-const GENERIC = 'Something went wrong. Please try again.';
-const UNREACHABLE = "We couldn't reach the service. Please try again in a moment.";
-const RATE_LIMITED = 'Too many attempts. Please wait a minute and try again.';
 
 /** `fail()` needs a 4xx/5xx. A transport failure has status 0, which is not one. */
 export function toFailStatus(error: ApiError): NumericRange<400, 599> {

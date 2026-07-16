@@ -97,6 +97,9 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     an allow-listed `Origin`. A `pk_` key is *expected* to be stolen — that containment is the whole
     design. `/admin/*` is guarded by `ADMIN_API_KEY` (a deployment secret, not a DB row) because
     those are the operations that *create* DB rows.
+    The management gate has since widened to admit a *session* (invariant 23) — it has **never**
+    widened for `pk_`, and must not. Widening it there deletes the containment above, which is the
+    only thing that makes a public, stealable key safe to print.
 16. **Internal failure detail never reaches a client.** Unexpected errors are logged in full and
     answered generically. Caller errors describe the caller's mistake and nothing about internals.
 17. **Passwords are Argon2id-hashed; session tokens are SHA-256-hashed. Neither is ever logged.**
@@ -104,6 +107,10 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     credential dump. `accounts` and `sessions` are global tables (no RLS), resolved on the plain pool
     *before* tenant context exists — a session lookup is what *establishes* that context. A session
     token carries the `sess_` prefix so it can never be confused with an `sk_`/`pk_` key.
+    **That prefix is load-bearing, not decoration.** `Actor` dispatches on it to choose which table
+    to resolve a bearer token against — `sessions` or `api_keys`. The two are disjoint, so a token
+    sent to the wrong one simply misses and 401s. Rename or drop the prefix and every session
+    resolves against `api_keys`, misses, and the whole dashboard 401s at once.
 18. **`/auth/register` and `/auth/login` are the only public credential endpoints, and both are rate
     limited.** Register is the single path that *creates a tenant* without the admin key, so its cap
     bounds abuse and `/embeddings` spend; login is a password oracle, throttled per email. Login
@@ -135,6 +142,39 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     param (browser history, `Referer`, access logs) and never `localStorage`. Refreshing that page
     therefore loses the key, which is correct: it mirrors the API's own promise rather than papering
     over it. `POST /auth/keys` is the recovery path.
+23. **The document-management routes take an `sk_` *or* a `sess_`, and never a `pk_`.** This is a
+    consequence of invariant 22, not a convenience: the dashboard has no key to present. The one-time
+    `sk_` is gone the moment its reveal page renders, and `GET /auth/keys` returns hashes. So the
+    session is the *only* credential the BFF holds, and a dashboard that cannot list a document is
+    not a dashboard. The alternatives were storing an `sk_` server-side (which contradicts invariant
+    14's whole stated trade — hash, don't encrypt) or minting a key per page load.
+    `Actor` is the union principal that expresses this, and `require_management()` is its gate:
+    `Secret | Session` pass, `Publishable` is refused with a 403. `AuthTenant::require_secret()`
+    still exists and still guards what stays key-only — `/ingest` and the deprecated multipart
+    `POST /documents`. Both extractors yield a `tenant_id` and nothing else reaches the database, so
+    **RLS is keyed on the string, not on how the string was obtained** — isolation is identical
+    whichever credential arrived.
+24. **A presigned URL in the browser is a capability, not a credential — and it does not break
+    invariant 20.** The dashboard uploads by asking its own origin for a URL (server-side, with the
+    session) and then PUTting the bytes *straight to MinIO*. The session never leaves Node; what the
+    browser holds authorises one object key, one method, for one TTL. That is what a presigned URL
+    *is*, and it is why `POST /documents/upload-url` exists at all.
+    Two consequences, both easy to "fix" wrongly. **The PUT carries no `Authorization` header and no
+    cookies** — the signature is in the query string, and MinIO rejects a request bearing both.
+    **Uploading therefore requires JavaScript**, and that is architectural, not laziness: a multipart
+    `<form>` action would proxy the bytes through Node, which is precisely the deprecated
+    `POST /documents` we are deleting, rebuilt one layer up. Reading the list keeps the no-JS
+    guarantee; only the write path spends it. `upload.test.ts` pins the header assertions, because a
+    leak there would still upload fine and nothing else would notice.
+25. **Re-minting an upload URL is only safe for the *same file*.** `refresh_session` re-signs the
+    row's existing `object_key`, whose extension was fixed from the original filename at
+    `create_session` — it takes no filename and revalidates nothing. Re-mint for a different file
+    type and the bytes land at `original.pdf` while the sidecar, which dispatches on the suffix,
+    fails a perfectly good file — and the user is told *their* document is broken. So the client
+    re-mints in exactly one place: a mid-flight `403` (the signature outlived a slow upload) where it
+    still holds the same `File`, so the extension provably cannot have changed. An `expired` row on a
+    cold page load mints a **fresh** row instead. The endpoint is under-specified — it should either
+    take a filename and revalidate, or stop embedding the extension in the key.
 
 ## Tenant isolation — the three layers
 
@@ -188,6 +228,9 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Version a dep in a member crate | `[workspace.dependencies]` | Two versions of `uuid` across the binaries produce different point ids — surfacing as bad search results, not a build error |
 | Give the api and worker their own embedding code | Both call `common::embedding::EmbeddingClient` | Model name, request shape and `EMBEDDING_DIM` are defined once. Two copies drift, and drift here means the two binaries write vectors the other cannot search |
 | Extend `POST /documents` (multipart) | `POST /documents/upload-url` | Deprecated; buffers whole files in API memory |
+| Mirror `extension_of` in TS with `split('.').pop()` | Reject when the last dot is at index `<= 0` | It is `Path::extension()`: `.pdf` is a dotfile with **no** extension, `..pdf` has one. The naive version accepts `.pdf` and the API then 400s it. Pinned both sides — `key.rs::dotfiles_have_no_extension` and `documents/schema.test.ts` |
+| Render `created_at` with `new Date(s)` | Normalise the offset first | Postgres `timestamptz::text` is `2026-07-16 11:39:20+00` — a space, and a 2-digit offset. ISO wants `T` and `+00:00`. `Date` returns **Invalid Date** silently, so the raw string reaches the UI. See `documents/format.ts` |
+| Add a `<form action>` to the upload card | Leave it JS-only | A multipart action proxies bytes through Node — the deprecated route, one layer up (invariant 24) |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
 The worker classifies these into fatal-vs-retryable. It is a cross-language contract and neither side
@@ -201,9 +244,15 @@ writing the code.
   reaches the database. An encrypted key can be decrypted by whoever holds the key-encryption key,
   which is on the same machine; a hash cannot be reversed, so a database dump is not a credential
   dump. The cost — we can never show a key again — is the intended trade.
-- **`tenant.require_secret()?` is the first line** of any handler that ingests, uploads, lists or
-  manages. Present on `/ingest`, `/documents` (both verbs) and the upload-url routes; correctly
-  absent on `/ask` and `/ask/stream`; absent **as an outstanding gap** on `/search`.
+- **A gate is the first line of any handler that ingests, uploads, lists or manages** — which gate
+  depends on who may legitimately reach it:
+  - `actor.require_management()?` — `sk_` **or** `sess_`, never `pk_`. On `GET /documents` and both
+    upload-url routes: the tenant's own server *and* the dashboard reach these (invariant 23).
+  - `tenant.require_secret()?` — `sk_` only. On `/ingest` and the deprecated multipart
+    `POST /documents`. Both are paths we are not extending, so neither gets a session.
+
+  Correctly absent on `/ask` and `/ask/stream`, which `pk_` is *meant* to reach; absent **as an
+  outstanding gap** on `/search`.
 - **Two auth principals, do not conflate them.** `AuthTenant` resolves an API key (`sk_`/`pk_`) to a
   tenant — the *machine* credential (a tenant's server, the widget). `SessionAuth` resolves a
   `sess_` token to an account + tenant — the *human* credential (the dashboard, the `/auth/*`
@@ -212,6 +261,12 @@ writing the code.
   the admin-only `mint_key`; the two share `handlers::provision_tenant` / `insert_api_key` so they
   cannot drift. Revoke is scoped by `tenant_id` in the `WHERE` clause — that guard, not RLS (api_keys
   has none), is the isolation boundary for key management.
+  **`Actor` is their union, and it does not conflate them.** Both extractors stay intact and
+  independently usable; `Actor` exists only for the routes both may legitimately reach (invariant
+  23), and it *widens* nothing on its own — `require_management()` does the deciding. It picks its
+  delegate by the token's prefix, one table and one query, so a `sess_` is never looked up in
+  `api_keys` nor an `sk_` in `sessions`. A `kind` the DB `CHECK` should have made impossible fails
+  closed with the same 401 as an unknown key, so it is not an oracle either.
 - **`allow_origin(Any)` is deliberate. Read this before "fixing" it.** CORS is a *browser* mechanism,
   not a server authorization mechanism — it cannot stop curl. The real check is the publishable key's
   `allowed_origins` list, enforced server-side in `AuthTenant` regardless of what the browser sent.
@@ -230,7 +285,7 @@ writing the code.
 | Routes, CORS layer, RabbitMQ connect | `crates/api/src/main.rs` |
 | Handlers, Qdrant search, SSE stream | `crates/api/src/handlers.rs` |
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
-| `AuthTenant` / `AdminAuth` / `SessionAuth`, `hash_key`, `require_secret`, key + session token gen | `crates/api/src/auth.rs` |
+| `AuthTenant` / `AdminAuth` / `SessionAuth` / `Actor`, `hash_key`, `require_secret` vs `require_management`, the `sess_` prefix dispatch, key + session token gen | `crates/api/src/auth.rs` |
 | Self-serve accounts: register / login / logout / me / self-serve key mgmt; Argon2 hashing | `crates/api/src/accounts.rs` |
 | `AppError` and the blanket `From` impl that makes `?` a 500 | `crates/api/src/error.rs` |
 | Env vars and their defaults | `crates/api/src/config.rs` |
@@ -242,9 +297,12 @@ writing the code.
 | Embeddable widget | `widget/widget.js` |
 | Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |
 | Typed API client: `ApiResult`, the JSON-vs-`text/plain` split, timeouts | `web/src/lib/server/api/` |
-| Session + one-time-key cookies; the route guard | `web/src/lib/server/auth/` |
+| Session + one-time-key cookies; `requireUser` vs `requireSession` | `web/src/lib/server/auth/` |
 | Login-401 and the two register-409s → which field (invariant 19) | `web/src/lib/features/auth/error-map.ts` |
-| The TS mirror of the Rust validators — drift here 422s the user | `web/src/lib/features/auth/schema.ts` |
+| The TS mirrors of the Rust validators — drift here 422s/400s the user | `web/src/lib/features/{auth,documents}/schema.ts` |
+| Browser → MinIO upload; the presigned-URL-is-not-a-credential boundary (invariant 24) | `web/src/lib/features/documents/upload.ts` |
+| Status → user-facing copy; where invariant 16 is enforced *in the UI* | `web/src/lib/features/documents/status.ts` |
+| The only BFF route a browser fetches as JSON (mint + re-mint) | `web/src/routes/(authenticated)/documents/upload-url/+server.ts` |
 | Migrations — forward-only, run at API startup on the admin pool, which is then closed | `crates/api/migrations/` |
 
 ## Known state & debt
@@ -262,6 +320,19 @@ Honest inventory. Each entry states the impact, not merely the fact.
   data" request cannot presently be honoured. For a product holding customers' support documents this
   is a compliance gap, not a missing feature. Designing it means deciding the order of operations
   across three stores and what happens when a step fails halfway.
+  **The dashboard now makes this visible**: `/documents` lists every row with no way to remove one,
+  and `expired`/`failed` rows accumulate in the tenant's own view.
+- **`GET /documents` has no pagination.** It returns the tenant's entire table, every call, fully
+  materialised. Fine for a new tenant; a real problem at scale, and the dashboard polls it. The
+  polling backs off to a 15s ceiling precisely because this query is unbounded — that is a mitigation,
+  not a fix.
+- **`failed` conflates "your file is broken" with "our worker died".** `mark_failed` writes the
+  parser's stderr; the reaper writes `'processing lease expired; worker presumed dead'`. Both land in
+  the `error` column, which **no endpoint exposes** — correctly, since invariant 16 forbids shipping
+  either string to a client. The cost is that the UI cannot tell a tenant whether to re-upload or
+  wait, so its copy names both causes. The fix is for the worker to write a *classified* reason code
+  alongside the raw text, which the API could then expose safely. Until then a `failed` badge is
+  honest but not actionable.
 - **`POST /documents` (multipart proxy) is deprecated** — it buffers whole files in API memory. Use
   `POST /documents/upload-url`. It gets deleted along with `crates/api/src/queue.rs` and the worker's
   `consume_legacy` / `LEGACY_QUEUE`. Do not add features to it. Do not add callers.

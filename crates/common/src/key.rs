@@ -128,6 +128,26 @@ mod tests {
         assert_eq!(extension_of("noext"), None);
     }
 
+    /// `Path::extension` has rules that a hand-rolled `split('.').last()` does not, and the web
+    /// client mirrors this function in TypeScript. Pin the cases where the two would disagree —
+    /// drift shows the user a client-side "valid" that this function then 400s.
+    #[test]
+    fn dotfiles_have_no_extension() {
+        // A leading dot with no other dot is a *stem*, not an extension. `split('.').last()`
+        // would say "pdf" and wave it through.
+        assert_eq!(extension_of(".pdf"), None);
+        assert_eq!(extension_of(".txt"), None);
+        // ...but a second dot makes the last segment a real extension again.
+        assert_eq!(extension_of("..pdf").as_deref(), Some("pdf"));
+        assert_eq!(extension_of(".hidden.md").as_deref(), Some("md"));
+        // A trailing dot is an empty extension, not an inherited one.
+        assert_eq!(extension_of("file."), None);
+        assert_eq!(extension_of(".."), None);
+        // file_name() first: a client may send a path, and only the last segment counts.
+        assert_eq!(extension_of("dir/file.pdf").as_deref(), Some("pdf"));
+        assert_eq!(extension_of("a.pdf/b.txt").as_deref(), Some("txt"));
+    }
+
     #[test]
     fn content_type_follows_the_extension_not_the_client() {
         assert_eq!(content_type_for("pdf"), "application/pdf");
