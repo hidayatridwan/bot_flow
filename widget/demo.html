@@ -10,9 +10,12 @@
     <h1>Umbrella Support</h1>
     <p>This page simulates a customer's website embedding the chat widget. The publishable
         key below is safe to expose — it's chat-only and locked to this origin.</p>
-    <!-- Bump the version query whenever the widget changes: browsers cache an unversioned
-         script aggressively, so visitors keep running a stale copy long after a fix ships. -->
-    <script src="widget.js?v=2"></script>
+    <!-- Served by the API from the binary (phase 7), so a fix reaches every visitor on the next
+         restart — no version query to bump, because the API answers this with `Cache-Control:
+         no-cache` and an ETag: the browser revalidates and gets a 304 when nothing changed, the
+         new bytes when it did. This used to be a self-hosted `widget.js?v=2`, and the version
+         query was a workaround for exactly the staleness the served route now removes. -->
+    <script src="http://localhost:3000/widget.js"></script>
     <script>
         ChatWidget.init({
             apiBase: 'http://localhost:3000',

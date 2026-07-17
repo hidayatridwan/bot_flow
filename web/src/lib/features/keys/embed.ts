@@ -31,7 +31,10 @@ export function embedSnippet({ apiBase, publicKey, title }: EmbedOptions): strin
 	const base = apiBase.replace(/\/$/, '');
 	const titleLine = title ? `\n    title: ${JSON.stringify(title)},` : '';
 
-	return `<script src="/path/to/widget.js"></script>
+	// The `src` is the API's own `/widget.js` (phase 7), so the snippet is copy-pasteable as-is —
+	// no `/path/to/` for the tenant to resolve, and the widget updates when the API does. It is the
+	// same origin the widget then calls, which is the point: one place to configure, not two.
+	return `<script src="${base}/widget.js"></script>
 <script>
   ChatWidget.init({
     apiBase: ${JSON.stringify(base)},

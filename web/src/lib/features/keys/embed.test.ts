@@ -41,6 +41,15 @@ describe('embedSnippet — the output', () => {
 		expect(s).toContain('widget.js');
 	});
 
+	it('sources the widget from the API, copy-pasteable — no placeholder path', () => {
+		// The whole of phase 7: the src is the API's own /widget.js, so a tenant pastes this verbatim.
+		// A leftover `/path/to/` would mean the snippet still needs hand-editing, which is the failure
+		// the phase exists to end.
+		const s = embedSnippet({ apiBase: 'https://api.example.com', publicKey: PK });
+		expect(s).toContain('src="https://api.example.com/widget.js"');
+		expect(s).not.toContain('/path/to/');
+	});
+
 	it('strips a trailing slash from the api base', () => {
 		// widget.js does `config.apiBase.replace(/\/$/, '')` itself, but emitting `//ask/stream` in the
 		// snippet would still look broken to whoever reads it.
