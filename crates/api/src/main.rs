@@ -16,7 +16,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use anyhow::Context;
 use axum::{
-    routing::{delete, get, post},
+    routing::{get, patch, post},
     Router,
 };
 use qdrant_client::Qdrant;
@@ -158,7 +158,10 @@ async fn main() -> anyhow::Result<()> {
             "/auth/keys",
             get(accounts::list_keys).post(accounts::create_key),
         )
-        .route("/auth/keys/{key_hash}", delete(accounts::revoke_key))
+        .route(
+            "/auth/keys/{key_hash}",
+            patch(accounts::update_key).delete(accounts::revoke_key),
+        )
         .route("/admin/tenants", post(handlers::create_tenant))
         .route("/admin/tenants/{tenant_id}/keys", post(handlers::mint_key))
         .layer(cors)

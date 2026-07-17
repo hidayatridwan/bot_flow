@@ -643,6 +643,41 @@ pub async fn list_documents(
     Ok(Json(json!({ "documents": docs })))
 }
 
+/// Validate and canonicalise an allow-list for a key of `kind`.
+///
+/// Lives here, beside `insert_api_key`, for the same reason that function is shared: the admin and
+/// self-serve mint paths must not drift, and neither may produce a key that cannot work. A
+/// publishable key is matched against the `Origin` header by string equality (`auth.rs`), so an
+/// un-canonical entry is dead rather than lax, and an *empty* list is not a permissive key — it is a
+/// key that 403s on every request, forever.
+pub(crate) fn checked_origins(kind: &str, raw: &[String]) -> Result<Vec<String>, AppError> {
+    let mut out = Vec::with_capacity(raw.len());
+    for origin in raw {
+        let normalized = auth::normalize_origin(origin).ok_or_else(|| {
+            AppError::client(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "'{origin}' is not a valid origin; expected scheme://host[:port], e.g. https://example.com"
+                ),
+            )
+        })?;
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+
+    // Only publishable keys are origin-checked, so only they are broken by an empty list. Secret keys
+    // ignore the field entirely; requiring one there would break the admin path for no gain.
+    if kind == "publishable" && out.is_empty() {
+        return Err(AppError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a publishable key needs at least one allowed origin, or it cannot answer from anywhere",
+        ));
+    }
+
+    Ok(out)
+}
+
 /// Insert a fresh API key for a tenant and return the raw key (shown ONCE, only its hash stored).
 /// Shared by the admin `mint_key` and the self-serve `/auth/keys` handler so the two mint paths
 /// cannot drift. Generic over the executor so it works on the pool or inside a transaction.
@@ -656,6 +691,10 @@ pub(crate) async fn insert_api_key<'e, E>(
 where
     E: PgExecutor<'e>,
 {
+    // Before the insert, not after: a stored dead key is indistinguishable from a live one until a
+    // real visitor hits it.
+    let allowed_origins = checked_origins(kind, allowed_origins)?;
+
     let raw = auth::generate_key(kind);
     sqlx::query(
         "INSERT INTO api_keys (key_hash, tenant_id, kind, label, allowed_origins) VALUES ($1, $2, $3, $4, $5)",
@@ -664,7 +703,7 @@ where
     .bind(tenant_id)
     .bind(kind)
     .bind(label)
-    .bind(allowed_origins) // &[String] -> text[]
+    .bind(&allowed_origins) // &[String] -> text[]
     .execute(exec)
     .await?;
     Ok(raw)

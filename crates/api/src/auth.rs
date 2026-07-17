@@ -72,6 +72,60 @@ impl FromRequestParts<AppState> for AuthTenant {
     }
 }
 
+/// Canonicalise an origin into the exact form a browser sends, or `None` if it can never match one.
+///
+/// This lives next to the comparison above deliberately: step 5 matches `allowed_origins` against the
+/// `Origin` header by **string equality**, so a stored value that is not in a browser's canonical form
+/// is not "slightly wrong" — it is dead, and every request with that key 403s forever. Validation and
+/// matching drift the moment they live in different files.
+///
+/// A browser sends `scheme://host[:port]`: lowercased, no trailing slash, and the port omitted when it
+/// is the default for the scheme.
+pub fn normalize_origin(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    // `null` is what a `file://` page (or a sandboxed iframe) sends. Storing it would hand every such
+    // page a valid key, which is the opposite of an allow-list.
+    if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
+        return None;
+    }
+
+    let (scheme, rest) = raw.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+
+    // An origin is scheme + host + port and nothing else. A trailing `/` is the one exception we
+    // forgive, because it is what a human copies out of a browser's address bar.
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
+        return None;
+    }
+
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => {
+            let port: u16 = p.parse().ok()?;
+            (h, Some(port))
+        }
+        None => (rest, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+
+    // The browser omits the default port, so storing it guarantees a mismatch.
+    let port = match (scheme.as_str(), port) {
+        ("https", Some(443)) | ("http", Some(80)) => None,
+        (_, p) => p,
+    };
+
+    let host = host.to_ascii_lowercase();
+    Some(match port {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    })
+}
+
 /// SHA-256 hex of a raw key — the form stored in api_keys.key_hash.
 pub fn hash_key(raw: &str) -> String {
     hex::encode(Sha256::digest(raw.as_bytes()))
@@ -342,6 +396,97 @@ mod tests {
                 .require_secret()
                 .expect_err("require_secret is an allow-list of exactly one kind");
             assert_eq!(status_of(err), StatusCode::FORBIDDEN);
+        }
+    }
+
+    /// The mirror of this function lives in `web/src/lib/features/keys/schema.ts`, which ports these
+    /// cases verbatim. Drift shows the user a client-side "valid" that this then 422s.
+    #[test]
+    fn origins_are_canonicalised_to_what_a_browser_actually_sends() {
+        // The plain cases.
+        assert_eq!(
+            normalize_origin("https://acme.com").as_deref(),
+            Some("https://acme.com")
+        );
+        assert_eq!(
+            normalize_origin("http://localhost:5500").as_deref(),
+            Some("http://localhost:5500")
+        );
+
+        // What a human copies out of an address bar. Stored as-is, these never match — which is the
+        // whole reason this function exists.
+        assert_eq!(
+            normalize_origin("https://acme.com/").as_deref(),
+            Some("https://acme.com")
+        );
+        assert_eq!(
+            normalize_origin("https://ACME.com").as_deref(),
+            Some("https://acme.com")
+        );
+        assert_eq!(
+            normalize_origin("  https://acme.com  ").as_deref(),
+            Some("https://acme.com")
+        );
+
+        // A browser omits the default port, so storing it guarantees a mismatch.
+        assert_eq!(
+            normalize_origin("https://acme.com:443").as_deref(),
+            Some("https://acme.com")
+        );
+        assert_eq!(
+            normalize_origin("http://acme.com:80").as_deref(),
+            Some("http://acme.com")
+        );
+        // ...but a non-default port is part of the origin and must survive.
+        assert_eq!(
+            normalize_origin("https://acme.com:8443").as_deref(),
+            Some("https://acme.com:8443")
+        );
+        assert_eq!(
+            normalize_origin("http://acme.com:443").as_deref(),
+            Some("http://acme.com:443")
+        );
+    }
+
+    #[test]
+    fn unmatchable_origins_are_rejected_rather_than_stored() {
+        for bad in [
+            "",
+            "   ",
+            "acme.com",              // no scheme
+            "//acme.com",            // protocol-relative
+            "https://",              // no host
+            "https://acme.com/path", // an origin has no path
+            "https://acme.com?a=b",
+            "https://acme.com#frag",
+            "https://user@acme.com", // credentials are not part of an origin
+            "https://acme.com:notaport",
+            "ftp://acme.com", // a browser will never send this to us
+            "file://acme.com",
+        ] {
+            assert_eq!(normalize_origin(bad), None, "should reject: {bad}");
+        }
+    }
+
+    /// `null` is the origin of a `file://` page and of a sandboxed iframe. Allow-listing it would hand
+    /// a valid key to *any* such page — an allow-list that allows the anonymous.
+    #[test]
+    fn the_null_origin_is_never_allow_listable() {
+        assert_eq!(normalize_origin("null"), None);
+        assert_eq!(normalize_origin("NULL"), None);
+        assert_eq!(normalize_origin(" null "), None);
+    }
+
+    #[test]
+    fn normalising_is_idempotent() {
+        // Anything we store must survive a second pass unchanged, or a PATCH would corrupt it.
+        for raw in [
+            "https://acme.com/",
+            "https://ACME.com:443",
+            "http://localhost:5500",
+        ] {
+            let once = normalize_origin(raw).unwrap();
+            assert_eq!(normalize_origin(&once).as_deref(), Some(once.as_str()));
         }
     }
 

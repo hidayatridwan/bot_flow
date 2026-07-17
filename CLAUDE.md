@@ -97,6 +97,14 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     an allow-listed `Origin`. A `pk_` key is *expected* to be stolen — that containment is the whole
     design. `/admin/*` is guarded by `ADMIN_API_KEY` (a deployment secret, not a DB row) because
     those are the operations that *create* DB rows.
+    **The allow-list is that containment, so it is validated at mint, not merely stored.** An origin
+    is compared to the `Origin` header by *string equality*, so a value that is not in a browser's
+    canonical form is not lax — it is dead, and the key 403s forever. `auth::normalize_origin`
+    canonicalises (lowercase, no trailing slash, default port stripped) and rejects what can never
+    match; `handlers::checked_origins` enforces it inside `insert_api_key`, so the admin and
+    self-serve mint paths cannot diverge on it. A **publishable key with an empty allow-list is
+    refused** (422): it is not a permissive key, it is one that can answer from nowhere. `null` is
+    never allow-listable — it is what every `file://` page and sandboxed iframe sends.
     The management gate has since widened to admit a *session* (invariant 23) — it has **never**
     widened for `pk_`, and must not. Widening it there deletes the containment above, which is the
     only thing that makes a public, stealable key safe to print.
@@ -141,7 +149,9 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     5-minute `httpOnly` flash cookie that is read *and deleted* in the same request — never a query
     param (browser history, `Referer`, access logs) and never `localStorage`. Refreshing that page
     therefore loses the key, which is correct: it mirrors the API's own promise rather than papering
-    over it. `POST /auth/keys` is the recovery path.
+    over it. `POST /auth/keys` is the recovery path, and it is reachable: `/keys` in the dashboard
+    mints, lists, revokes and edits. That page is what makes this invariant honest rather than a
+    promise about an endpoint no user can call — the reveal alert links straight to it.
 23. **The document-management routes take an `sk_` *or* a `sess_`, and never a `pk_`.** This is a
     consequence of invariant 22, not a convenience: the dashboard has no key to present. The one-time
     `sk_` is gone the moment its reveal page renders, and `GET /auth/keys` returns hashes. So the
@@ -175,6 +185,14 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     still holds the same `File`, so the extension provably cannot have changed. An `expired` row on a
     cold page load mints a **fresh** row instead. The endpoint is under-specified — it should either
     take a filename and revalidate, or stop embedding the extension in the key.
+26. **A key's allow-list is editable; its `kind` and its hash are not.** `PATCH /auth/keys/{hash}`
+    changes `allowed_origins` and nothing else. Adding a domain must not mean minting a new key: a
+    `pk_` is public and expected to be stolen, so rotating it to add `www.` buys nothing, while
+    forcing a site-wide `<script>` edit for a one-word change is how tenants end up begging for a
+    wildcard — which would delete invariant 15's containment. `kind` stays immutable because flipping
+    it would silently turn a published key secret, or a secret key public, under an unchanged snippet.
+    The `tenant_id` in the `WHERE` clause is the isolation boundary (`api_keys` has no RLS), and a
+    foreign hash **404s like an unknown one** — same non-oracle rule as invariants 8 and 18.
 
 ## Tenant isolation — the three layers
 
@@ -231,6 +249,8 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Mirror `extension_of` in TS with `split('.').pop()` | Reject when the last dot is at index `<= 0` | It is `Path::extension()`: `.pdf` is a dotfile with **no** extension, `..pdf` has one. The naive version accepts `.pdf` and the API then 400s it. Pinned both sides — `key.rs::dotfiles_have_no_extension` and `documents/schema.test.ts` |
 | Render `created_at` with `new Date(s)` | Normalise the offset first | Postgres `timestamptz::text` is `2026-07-16 11:39:20+00` — a space, and a 2-digit offset. ISO wants `T` and `+00:00`. `Date` returns **Invalid Date** silently, so the raw string reaches the UI. See `documents/format.ts` |
 | Add a `<form action>` to the upload card | Leave it JS-only | A multipart action proxies bytes through Node — the deprecated route, one layer up (invariant 24) |
+| Store an `allowed_origins` entry as the tenant typed it | `auth::normalize_origin` first | It is matched against `Origin` by string equality. `https://acme.com/`, `HTTPS://Acme.com` and `https://acme.com:443` all *look* right, mint fine, and never match — the key 403s forever with nothing in any log to say why |
+| Render the embed snippet from any key you are handed | `embedSnippet` refuses a non-`pk_` | The snippet is designed to be pasted into a public page. An `sk_` there is invariant 15 inverted |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
 The worker classifies these into fatal-vs-retryable. It is a cross-language contract and neither side
@@ -285,7 +305,7 @@ writing the code.
 | Routes, CORS layer, RabbitMQ connect | `crates/api/src/main.rs` |
 | Handlers, Qdrant search, SSE stream | `crates/api/src/handlers.rs` |
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
-| `AuthTenant` / `AdminAuth` / `SessionAuth` / `Actor`, `hash_key`, `require_secret` vs `require_management`, the `sess_` prefix dispatch, key + session token gen | `crates/api/src/auth.rs` |
+| `AuthTenant` / `AdminAuth` / `SessionAuth` / `Actor`, `hash_key`, `require_secret` vs `require_management`, the `sess_` prefix dispatch, `normalize_origin` (next to the `Origin` check it must agree with), key + session token gen | `crates/api/src/auth.rs` |
 | Self-serve accounts: register / login / logout / me / self-serve key mgmt; Argon2 hashing | `crates/api/src/accounts.rs` |
 | `AppError` and the blanket `From` impl that makes `?` a 500 | `crates/api/src/error.rs` |
 | Env vars and their defaults | `crates/api/src/config.rs` |
@@ -301,6 +321,8 @@ writing the code.
 | Login-401 and the two register-409s → which field (invariant 19) | `web/src/lib/features/auth/error-map.ts` |
 | The TS mirrors of the Rust validators — drift here 422s/400s the user | `web/src/lib/features/{auth,documents}/schema.ts` |
 | Browser → MinIO upload; the presigned-URL-is-not-a-credential boundary (invariant 24) | `web/src/lib/features/documents/upload.ts` |
+| Origin validation + the mint/PATCH rules, shared by admin and self-serve | `crates/api/src/handlers.rs` (`checked_origins`, in `insert_api_key`) |
+| The embed snippet, and its refusal to carry an `sk_` | `web/src/lib/features/keys/embed.ts` |
 | Status → user-facing copy; where invariant 16 is enforced *in the UI* | `web/src/lib/features/documents/status.ts` |
 | The only BFF route a browser fetches as JSON (mint + re-mint) | `web/src/routes/(authenticated)/documents/upload-url/+server.ts` |
 | Migrations — forward-only, run at API startup on the admin pool, which is then closed | `crates/api/migrations/` |

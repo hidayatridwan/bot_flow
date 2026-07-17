@@ -17,9 +17,11 @@
         ChatWidget.init({
             apiBase: 'http://localhost:3000',
             // A publishable key: chat-only, and rejected from any Origin not on its allow-list.
-            // Mint your own -> POST /admin/tenants/{tenant}/keys with
+            // Mint your own at http://localhost:5173/keys — the dashboard writes the whole snippet
+            // for you. By hand: POST /auth/keys with a `sess_` token and
             //   {"kind":"publishable","allowed_origins":["http://localhost:5500"]}
             // A 401 here means this key's hash is not in the database (wrong or recreated DB).
+            // A 403 means this page's Origin is not on the key's allow-list — mind the port.
             publicKey: 'pk_cb1c812075f142178c288951131f66da3089832d4b314806b89a5a42aa24fd0f'
         });
     </script>

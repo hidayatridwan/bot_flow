@@ -82,7 +82,8 @@ is the only credential it holds.
 | `POST` | `/auth/logout` | session | Ends the current session |
 | `GET` | `/auth/me` | session | The account + tenant behind the session |
 | `GET` | `/auth/keys` | session | Lists this tenant's key metadata (never the raw key) |
-| `POST` | `/auth/keys` | session | Self-serve mint of a `secret`/`publishable` key |
+| `POST` | `/auth/keys` | session | Self-serve mint of a `secret`/`publishable` key. Origins are validated and canonicalised; a `publishable` key with none is refused (`422`) |
+| `PATCH` | `/auth/keys/{key_hash}` | session | Change a key's `allowed_origins`. `kind` and the hash are immutable |
 | `DELETE` | `/auth/keys/{key_hash}` | session | Revokes one of this tenant's keys |
 | `POST` | `/documents/upload-url` | secret **or** session | `{"filename": "cv.pdf"}` → a presigned PUT. Rate-limited. Returns `201` |
 | `POST` | `/documents/{id}/upload-url` | secret **or** session | Re-mint a URL for a document still `uploading` or `expired`. Only safe for *the same file* — see the note below |
@@ -574,6 +575,10 @@ every subsequent message. Its "new chat" button clears the id along with the tra
 
 ## Embedding the widget
 
+**The dashboard writes this snippet for you.** Mint a publishable key at `/keys` and it is rendered
+pre-filled with your key and API URL — at mint time, the one moment the raw key exists. What follows
+is the same thing by hand.
+
 [widget/widget.js](widget/widget.js) is a self-contained script — no build step, no
 dependencies. Drop it on any page and initialise it with a **publishable** key:
 
@@ -589,13 +594,20 @@ dependencies. Drop it on any page and initialise it with a **publishable** key:
 ```
 
 That renders a launcher button in the bottom-right corner which opens a 360px chat panel.
-The widget talks to `/ask/stream`, so answers appear token by token, with a citation line
-under each reply.
+The widget talks to `/ask/stream`, so answers appear token by token.
+
+It does **not** render citations: the server emits a `sources` event and `widget.js` deliberately
+ignores it. The structured citations are there for a client that wants them (invariant 5) — this
+widget is not yet that client.
 
 Two things the browser enforces, and one the server does:
 
 - The page's `Origin` **must** appear in the key's `allowed_origins`, or the API returns
-  `403`. Serving from `file://` sends no `Origin` header and will be rejected.
+  `403`. Serving from `file://` sends `Origin: null`, which is never allow-listable.
+  The comparison is **exact string equality** against what the browser sends — `scheme://host`, plus
+  a port only when it is non-default. `POST /auth/keys` canonicalises what you give it
+  (`https://Acme.com:443/` → `https://acme.com`) and rejects anything that could never match, because
+  a stored origin in the wrong shape is not lax — it is a key that 403s forever.
 - The API's CORS policy is deliberately permissive (`allow_origin(Any)`) because the real
   check is the server-side origin allow-list above, and no cookies are involved.
 - A `pk_` key is chat-only. Even if someone lifts it from your page's source, it cannot

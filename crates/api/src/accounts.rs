@@ -361,6 +361,54 @@ pub async fn create_key(
     ))
 }
 
+#[derive(Deserialize)]
+pub struct UpdateKeyRequest {
+    allowed_origins: Vec<String>,
+}
+
+/// `PATCH /auth/keys/{key_hash}` — change a key's allowed origins, and nothing else.
+///
+/// Adding a domain must not mean minting a new key: a `pk_` is printed in public page source and is
+/// expected to be stolen, so rotating it to add `www.` buys nothing — the allow-list *is* the
+/// containment (invariant 15), and editing it has to be cheap or tenants will reach for a wildcard.
+/// `kind` and the hash are deliberately immutable: changing `kind` would silently turn a public key
+/// into a secret one, or vice versa, under an unchanged snippet.
+///
+/// Same isolation boundary as revoke: the `tenant_id` in the WHERE clause, not RLS.
+pub async fn update_key(
+    session: SessionAuth,
+    State(state): State<AppState>,
+    Path(key_hash): Path<String>,
+    Json(req): Json<UpdateKeyRequest>,
+) -> Result<Json<Value>, AppError> {
+    // Read the kind first: the rules differ by kind, and validating against the wrong one either
+    // rejects a legal secret key or waves through a dead publishable one. Two queries rather than one
+    // clever UPDATE, so "not found" and "invalid origin" stay distinct answers instead of collapsing
+    // into an ambiguous zero-row result.
+    let row = sqlx::query("SELECT kind FROM api_keys WHERE tenant_id = $1 AND key_hash = $2")
+        .bind(&session.tenant_id)
+        .bind(&key_hash)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::client(StatusCode::NOT_FOUND, "key not found"))?;
+    let kind: String = row.get("kind");
+
+    let allowed_origins = crate::handlers::checked_origins(&kind, &req.allowed_origins)?;
+
+    sqlx::query("UPDATE api_keys SET allowed_origins = $1 WHERE tenant_id = $2 AND key_hash = $3")
+        .bind(&allowed_origins)
+        .bind(&session.tenant_id)
+        .bind(&key_hash)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(json!({
+        "key_hash": key_hash,
+        "kind": kind,
+        "allowed_origins": allowed_origins,
+    })))
+}
+
 /// `DELETE /auth/keys/{key_hash}` — revoke one of the tenant's keys. The `tenant_id` guard is the
 /// isolation boundary here (api_keys carries no RLS), so a session can only revoke its own keys.
 pub async fn revoke_key(

@@ -37,7 +37,8 @@
 				<Alert.Title>Copy this key now — it will not be shown again</Alert.Title>
 				<Alert.Description>
 					We only store a hash of it, so we cannot show it to you a second time. If you lose it,
-					leave this page, or refresh, you will need to create a new key from your dashboard.
+					leave this page, or refresh, you can create a new one under
+					<a href="/keys" class="underline underline-offset-4">API keys</a>.
 				</Alert.Description>
 			</Alert.Root>
 

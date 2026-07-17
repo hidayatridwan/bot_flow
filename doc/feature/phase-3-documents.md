@@ -227,6 +227,9 @@ Rust returns `None` for `.pdf` (leading dot ⇒ all stem) but `Some("pdf")` for 
   indeterminate spinner instead.
 - **Key management UI.** `/auth/keys` list/mint/revoke — fully unblocked, needs no plumbing changes.
   The natural next slice.
+  **Shipped in phase 4** — see [`phase-4-keys.md`](./phase-4-keys.md). "Needs no plumbing changes" held
+  for `web/`, but the API did need fixing first: `allowed_origins` had no validation, so a mint form
+  would have produced keys that 403 forever.
 - **The "Queued" refinement.** After the PUT resolves the row is still `uploading`, so the badge is
   briefly a lie. A client-held `Set` of ids could render those as "Queued" — but it is the only client
   state that would override a server status, and that kind of thing rots.
