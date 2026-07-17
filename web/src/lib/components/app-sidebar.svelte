@@ -6,6 +6,7 @@
 	import FrameIcon from '@lucide/svelte/icons/frame';
 	import GalleryVerticalEndIcon from '@lucide/svelte/icons/gallery-vertical-end';
 	import KeyRoundIcon from '@lucide/svelte/icons/key-round';
+	import LayoutDashboardIcon from '@lucide/svelte/icons/layout-dashboard';
 	import MapIcon from '@lucide/svelte/icons/map';
 	import Settings2Icon from '@lucide/svelte/icons/settings-2';
 
@@ -37,7 +38,7 @@
 			{
 				title: 'Dashboard',
 				url: '/dashboard',
-				icon: FileTextIcon
+				icon: LayoutDashboardIcon
 			}
 		],
 		navCore: [
