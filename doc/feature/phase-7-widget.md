@@ -1,10 +1,12 @@
 # Feature: Serving the widget, and making it tell the truth (phase 7)
 
-> Status: **planned.** Audited against `widget/widget.js` (all 173 lines of it), `widget/demo.html`,
-> `web/src/lib/features/keys/embed.ts` and the API's router before writing. The headline of the audit
-> is in *Does this break existing integrations?* — the short answer is **no, and it cannot**, for a
-> reason more specific than "it is additive". The real risk this phase carries is not breakage; it is
-> doing the work and delivering nothing. Read *Known debt & traps* before picking a cache header.
+> Status: **planned, decisions locked.** Audited against `widget/widget.js` (all 173 lines of it),
+> `widget/demo.html`, `web/src/lib/features/keys/embed.ts` and the API's router before writing. All
+> four decisions (D1–D4) are settled below; the reasoning is retained as the spec the implementation is
+> held to, not as an open question. The headline of the audit is in *Does this break existing
+> integrations?* — the short answer is **no, and it cannot**, for a reason more specific than "it is
+> additive". The real risk this phase carries is not breakage; it is doing the work and delivering
+> nothing — which is why D1, the cache header, *is* the feature rather than a detail of it.
 
 ## Context — why
 
@@ -116,45 +118,64 @@ failure the playground admits it cannot reproduce.
 None of this is an argument against serving the widget. It is an argument that the phase which serves
 it is the phase that owns it, and should not take ownership of known bugs.
 
-## Decisions to take before coding
+## Decisions taken
 
-**D1 — the cache header.** The whole feature. Recommendation: **stable URL (`/widget.js`) +
-`Cache-Control: no-cache` + a strong `ETag`.**
+All four are settled — this is the Plan of Record, not a proposal. The reasoning is kept because it is
+what the audit and the implementation must hold the code against, not because the choice is still open.
+
+**D1 — cache header: stable URL (`/widget.js`) + `Cache-Control: no-cache` + a strong `ETag`.** This is
+the whole feature; the other three are its passengers.
 
 `no-cache` does not mean "do not cache" — it means "revalidate before use", which is exactly right. A
 browser keeps its copy and asks; unchanged, it gets a ~200-byte `304` and reuses it. A fix is live for
 every visitor of every tenant the moment the API restarts, with no snippet edit anywhere.
 
 The ETag is free: `include_str!` fixes the content at compile time, so the hash can be computed once at
-startup and compared per request.
+startup and compared per request. It must be a **strong** ETag (no `W/` prefix) — the bytes are
+identical, not merely equivalent, and a strong tag is what lets a future CDN serve `304`s itself.
 
-The trade to accept knowingly: one conditional GET per visitor page load. Cheap per request, real in
-aggregate. If it ever bites, the answer is a CDN in front — which is a deployment change, not a
-redesign, precisely *because* the URL is stable. `max-age=300` is the alternative if you would rather
-trade five minutes of staleness for zero revalidation traffic; that is a defensible answer to a
-question this document should not pretend has one right answer.
+The trade, accepted knowingly: one conditional GET per visitor page load. Cheap per request, real in
+aggregate. If it ever bites, the answer is a CDN in front — a deployment change, not a redesign,
+precisely *because* the URL is stable. `max-age=300` was the considered alternative (five minutes of
+staleness for zero revalidation traffic) and was **rejected**: the entire reason this phase exists is
+that a stale widget cannot be fixed remotely, and any staleness window reintroduces exactly that, in
+miniature. `no-cache` is the only header that makes "a fix reaches every visitor immediately" literally
+true.
 
-**D2 — does this phase render citations?** Recommendation: **yes.** It is one widget change and one
-deploy, it ends invariant 24's contradiction, and `chat/sources.ts` already exists as a tested
-reference to port. Rendering them in a widget nobody can update would be the worst of both.
+**D2 — render citations, by porting `chat/sources.ts`.** One widget change, one deploy, and it ends
+invariant 24's contradiction (the playground claims *"this is what your end users see"* while the
+widget drops the `sources` event). Porting rather than reinventing is load-bearing: `sources.ts` is the
+tested surface, and its one rule the widget must not break is that a citation's number is `index` from
+the field, **never** the array position (invariant 5). A hand-rolled `#{i+1}` would pass every casual
+test — the API sends `1..n` in order today — and silently violate the invariant the moment it does not.
 
-**D3 — does this phase fix the empty answer and `done`?** Recommendation: **yes**, per the section
-above. Serving it is taking ownership; ship it owning bugs and they are ours, deployed, on day one.
+**D3 — fix the empty-answer bug and handle `done`.** Serving the widget is taking ownership of it (see
+the section above); shipping it with known bugs means shipping *our* bugs, deployed, into strangers'
+browsers on day one. Two concrete changes:
 
-**D4 — `include_str!`, or build `widget.js` from `web/`'s tested modules?** Recommendation:
-**`include_str!`, and reject the unification.**
+- **Count token frames; report zero-with-a-completed-stream.** Mirror `ask.ts`: if `done` arrives and
+  no `token` ever did, the bubble must say something rather than sit empty. The message is the widget's
+  own copy — it has no `error-map.ts` — but the *condition* is identical, and counting frames (not
+  inspecting the accumulated string) is the same discipline for the same reason: a whitespace-only
+  answer is still the model speaking.
+- **Add a `done` case to `_onEvent`.** Today the loop ends only when the reader closes, so the widget
+  cannot tell a finished answer from a dropped socket. An explicit `done` makes completion observable,
+  which is what a "the answer was cut short" state would later hang off — the widget's `CUT_SHORT`
+  equivalent is out of scope here, but it is *impossible* without this, so this is the enabling half.
 
-It is tempting: `sse.ts` is the contract's *only tested* parser, and `widget.js:161`'s `_parseEvent` is
-a second, untested one — CLAUDE.md flags exactly this. Building the widget from `web/` would delete the
-duplication.
+**D4 — `include_str!`; keep the two SSE parsers separate.** The unification is tempting and rejected on
+purpose. `sse.ts` is the contract's *only tested* parser and `widget.js`'s `_parseEvent` is a second,
+untested one — CLAUDE.md flags exactly this — so building the widget from `web/`'s modules would delete
+the duplication. It would also make the **Rust build depend on a `bun` build**, in a repo whose first
+architectural rule is *"two projects, one repo, and the root is the Rust one."* That is a large,
+permanent change to how everything builds, traded for one deduplicated function.
 
-It would also make the Rust build depend on a `bun` build, in a repo whose first architectural rule is
-*"two projects, one repo, and the root is the Rust one."* That is a large, permanent change to how the
-whole thing builds, traded for one deduplicated function. `include_str!` keeps the widget a
-zero-build-step artifact and keeps the API self-contained: no `ServeDir`, no filesystem path, no
-traversal surface, and the binary carries its own asset.
-
-The duplication stays. It should be recorded honestly rather than solved by accident.
+`include_str!` keeps the widget a zero-build-step artifact and the API self-contained: no `ServeDir`,
+no filesystem path, no traversal surface, the binary carrying its own asset. The duplication stays, and
+is recorded in *Known debt* rather than solved by accident. **Consequence the implementation must
+respect:** D2 and D3 change `widget.js`'s `_parseEvent`/`_onEvent` and citation rendering, so `sse.ts`
+and `sources.ts` are now definitions the widget is *ported from* and must not silently diverge from —
+the duplication is accepted, drift is not.
 
 ## Design sketch
 
