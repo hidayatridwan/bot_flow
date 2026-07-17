@@ -11,6 +11,7 @@ mod rate_limit;
 mod state;
 mod storage;
 mod upload;
+mod widget;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -130,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(handlers::health))
+        // Public and unauthenticated, like /health: it is the file a visitor's browser loads before
+        // it holds any credential. Served from the binary; cache-revalidated (phase 7).
+        .route("/widget.js", get(widget::serve))
         .route("/ingest", post(handlers::ingest))
         .route("/search", post(handlers::search))
         .route("/ask", post(handlers::ask))

@@ -218,6 +218,7 @@ phase touches the one route every deployed widget flows through.
 | Reach for `ServeDir` | `include_str!` | The API would gain a filesystem dependency and a traversal surface to serve one known file that never changes at runtime |
 | Renumber citations in the widget | `index` from the field | Invariant 5. The widget is a second renderer of the same contract, and it will drift from `sources.ts` unless it is ported rather than reinvented |
 | Assume old self-hosted copies break | They cannot | The snippet was a placeholder — no integration ever came from it. Their file, their path, our unchanged API |
+| Ship a widget fix without advancing `widget.js`'s mtime | `touch` it, or `cargo clean` the api crate, in the build | `include_str!` is a *compile-time* embed, and cargo fingerprints the include by mtime. Editing the bytes without a newer mtime (a `mv` that preserves it, some `cp`/checkout patterns) leaves the old bytes baked into a reused binary — the served ETag never changes and the fix silently does not ship. Observed live during phase 7: a restore-then-`cargo run` reported "Finished in 0.50s" and kept serving the previous build. CI that always builds clean is immune; incremental/container-layer builds are not |
 
 **Left standing, deliberately:**
 
