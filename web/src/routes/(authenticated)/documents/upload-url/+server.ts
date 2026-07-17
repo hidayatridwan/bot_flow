@@ -2,6 +2,7 @@ import { error, json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { api } from '$lib/server/api';
 import * as documentsApi from '$lib/server/api/documents';
+import { isUuid } from '$lib/utils/uuid';
 
 /**
  * Mint (or re-mint) a presigned upload URL for the logged-in tenant.
@@ -18,10 +19,6 @@ import * as documentsApi from '$lib/server/api/documents';
  * SvelteKit's `csrf.checkOrigin` does *not* apply here: it only covers form-encodable content types,
  * so it never sees a JSON POST. The explicit checks below are therefore the belt to Lax's braces.
  */
-
-const isUuid = (s: unknown): s is string =>
-	typeof s === 'string' &&
-	/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 
 export const POST: RequestHandler = async (event) => {
 	const { request, url, locals } = event;

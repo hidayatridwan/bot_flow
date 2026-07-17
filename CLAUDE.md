@@ -204,8 +204,15 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     **Uploading therefore requires JavaScript**, and that is architectural, not laziness: a multipart
     `<form>` action would proxy the bytes through Node, which is precisely the deprecated
     `POST /documents` we are deleting, rebuilt one layer up. Reading the list keeps the no-JS
-    guarantee; only the write path spends it. `upload.test.ts` pins the header assertions, because a
+    guarantee; the write path spends it. `upload.test.ts` pins the header assertions, because a
     leak there would still upload fine and nothing else would notice.
+    **The playground spends it a second time, and on different grounds — worth stating, because the
+    two must not be confused.** Uploading has *no* no-JS design available. The playground does: a form
+    action over `POST /ask` would work perfectly without JavaScript. So this one is **bought, not
+    forced**, and what it buys is the only claim the page makes — *this is what your end users see*,
+    and what they see is tokens arriving. A form-action playground would answer correctly and feel
+    like a different product, hiding the exact property a tenant checks before going live. It costs
+    nothing that previously worked: a new page, not a regression.
 25. **Re-minting an upload URL is only safe for the *same file*.** `refresh_session` re-signs the
     row's existing `object_key`, whose extension was fixed from the original filename at
     `create_session` — it takes no filename and revalidates nothing. Re-mint for a different file
@@ -383,7 +390,7 @@ writing the code.
 | Origin validation + the mint/PATCH rules, shared by admin and self-serve | `crates/api/src/handlers.rs` (`checked_origins`, in `insert_api_key`) |
 | The embed snippet, and its refusal to carry an `sk_` | `web/src/lib/features/keys/embed.ts` |
 | Status → user-facing copy; where invariant 16 is enforced *in the UI* | `web/src/lib/features/documents/status.ts` |
-| The only BFF route a browser fetches as JSON (mint + re-mint) | `web/src/routes/(authenticated)/documents/upload-url/+server.ts` |
+| The two BFF routes a browser fetches directly — the shared origin / content-type / `locals.session` guard chain, and why it is not `requireUser` | `web/src/routes/(authenticated)/documents/upload-url/+server.ts` (mint + re-mint) and `.../playground/ask/+server.ts` (the SSE proxy) |
 | Migrations — forward-only, run at API startup on the admin pool, which is then closed | `crates/api/migrations/` |
 
 ## Known state & debt
