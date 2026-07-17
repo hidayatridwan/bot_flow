@@ -41,6 +41,16 @@ export function createApiClient(opts: ApiClientOptions): ApiClient {
 				method,
 				headers,
 				body: body === undefined ? undefined : JSON.stringify(body),
+				// Keeps invariant 20's "the API stays cookie-free" true, which it was not.
+				// `event.fetch` defaults to `credentials: 'same-origin'` and treats a *hostname suffix*
+				// match as same-origin — so it injects the browser's cookie jar into the upstream
+				// request whenever `.<apiHost>`.endsWith(`.<webHost>`). That holds for
+				// localhost→localhost in dev and example.com→api.example.com in production, and it
+				// happens after this header object is built, so nothing here could have revealed it.
+				// The API never reads cookies, so this was not an auth hole — but it shipped
+				// `bf_session` to the API on every call, where it lands in access logs, and invariant
+				// 18's CORS reasoning is supposed to rest on the API never seeing a cookie at all.
+				credentials: 'omit',
 				// A hung API must not hang server-side rendering.
 				signal: AbortSignal.timeout(timeoutMs)
 			});

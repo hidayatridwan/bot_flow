@@ -112,4 +112,19 @@ describe('the request it builds', () => {
 		expect((init.headers as Record<string, string>)['content-type']).toBeUndefined();
 		expect(init.body).toBeUndefined();
 	});
+
+	it("passes credentials: 'omit', without which SvelteKit forwards the session cookie", async () => {
+		// `event.fetch` defaults to `credentials: 'same-origin'` and counts a hostname *suffix* match
+		// as same-origin, so it injects the browser's cookie jar into the upstream request whenever
+		// `.<apiHost>`.endsWith(`.<webHost>`) — true for localhost→localhost in dev and
+		// example.com→api.example.com in production. It does this *after* the headers below are built,
+		// so no assertion on `headers` can see it. Verified against a live dev server: without this,
+		// the API received `cookie: bf_session=...` on every single call. The API never reads cookies,
+		// so it was not an auth hole — but invariant 20 says the API stays cookie-free, and it did not.
+		const fetch = vi.fn(async () => json(200, {})) as unknown as FetchFn;
+
+		await clientWith(fetch, 'sess_abc').get('/auth/me');
+		const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit;
+		expect(init.credentials).toBe('omit');
+	});
 });

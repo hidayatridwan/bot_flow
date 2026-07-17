@@ -140,6 +140,17 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     keeps the credential (`session`) and the identity (`user`) in separate fields precisely so a
     careless `return { user }` cannot leak it. The API itself stays cookie-free, which is what keeps
     invariant 18's CORS reasoning sound.
+    **That last sentence costs one word per outbound call, and was false until it was paid.**
+    `event.fetch` defaults to `credentials: 'same-origin'`, and its notion of same-origin is a
+    *hostname suffix* match: it injects the browser's whole cookie jar into the upstream request
+    whenever `` `.<apiHost>`.endsWith(`.<webHost>`) `` — `localhost`→`localhost` in dev,
+    `example.com`→`api.example.com` in production. It does this *after* our header object is built,
+    so no amount of care in constructing headers prevents it and no assertion over them can see it.
+    Every API call shipped `bf_session` to the API. It was never an auth hole — the API reads only
+    `Authorization` — but the token landed in the API's access logs, and invariant 18's "no cookie
+    surface, therefore no CSRF surface" rested on a fact that was not true. Both `client.ts` and
+    `stream.ts` therefore pass **`credentials: 'omit'`**, and both pin it with a test, because this is
+    invisible in review: the code reads correctly either way.
 21. **An API outage is not a logout.** `hooks.server.ts` deletes the session cookie on a **401**
     only. A 5xx or an unreachable API leaves the cookie in place and merely renders the visitor as
     logged out for that request — otherwise a thirty-second blip silently signs out every user, and
@@ -272,6 +283,7 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Render `created_at` with `new Date(s)` | Normalise the offset first | Postgres `timestamptz::text` is `2026-07-16 11:39:20+00` — a space, and a 2-digit offset. ISO wants `T` and `+00:00`. `Date` returns **Invalid Date** silently, so the raw string reaches the UI. See `documents/format.ts` |
 | Add a `<form action>` to the upload card | Leave it JS-only | A multipart action proxies bytes through Node — the deprecated route, one layer up (invariant 24) |
 | Store an `allowed_origins` entry as the tenant typed it | `auth::normalize_origin` first | It is matched against `Origin` by string equality. `https://acme.com/`, `HTTPS://Acme.com` and `https://acme.com:443` all *look* right, mint fine, and never match — the key 403s forever with nothing in any log to say why |
+| Call the API through `event.fetch` without `credentials: 'omit'` | Pass it, and pin it | Kit counts a *hostname suffix* match as same-origin and injects the browser's cookie jar — `localhost`→`localhost`, `example.com`→`api.example.com`. It happens after your headers are built, so the code reads correctly and still ships `bf_session` to the API (invariant 20) |
 | Render the embed snippet from any key you are handed | `embedSnippet` refuses a non-`pk_` | The snippet is designed to be pasted into a public page. An `sk_` there is invariant 15 inverted |
 | "Secure" `/ask` with `require_management()` | Leave it ungated — that is invariant 27 | It is the one route a `pk_` exists to reach. A gate there 403s every deployed widget, and no unit test catches it: `Actor::from_request_parts` needs a database, so tenants find it, not CI |
 | Read `/ask/stream` with a browser `EventSource` | `fetch` + `features/chat/sse.ts` | `event: done` carries **no `data:` line** — `Event::data("")` writes nothing — and the WHATWG dispatch step drops a data-less event. `EventSource` would therefore never fire `done`, silently, and every completed answer would look truncated. Our decoder departs from the spec on exactly this point, and says so |
