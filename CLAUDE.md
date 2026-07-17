@@ -274,6 +274,8 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Store an `allowed_origins` entry as the tenant typed it | `auth::normalize_origin` first | It is matched against `Origin` by string equality. `https://acme.com/`, `HTTPS://Acme.com` and `https://acme.com:443` all *look* right, mint fine, and never match — the key 403s forever with nothing in any log to say why |
 | Render the embed snippet from any key you are handed | `embedSnippet` refuses a non-`pk_` | The snippet is designed to be pasted into a public page. An `sk_` there is invariant 15 inverted |
 | "Secure" `/ask` with `require_management()` | Leave it ungated — that is invariant 27 | It is the one route a `pk_` exists to reach. A gate there 403s every deployed widget, and no unit test catches it: `Actor::from_request_parts` needs a database, so tenants find it, not CI |
+| Read `/ask/stream` with a browser `EventSource` | `fetch` + `features/chat/sse.ts` | `event: done` carries **no `data:` line** — `Event::data("")` writes nothing — and the WHATWG dispatch step drops a data-less event. `EventSource` would therefore never fire `done`, silently, and every completed answer would look truncated. Our decoder departs from the spec on exactly this point, and says so |
+| Join a frame's `data:` lines with `''` | Join with `'\n'` | axum re-prefixes every newline inside a value with a fresh `data: `, so one token arrives as several lines. Joining without the `\n` collapses a numbered list into one line — the answer is still *plausible*, which is why nothing catches it |
 | Put an error's own text in an SSE `error` frame | A fixed string; `tracing::error!` the detail | The frame goes to a browser — for a `pk_` widget, a *stranger's*. `{e:#}` from `llm.rs` is `LLM replied {status}: {the gateway's raw body}` — a body we do not author and cannot predict. Observed from a 401: a key fragment, **the key's full SHA-256 hash**, and the gateway's internal table names. A mid-stream frame never passes through `AppError::into_response`, so it is the one client-facing surface that does *not* inherit invariant 16 from `?` — it must re-implement that discipline by hand |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
@@ -340,6 +342,7 @@ writing the code.
 | Reaper — `UPLOAD_GRACE` and `PROCESSING_LEASE` are named constants; read them there | `crates/worker/src/reaper.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |
 | Embeddable widget | `widget/widget.js` |
+| The SSE frame contract, and its only *tested* parser — `widget.js` has a second, untested one | `web/src/lib/features/chat/sse.ts` |
 | Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |
 | Typed API client: `ApiResult`, the JSON-vs-`text/plain` split, timeouts | `web/src/lib/server/api/` |
 | Session + one-time-key cookies; `requireUser` vs `requireSession` | `web/src/lib/server/auth/` |
