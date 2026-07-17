@@ -5,12 +5,15 @@ the platform parses, chunks, embeds and indexes them per tenant. End users ask q
 embeddable JS widget and get answers grounded **only** in that tenant's documents, with citations,
 streamed over SSE.
 
-> **This is a Rust Cargo workspace, not a Node project.** No `package.json`, no npm, no eslint.
-> Reach for `cargo`, `sqlx` and `docker compose`.
+> **Two projects, one repo, and the root is the Rust one.** Everything outside `web/` is a Cargo
+> workspace: no `package.json`, no npm, no eslint — reach for `cargo`, `sqlx` and `docker compose`.
+> `web/` alone is a Node project (SvelteKit, `bun`, eslint, prettier, vitest). Run the right tool in
+> the right directory; a `cargo` command at `web/` or an `npm` command at the root is a sign you have
+> the wrong half.
 
 `crates/api` (Axum HTTP server) · `crates/worker` (RabbitMQ consumer) · `crates/common` (shared
 object-key contract **and the embedding client**) · `sidecar/` (Python `pypdf` extractor) ·
-`widget/` (vanilla JS, no build step).
+`widget/` (vanilla JS, no build step) · `web/` (SvelteKit BFF — the dashboard).
 
 Backing services: Postgres 16, Qdrant, MinIO, RabbitMQ, Redis. Embeddings are an OpenAI-compatible
 `/embeddings` call (`text-embedding-3-small`, 1536-dim, cosine), authenticated with
@@ -26,6 +29,20 @@ cargo run -p worker       # ingestion consumer
 cargo test                # inline #[cfg(test)] unit tests; no integration suite
 cargo clippy && cargo fmt # stock defaults, no config files
 ```
+
+From `web/`, for the dashboard:
+
+```bash
+bun run dev               # http://localhost:5173 — needs the api running
+bun run test              # vitest; pure units, no services
+bun run check             # svelte-check, strict
+```
+
+`bun run lint` is `prettier --check . && eslint .`, and **prettier currently fails on ~208
+pre-existing files** — nearly all of `lib/components/ui/` (vendored shadcn). So the command exits
+non-zero on a clean checkout and eslint never runs behind it. Check your own files
+(`npx prettier --check <path>`, `npx eslint <path>`) rather than reading the summary count, and do not
+sweep the 208 into an unrelated diff.
 
 Rust is pinned to 1.95.0 (`rust-toolchain.toml`).
 
@@ -422,6 +439,18 @@ Honest inventory. Each entry states the impact, not merely the fact.
   not rebuild it, and invariant 10 *skips* a redelivered document whose fingerprint is unchanged. So
   dropping the collection alone leaves it permanently empty, with no error. The document rows must go
   too. Whoever changes the model next will hit both.
+- **Nothing in the API bounds a hung LLM or embedding call.** Both clients are
+  `reqwest::Client::new()` with no `.timeout()`, and reqwest's default is *no timeout at all*. If the
+  gateway accepts a connection and then stalls, the request task waits forever, holding its Tokio
+  task, its DB-free but real memory, and — on `/ask/stream` — an open SSE response. The only bounds
+  that exist today are `max_tokens: 512` on a *well-behaved* gateway and `ASK_TIMEOUT_MS`, which lives
+  in the **web BFF**: it protects the dashboard's browser and nothing else. A `pk_` widget calling the
+  API directly has no ceiling anywhere. The fix is a `.timeout()` on both clients in `llm.rs` and
+  `embedding.rs`; it is small, and it is not done.
+- **The Postman collection has drifted from the API.** `postman/bot_flow.postman_collection.json` is
+  missing `PATCH /auth/keys/{hash}` (invariant 26, shipped in phase 4), and its Chat group predates
+  the ask routes accepting a session (invariant 27). It is the artefact people reach for to learn the
+  surface, so a gap there reads as "this endpoint does not exist".
 - The DB permits an `uploaded` document status that **no code path ever assigns**. A vestige. Either
   give it meaning or drop it from the constraint — an unreachable state is a trap for the next reader.
 - **No `.env.example`**, though `.gitignore` expects one. A new contributor reconstructs the required
@@ -436,6 +465,14 @@ Honest inventory. Each entry states the impact, not merely the fact.
 - **Do not restate values this file does not own.** Chunk size and overlap, the relevance floor, the
   presign TTL, the upload cap, history depth, ports and the full `.env` block live in `README.md` and
   in the code. Duplicating them is how they drift. Point at the constant; don't copy it.
-- Tests are inline `#[cfg(test)]` unit tests and must pass with **no backing services running**.
-  Anything needing Postgres or Qdrant belongs in `crates/<crate>/tests/`, which does not exist yet —
-  discuss before introducing one. Do not widen visibility just to test something.
+- Tests must pass with **no backing services running** — inline `#[cfg(test)]` in Rust, `*.test.ts`
+  beside the source in `web/`. Anything needing Postgres or Qdrant belongs in `crates/<crate>/tests/`,
+  which does not exist yet — discuss before introducing one. Do not widen visibility just to test
+  something.
+- **Verify against the running system, not against this file.** Every claim here was true once; the
+  ones that quietly stopped being true are the expensive ones, and they do not announce themselves.
+  Recent examples, all found by looking rather than reasoning: the API was streaming the LLM
+  gateway's raw error body to browsers; the BFF was sending `bf_session` to the API on every call
+  while invariant 20 said it did not; `README` documented `[n]` citation markers that the system
+  prompt explicitly forbids. A curl, an echo server, or a captured stream settles in a minute what a
+  paragraph can argue for a year.

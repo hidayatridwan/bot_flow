@@ -27,8 +27,12 @@ takes it from there. There is no `/complete` callback for a client to forget or 
 
 Ask flow: rewrite the question into a standalone one using conversation history (skipped on the
 first turn) → embed it → Qdrant search filtered to the caller's `tenant_id` → drop hits below
-`RAG_SCORE_THRESHOLD` → build a numbered CONTEXT prompt → LLM answers with `[n]` citations, or
-admits it doesn't know → persist the turn.
+`RAG_SCORE_THRESHOLD` → build a numbered CONTEXT prompt → LLM answers in plain prose, or admits it
+doesn't know → persist the turn.
+
+The numbering is for the machine, not the reader: the model is **forbidden** from writing `[n]`
+markers into its prose, and citations come back as a structured `sources` array instead. That is what
+lets a client render them as it likes — or, like today's widget, not at all.
 
 ## Tech stack
 
@@ -207,9 +211,14 @@ Sign up at `/signup`; you land on a page that shows your `sk_` exactly once. The
 your library and uploads to it. See [`doc/feature/`](doc/feature/) for the design of each phase.
 
 ```bash
-bun run test            # 89 unit tests: the validation mirrors, the error maps, the api client
+bun run test            # unit tests: the validation mirrors, the error maps, the api client, the SSE decoder
 bun run check           # svelte-check, strict
 ```
+
+`bun run lint` is `prettier --check . && eslint .`, and it **fails on a clean checkout**: ~208
+vendored `lib/components/ui/` files predate the prettier config, and because the two commands are
+`&&`-chained, eslint never runs behind it. Check your own paths — `npx prettier --check <path>`,
+`npx eslint <path>` — instead of trusting the summary.
 
 **Run the worker too** if you want uploads to reach `Ready` — the dashboard shows
 `Uploading → Processing → Ready` by polling, but it is the worker that does the indexing.
@@ -480,8 +489,16 @@ Then ask:
 curl -sX POST localhost:3000/ask \
   -H "authorization: Bearer $SK" -H 'content-type: application/json' \
   -d '{"query":"What is the refund window?"}'
-# {"answer":"Refunds are accepted within 30 days [1].","sources":[{"index":1,"score":0.89,…}]}
+# {"answer":"The refund window is 30 days from the date of purchase.",
+#  "sources":[{"index":1,"score":0.54,"document_id":"","text":"Refunds are accepted within 30 days…"}]}
 ```
+
+Two things in that response are easy to misread. **The prose carries no `[1]`** — the model is
+forbidden from writing markers, so `sources[].index` is the only thing tying the answer back to a
+passage; it is 1-based and must never be renumbered. And **`score` is 0.54, not 0.9** — that is what a
+near-verbatim match actually scores with `text-embedding-3-small`, which is why the threshold note
+below matters. (`document_id` is empty here only because this chunk came from `/ingest`; a real
+uploaded document reports its id.)
 
 If nothing clears `RAG_SCORE_THRESHOLD` (default `0.70`), the API returns a canned "couldn't find any
 relevant information" rather than letting the model guess. The retrieval scores are logged on
@@ -561,7 +578,7 @@ curl -sX POST localhost:3000/ask -H "authorization: Bearer $SK" -H 'content-type
 # Turn 2 — pass it back, and the pronoun resolves.
 curl -sX POST localhost:3000/ask -H "authorization: Bearer $SK" -H 'content-type: application/json' \
   -d '{"query":"What is his mobile number?","conversation_id":"7dad2af9-…"}'
-# {"answer":"His mobile number is +6283141418173 [1].", …}
+# {"answer":"His mobile number is +6283141418173.", …}
 ```
 
 History lives in two RLS-protected tables, `conversations` and `messages`, both scoped by `tenant_id`
