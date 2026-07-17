@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ask, type AskHandlers, type Source } from './ask';
-import { CUT_SHORT, SESSION_EXPIRED } from './error-map';
+import { CUT_SHORT, NO_WORDS, SESSION_EXPIRED } from './error-map';
 import { GENERIC, RATE_LIMITED, UNREACHABLE } from '$lib/utils/api-copy';
 
 /** A streaming Response, delivered in whatever chunks the test asks for. */
@@ -193,6 +193,63 @@ describe('ask', () => {
 
 		it('does not call a real answer refused just because it is short', async () => {
 			const fetch = vi.fn().mockResolvedValue(stream(ANSWERED));
+			expect(await ask({ query: 'x' }, handlers, { fetch })).toEqual({ ok: true, refused: false });
+		});
+	});
+
+	describe('a stream that found passages and produced no words', () => {
+		// Observed in the wild, not invented. Every reasoning model bills its thinking against the same
+		// max_tokens budget as its prose, so a question that thinks hard enough spends the lot and emits
+		// no `content` at all. Reproduced against the configured gateway: at a squeezed budget,
+		// finish_reason comes back "length" with zero content deltas. Nothing failed, so the API quite
+		// correctly yields `done` — only the client is placed to notice the silence.
+		const SILENT = [
+			'event: conversation\ndata: e4490fbb-e9ca-4c8b-845c-fb39f31ae699\n\n',
+			'event: sources\ndata: [{"index":1,"score":0.59,"document_id":"d1","text":"Refunds within 30 days."}]\n\n',
+			'event: done\n\n'
+		];
+
+		it('reports a failure rather than rendering silence', async () => {
+			const fetch = vi.fn().mockResolvedValue(stream(SILENT));
+			const out = await ask({ query: 'dimana dia bekerja terakhir?' }, handlers, { fetch });
+
+			expect(out).toEqual({ ok: false, message: NO_WORDS });
+			// The citations still arrived — the caller may render them beside the failure.
+			expect(handlers.sourceSets[0]).toHaveLength(1);
+		});
+
+		it('does not mistake a refusal for silence', async () => {
+			// The mirror case, and the one that must not regress: a refusal has no sources but DOES carry
+			// its canned sentence, so it stays a successful answer (invariant 4).
+			const fetch = vi.fn().mockResolvedValue(stream(REFUSED));
+			expect(await ask({ query: 'x' }, handlers, { fetch })).toEqual({ ok: true, refused: true });
+		});
+
+		it('does not fire when a single token arrived', async () => {
+			const fetch = vi
+				.fn()
+				.mockResolvedValue(
+					stream([
+						'event: sources\ndata: [{"index":1,"score":0.5,"document_id":"d","text":"t"}]\n\n',
+						'event: token\ndata: Yes.\n\n',
+						'event: done\n\n'
+					])
+				);
+			expect(await ask({ query: 'x' }, handlers, { fetch })).toEqual({ ok: true, refused: false });
+		});
+
+		it('counts tokens rather than judging the prose', async () => {
+			// A whitespace-only answer is still the model speaking. Inferring emptiness from the joined
+			// text would silently reclassify it, and it is not this file's place to grade output.
+			const fetch = vi
+				.fn()
+				.mockResolvedValue(
+					stream([
+						'event: sources\ndata: [{"index":1,"score":0.5,"document_id":"d","text":"t"}]\n\n',
+						'event: token\ndata:  \n\n',
+						'event: done\n\n'
+					])
+				);
 			expect(await ask({ query: 'x' }, handlers, { fetch })).toEqual({ ok: true, refused: false });
 		});
 	});

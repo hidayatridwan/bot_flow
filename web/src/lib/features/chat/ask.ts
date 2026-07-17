@@ -1,6 +1,6 @@
 import type { ApiError } from '$lib/types/api';
 import { GENERIC, UNREACHABLE } from '$lib/utils/api-copy';
-import { CUT_SHORT, SESSION_EXPIRED, mapAskError } from './error-map';
+import { CUT_SHORT, NO_WORDS, SESSION_EXPIRED, mapAskError } from './error-map';
 import { createSseDecoder } from './sse';
 
 /**
@@ -115,6 +115,9 @@ export async function ask(
 	let sources: Source[] = [];
 	let done = false;
 	let failure: string | null = null;
+	// Counted rather than inferred from the accumulated text: a stream of whitespace-only tokens is
+	// still the model speaking, and it is not this file's job to judge the prose.
+	let tokens = 0;
 
 	reading: for (;;) {
 		let chunk: ReadableStreamReadResult<Uint8Array>;
@@ -141,6 +144,7 @@ export async function ask(
 					handlers.onSources(sources);
 					break;
 				case 'token':
+					tokens += 1;
 					handlers.onToken(frame.data);
 					break;
 				case 'error':
@@ -168,5 +172,17 @@ export async function ask(
 	// does, a client matching on the text starts calling refusals real answers. `relevant.is_empty()`
 	// is the single predicate driving both the empty array and the canned token, so this is exact by
 	// construction and cannot rot.
-	return { ok: true, refused: sources.length === 0 };
+	const refused = sources.length === 0;
+
+	// Retrieval worked and the model still said nothing. Reported as a failure even though the stream
+	// succeeded, because from the asker's side nothing happened: a silent bubble is indistinguishable
+	// from a broken page, and they cannot know that retrying is the fix.
+	//
+	// A refusal always carries its canned sentence, so this can only fire when passages were found.
+	// The cause is upstream — a reasoning model bills its thinking against the same `max_tokens`
+	// budget as its prose, so a hard enough question spends the lot and emits no `content`. Nothing
+	// errored, so the API correctly yields `done`; only the client is placed to notice the silence.
+	if (!refused && tokens === 0) return { ok: false, message: NO_WORDS };
+
+	return { ok: true, refused };
 }

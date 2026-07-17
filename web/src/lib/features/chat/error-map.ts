@@ -20,6 +20,23 @@ export const SESSION_EXPIRED = 'Your session has expired. Please log in again.';
  */
 export const CUT_SHORT = 'The answer was cut short. Ask again to see the rest.';
 
+/**
+ * The stream completed cleanly, found passages, and produced no words.
+ *
+ * Not hypothetical, and not the same as a refusal. A refusal has *no* sources and a canned sentence —
+ * the system declining to guess (invariant 4). This is the opposite: retrieval succeeded, so the bot
+ * had something to say and said nothing.
+ *
+ * The cause lives in the model. Every reasoning model bills its thinking against the same
+ * `max_tokens` budget as its prose, so a question that thinks hard enough can spend the whole budget
+ * and emit no `content` at all — `finish_reason: "length"`, zero content deltas, and an API that
+ * quite correctly yields `done` because nothing failed. Reproduced against the configured gateway.
+ *
+ * Retrying is genuinely the right advice: the budget is per-request and thinking is not deterministic.
+ */
+export const NO_WORDS =
+	"The bot found relevant passages but didn't produce an answer. Try asking again.";
+
 export function mapAskError(error: ApiError): string {
 	if (error.status === 429) return RATE_LIMITED;
 	if (error.status === 401) return SESSION_EXPIRED;
