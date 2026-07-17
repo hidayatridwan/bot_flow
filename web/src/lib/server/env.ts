@@ -33,3 +33,21 @@ export const widgetApiBaseUrl = (): string =>
 export const sessionTtlSeconds = (): number => Number(env.SESSION_TTL_SECS ?? 2_592_000);
 
 export const apiTimeoutMs = (): number => Number(env.API_TIMEOUT_MS ?? 10_000);
+
+/**
+ * The ceiling on one `/ask/stream` request, headers *and* body.
+ *
+ * Not `API_TIMEOUT_MS`, and the gap is not a rounding error. That budget is sized for a database read
+ * and must keep protecting `/documents` and `/keys` from a hung API. An ask is a different animal:
+ * `ask_stream` runs the query rewrite (a full LLM call) *and* retrieval (an embedding call + Qdrant)
+ * **before** it constructs the SSE response, so the first byte does not arrive until two model calls
+ * have finished. Ten seconds would kill healthy requests routinely.
+ *
+ * The default is generous because this is the **only** timeout in the whole chain. The API builds its
+ * LLM and embedding clients with `reqwest::Client::new()` and no `.timeout()`, so nothing upstream
+ * bounds a hung gateway. The one thing that does bound a *legitimate* answer is `max_tokens: 512` in
+ * `llm.rs` — at a slow-but-real 5 tokens/sec that is ~100s of streaming, plus the two calls above.
+ * Anything tighter truncates good answers; the value is env-tunable for deployments that know their
+ * gateway is faster.
+ */
+export const askTimeoutMs = (): number => Number(env.ASK_TIMEOUT_MS ?? 120_000);

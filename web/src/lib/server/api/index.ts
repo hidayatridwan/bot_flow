@@ -1,6 +1,7 @@
 import type { RequestEvent } from '@sveltejs/kit';
-import { apiBaseUrl, apiTimeoutMs } from '$lib/server/env';
+import { apiBaseUrl, apiTimeoutMs, askTimeoutMs } from '$lib/server/env';
 import { createApiClient, type ApiClient } from './client';
+import { createStreamClient, type StreamClient } from './stream';
 
 /**
  * The only place env is read. The token is passed explicitly rather than pulled from `locals`, which
@@ -16,4 +17,19 @@ export function api(event: RequestEvent, token?: string): ApiClient {
 	});
 }
 
+/**
+ * The same, for a response we pipe instead of parse. Separate because `ApiClient` cannot carry a
+ * stream at all — see `stream.ts` — and because an ask needs its own, much longer budget.
+ */
+export function apiStream(event: RequestEvent, token?: string): StreamClient {
+	return createStreamClient({
+		baseUrl: apiBaseUrl(),
+		fetch: event.fetch,
+		token,
+		timeoutMs: askTimeoutMs(),
+		signal: event.request.signal
+	});
+}
+
 export type { ApiClient } from './client';
+export type { StreamClient, StreamResult } from './stream';
