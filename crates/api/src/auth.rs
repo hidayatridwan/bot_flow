@@ -276,6 +276,16 @@ pub enum ActorKind {
 /// logged-in human, and there is no credential the dashboard could present other than its session —
 /// the one-time `sk_` is unrecoverable by design (invariant 22).
 ///
+/// **Extracting is not gating.** `Actor` decides *who is asking*; it never decides *who may*. Two
+/// route shapes use it, and they answer that second question differently:
+///
+/// - management routes call [`Actor::require_management`], which refuses `Publishable` (invariant 23);
+/// - the ask routes call **nothing**, admitting all three kinds on purpose (invariant 27) — a `pk_`
+///   already reached them, and the other two are strictly stronger.
+///
+/// So widening a route *to* `Actor` grants no access by itself. The gate is a separate, per-route
+/// decision, and `require_management()` has never moved.
+///
 /// It yields a `tenant_id` like both of its delegates, so it drives `db::tenant_tx()` unchanged:
 /// RLS is keyed on the string, not on how the string was obtained.
 pub struct Actor {

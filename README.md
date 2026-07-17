@@ -61,14 +61,17 @@ Three independent layers, so a single mistake doesn't leak data:
 | `pk_…` | publishable | shipped to browsers | `/ask`, `/ask/stream`, `/search` — and only from an `Origin` on the key's allow-list |
 
 `ADMIN_API_KEY` (an env var, not a database row) guards `/admin/*`. A third principal — a **login
-session** (a `sess_` bearer token from `/auth/login`) — authenticates the `/auth/*` dashboard routes
-*and* the document-management routes; see [Self-serve accounts](#self-serve-accounts).
+session** (a `sess_` bearer token from `/auth/login`) — authenticates the `/auth/*` dashboard routes,
+the document-management routes *and* the chat routes; see [Self-serve accounts](#self-serve-accounts).
 
 A session is accepted wherever an `sk_` is, **except** `/ingest` and the deprecated multipart
-`POST /documents`. It is never accepted in place of a `pk_`'s chat-only limits: a publishable key is
-printed in public page source and stays chat-only, which is the whole reason it is safe to print.
-The dashboard has no key to present — the one-time `sk_` is unrecoverable by design — so the session
-is the only credential it holds.
+`POST /documents`. The dashboard has no key to present — the one-time `sk_` is unrecoverable by
+design — so the session is the only credential it holds.
+
+**The containment runs one way.** A `pk_` is never accepted where an `sk_` or a session is required:
+it is printed in public page source and stays chat-only, which is the whole reason it is safe to
+print. The reverse is unremarkable — a session on `/ask` is a stronger credential reaching a route the
+weakest one already reaches, which is why the chat routes admit all three.
 
 ## Endpoints
 
@@ -91,8 +94,8 @@ is the only credential it holds.
 | `GET` | `/documents` | secret **or** session | Lists this tenant's documents and their status |
 | `POST` | `/ingest` | secret | `{"texts": [...]}` — indexes raw strings, skipping the upload pipeline |
 | `POST` | `/search` | any key | `{"query": "…", "limit": 3}` — returns raw scored chunks, no LLM |
-| `POST` | `/ask` | any key | Retrieval + LLM answer as one JSON blob. Rate-limited |
-| `POST` | `/ask/stream` | any key | Same, as SSE: a `conversation` event, a `sources` event, then `token` events, then `done` |
+| `POST` | `/ask` | any key **or** session | Retrieval + LLM answer as one JSON blob. Rate-limited |
+| `POST` | `/ask/stream` | any key **or** session | Same, as SSE: a `conversation` event, a `sources` event, then `token` events, then `done`. An LLM failure yields one `error` event carrying a fixed string — the detail goes to the log, never the client |
 
 Both ask endpoints accept an optional `conversation_id` and return one. See
 [Conversation memory](#conversation-memory).

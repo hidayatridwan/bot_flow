@@ -210,6 +210,22 @@ pub async fn search(
 
 const NO_ANSWER: &str = "Sorry, I couldn't find any relevant information.";
 
+/// What an LLM failure looks like to whoever is chatting.
+///
+/// Invariant 16, hand-rolled. An SSE frame is yielded mid-stream and never passes through
+/// `AppError::into_response`, so it is the one client-facing surface that does not inherit the
+/// log-in-full / answer-generically split that `?` gives every ordinary handler for free.
+///
+/// The detail this replaces was `{e:#}`, which for an LLM error is `llm.rs`'s
+/// `LLM replied {status}: {body}` — **a body we neither author nor control**. A real 401 from the
+/// gateway was observed carrying a key fragment, the key's full SHA-256 hash, and the name of an
+/// internal table. That is one gateway's choice on one day; the next one's is not ours to assume,
+/// which is the actual reason this cannot be a judgement call about how bad the body looks.
+///
+/// On a `pk_` widget this frame reaches a stranger's browser (invariant 15) — the least private
+/// surface in the system.
+const STREAM_FAILED: &str = "the answer could not be completed";
+
 /// `""`, whitespace and `null` all mean "no conversation yet".
 ///
 /// `#[serde(default)]` alone only covers an ABSENT key. A present-but-empty string is what an
@@ -261,21 +277,29 @@ async fn prepare(
     Ok((conversation_id, standalone))
 }
 
+/// Answer a question from the tenant's own documents.
+///
+/// `Actor`, and no gate: a `pk_` must reach this (it is the only thing a publishable key may do, and
+/// that limit is what makes it safe to print), so the two stronger credentials are admitted to a route
+/// the weakest already reaches. Adding `require_management()` here would 403 every widget — see
+/// invariant 27.
 pub async fn ask(
     State(state): State<AppState>,
-    tenant: AuthTenant,
+    actor: Actor,
     Json(req): Json<AskRequest>,
 ) -> Result<Json<Value>, AppError> {
-    rate_limit::check(&state, &tenant.tenant_id).await?;
+    // Keyed on the tenant, not the credential, so a dashboard question and a widget question draw on
+    // one bucket. That is what bounds the spend this route's openness would otherwise invite.
+    rate_limit::check(&state, &actor.tenant_id).await?;
 
-    let (conversation_id, standalone) = prepare(&state, &tenant.tenant_id, &req).await?;
+    let (conversation_id, standalone) = prepare(&state, &actor.tenant_id, &req).await?;
 
-    let relevant = retrieve(&state, &tenant.tenant_id, &standalone, req.limit).await?;
+    let relevant = retrieve(&state, &actor.tenant_id, &standalone, req.limit).await?;
 
     if relevant.is_empty() {
         conversation::append_turn(
             &state.db,
-            &tenant.tenant_id,
+            &actor.tenant_id,
             conversation_id,
             &req.query,
             NO_ANSWER,
@@ -300,7 +324,7 @@ pub async fn ask(
 
     conversation::append_turn(
         &state.db,
-        &tenant.tenant_id,
+        &actor.tenant_id,
         conversation_id,
         &req.query,
         &answer,
@@ -517,18 +541,20 @@ async fn retrieve(
         .collect())
 }
 
+/// The streaming twin of [`ask`]. Same principal, same absence of a gate, for the same reason
+/// (invariant 27) — the pair must not diverge on who may call them.
 pub async fn ask_stream(
     State(state): State<AppState>,
-    tenant: AuthTenant,
+    actor: Actor,
     Json(req): Json<AskRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    rate_limit::check(&state, &tenant.tenant_id).await?;
+    rate_limit::check(&state, &actor.tenant_id).await?;
 
     // Memory + rewrite before retrieval, so failures here are normal HTTP errors, not mid-stream.
-    let (conversation_id, standalone) = prepare(&state, &tenant.tenant_id, &req).await?;
+    let (conversation_id, standalone) = prepare(&state, &actor.tenant_id, &req).await?;
 
     // Retrieval happens before streaming, so retrieval errors are normal HTTP errors (not mid-stream).
-    let relevant = retrieve(&state, &tenant.tenant_id, &standalone, req.limit).await?;
+    let relevant = retrieve(&state, &actor.tenant_id, &standalone, req.limit).await?;
 
     // We know the sources up front — send them as the first SSE event.
     let sources = json!(relevant
@@ -547,7 +573,7 @@ pub async fn ask_stream(
     let empty = relevant.is_empty();
     let llm = state.llm.clone(); // move an owned client into the stream
     let db = state.db.clone();
-    let tenant_id = tenant.tenant_id.clone();
+    let tenant_id = actor.tenant_id.clone();
     let question = req.query.clone();
 
     let sse = async_stream::stream! {
@@ -582,7 +608,8 @@ pub async fn ask_stream(
                         Ok(_) => {} // empty delta (role-only / [DONE]) — skip
                         Err(e) => {
                             failed = true;
-                            yield Ok(Event::default().event("error").data(format!("{e:#}")));
+                            tracing::error!("llm stream failed mid-answer: {e:#}");
+                            yield Ok(Event::default().event("error").data(STREAM_FAILED));
                             break;
                         }
                     }
@@ -590,7 +617,8 @@ pub async fn ask_stream(
             }
             Err(e) => {
                 failed = true;
-                yield Ok(Event::default().event("error").data(format!("{e:#}")));
+                tracing::error!("llm stream failed to start: {e:#}");
+                yield Ok(Event::default().event("error").data(STREAM_FAILED));
             }
         }
 

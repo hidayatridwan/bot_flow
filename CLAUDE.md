@@ -158,12 +158,14 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     session is the *only* credential the BFF holds, and a dashboard that cannot list a document is
     not a dashboard. The alternatives were storing an `sk_` server-side (which contradicts invariant
     14's whole stated trade — hash, don't encrypt) or minting a key per page load.
-    `Actor` is the union principal that expresses this, and `require_management()` is its gate:
-    `Secret | Session` pass, `Publishable` is refused with a 403. `AuthTenant::require_secret()`
-    still exists and still guards what stays key-only — `/ingest` and the deprecated multipart
-    `POST /documents`. Both extractors yield a `tenant_id` and nothing else reaches the database, so
-    **RLS is keyed on the string, not on how the string was obtained** — isolation is identical
-    whichever credential arrived.
+    `Actor` is the union principal that expresses this, and `require_management()` is its gate *on
+    these routes*: `Secret | Session` pass, `Publishable` is refused with a 403. The extractor and the
+    gate are two decisions, not one — `Actor` also carries the ask routes, where it deliberately gates
+    nothing (invariant 27). Widening the *extractor* is not widening the *gate*, and this invariant is
+    about the gate. `AuthTenant::require_secret()` still exists and still guards what stays key-only —
+    `/ingest` and the deprecated multipart `POST /documents`. Both extractors yield a `tenant_id` and
+    nothing else reaches the database, so **RLS is keyed on the string, not on how the string was
+    obtained** — isolation is identical whichever credential arrived.
 24. **A presigned URL in the browser is a capability, not a credential — and it does not break
     invariant 20.** The dashboard uploads by asking its own origin for a URL (server-side, with the
     session) and then PUTting the bytes *straight to MinIO*. The session never leaves Node; what the
@@ -193,6 +195,26 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     it would silently turn a published key secret, or a secret key public, under an unchanged snippet.
     The `tenant_id` in the `WHERE` clause is the isolation boundary (`api_keys` has no RLS), and a
     foreign hash **404s like an unknown one** — same non-oracle rule as invariants 8 and 18.
+27. **The ask routes admit any authenticated principal of the tenant, and that is not a widening.**
+    `/ask` and `/ask/stream` take `Actor` and call **no gate**: `Secret`, `Publishable` and `Session`
+    all pass. Read that against invariant 15 before reaching for a gate.
+    A `pk_` is printed in public page source and is *expected* to be stolen — and it **already reached
+    these routes**, because "it can only ask questions" is precisely the containment that makes it safe
+    to print. So the ask routes are, by design, the ones the *weakest* credential in the system may
+    reach. A `sess_` costs an Argon2-verified password and expires; an `sk_` is stronger still.
+    Admitting the stronger credentials to a route the weakest already reaches adds no exposure — which
+    is the whole argument, and it is why this is not the mirror of invariant 23. That gate refuses
+    `pk_`; this one refuses nothing, deliberately.
+    **No gate is not no auth.** `Actor` still resolves the token against exactly one table, chosen by
+    prefix, and on the `pk_` branch its `AuthTenant` delegate still enforces the `Origin` allow-list.
+    Nothing about a publishable key's containment changed.
+    **The trap:** a future reader will want to "secure" this by adding `require_management()`. That
+    gate 403s every deployed widget — the one client these routes exist to serve — and it would be
+    discovered by tenants, not by tests, because `Actor::from_request_parts` needs a database and the
+    unit tests cannot see it.
+    Spend is bounded by `rate_limit::check`, which keys on `tenant_id` and not on the credential, so a
+    session cannot draw a token more than that tenant's own `pk_` already could. That is what answers
+    the spend question this change would otherwise raise: the limiter that was already there.
 
 ## Tenant isolation — the three layers
 
@@ -251,6 +273,8 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Add a `<form action>` to the upload card | Leave it JS-only | A multipart action proxies bytes through Node — the deprecated route, one layer up (invariant 24) |
 | Store an `allowed_origins` entry as the tenant typed it | `auth::normalize_origin` first | It is matched against `Origin` by string equality. `https://acme.com/`, `HTTPS://Acme.com` and `https://acme.com:443` all *look* right, mint fine, and never match — the key 403s forever with nothing in any log to say why |
 | Render the embed snippet from any key you are handed | `embedSnippet` refuses a non-`pk_` | The snippet is designed to be pasted into a public page. An `sk_` there is invariant 15 inverted |
+| "Secure" `/ask` with `require_management()` | Leave it ungated — that is invariant 27 | It is the one route a `pk_` exists to reach. A gate there 403s every deployed widget, and no unit test catches it: `Actor::from_request_parts` needs a database, so tenants find it, not CI |
+| Put an error's own text in an SSE `error` frame | A fixed string; `tracing::error!` the detail | The frame goes to a browser — for a `pk_` widget, a *stranger's*. `{e:#}` from `llm.rs` is `LLM replied {status}: {the gateway's raw body}` — a body we do not author and cannot predict. Observed from a 401: a key fragment, **the key's full SHA-256 hash**, and the gateway's internal table names. A mid-stream frame never passes through `AppError::into_response`, so it is the one client-facing surface that does *not* inherit invariant 16 from `?` — it must re-implement that discipline by hand |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
 The worker classifies these into fatal-vs-retryable. It is a cross-language contract and neither side
@@ -271,8 +295,9 @@ writing the code.
   - `tenant.require_secret()?` — `sk_` only. On `/ingest` and the deprecated multipart
     `POST /documents`. Both are paths we are not extending, so neither gets a session.
 
-  Correctly absent on `/ask` and `/ask/stream`, which `pk_` is *meant* to reach; absent **as an
-  outstanding gap** on `/search`.
+  Correctly absent on `/ask` and `/ask/stream`, which take `Actor` and gate nothing: all three kinds
+  pass, because `pk_` is *meant* to reach them and the other two are strictly stronger (invariant 27).
+  Absent **as an outstanding gap** on `/search`.
 - **Two auth principals, do not conflate them.** `AuthTenant` resolves an API key (`sk_`/`pk_`) to a
   tenant — the *machine* credential (a tenant's server, the widget). `SessionAuth` resolves a
   `sess_` token to an account + tenant — the *human* credential (the dashboard, the `/auth/*`
