@@ -409,6 +409,49 @@
           }
         },
         {
+          "name": "Update Key Origins",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{sessionToken}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"allowed_origins\": [\n    \"https://acme.com\",\n    \"https://www.acme.com\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/auth/keys/{{keyHash}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "keys",
+                "{{keyHash}}"
+              ]
+            },
+            "description": "Change a key's allowed_origins. Its `kind` and its hash are immutable (invariant 26). Run List Keys first to populate {{keyHash}}.\n\nAdding a domain must not mean minting a new key: a pk_ is public and expected to be stolen, so rotating it to add 'www.' buys nothing, while forcing a site-wide <script> edit for a one-word change is how tenants end up asking for a wildcard — which would delete the containment entirely. `kind` stays immutable because flipping it would silently turn a published key secret, or a secret key public, under an unchanged snippet.\n\nBehaviour worth knowing (each verified against a live API):\n- allowed_origins is REQUIRED. Omitting it is a 422, not a no-op — there is no serde default.\n- Origins are canonicalised, not stored as typed: [\"HTTPS://Acme.com:443/\", \"https://acme.com\"] both become \"https://acme.com\", and the duplicate collapses. They are matched against the browser's Origin header by STRING EQUALITY, so a value in a non-canonical shape is not lax — it is dead, and the key 403s forever with nothing in any log to say why.\n- A publishable key with an empty list is refused (422). That is not a permissive key, it is one that can answer from nowhere.\n- 'null' is never allow-listable — it is what every file:// page and sandboxed iframe sends.\n- A hash that is not yours 404s exactly like one that never existed, so this is not an oracle for which keys exist (same rule as invariants 8 and 18).\n\nReturns {key_hash, kind, allowed_origins} — the list echoed back is the CANONICALISED one, which is what GET /auth/keys will show. (Note POST /auth/keys echoes the raw request value instead, so the two responses can disagree for the same input.)"
+          }
+        },
+        {
           "name": "Revoke Key",
           "request": {
             "auth": {
@@ -701,7 +744,7 @@
                 "search"
               ]
             },
-            "description": "Raw vector search (debug): returns hits with score/text/document_id. Requires a SECRET key."
+            "description": "Raw vector search (debug): returns hits with score/text/document_id. No LLM, and no relevance floor — unlike /ask, it does not refuse when nothing scores well.\n\nAUTH: a secret OR a publishable key. NOT a session — this route takes `AuthTenant`, so a sess_ token is looked up in api_keys, misses, and 401s (verified). Only /ask and /ask/stream were widened to `Actor`. With a publishable key, send an Origin header matching the key's allowed_origins.\n\nKNOWN GAP, not a decision: /search is neither restricted to secret keys nor rate limited. A pk_ is expected to be stolen, and the containment for that theft was 'it can only ask questions' — which no longer bounds the cost, because every query is a billed /embeddings call against EMBEDDING_API_KEY. It can also dump raw chunk text. See 'Known state & debt' in CLAUDE.md."
           }
         },
         {
@@ -742,7 +785,7 @@
                 "ask"
               ]
             },
-            "description": "Turn 1 of a conversation. Send NO conversation_id and the server mints one, returning it as `conversation_id`. The test script captures it into {{conversationId}}.\n\nAn empty string or null is treated the same as omitting the field.\n\nGrounded RAG answer (single JSON) with citations + sources. Accepts a secret OR publishable key. For a publishable key, also send an Origin header matching the key's allowed_origins."
+            "description": "Turn 1 of a conversation. Send NO conversation_id and the server mints one, returning it as `conversation_id`. The test script captures it into {{conversationId}}.\n\nAn empty string or null is treated the same as omitting the field.\n\nGrounded RAG answer as a single JSON blob: `answer` is plain prose and carries NO [n] markers — the model is forbidden from writing them — and `sources[]` is the structured citation list. `sources[].index` is 1-based and is the only way to map the answer back to a passage, so never renumber it (invariant 5).\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) — no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket."
           },
           "event": [
             {
@@ -798,7 +841,7 @@
                 "ask"
               ]
             },
-            "description": "Turn 2+. Passes {{conversationId}}, captured by the 'Ask' request above, so the server rewrites a context-dependent question into a standalone one before retrieval.\n\nRun 'Ask' first (e.g. \"who is ridwan?\"), then this. Without the conversation_id the pronoun \"his\" retrieves nothing and you get 'Sorry, I couldn't find any relevant information.'"
+            "description": "Turn 2+. Passes {{conversationId}}, captured by the 'Ask' request above, so the server rewrites a context-dependent question into a standalone one before retrieval.\n\nRun 'Ask' first (e.g. \"who is ridwan?\"), then this. Without the conversation_id the pronoun \"his\" retrieves nothing and you get 'Sorry, I couldn't find any relevant information.'\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) — no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket."
           }
         },
         {
@@ -840,10 +883,11 @@
                 "stream"
               ]
             },
-            "description": "Server-Sent Events: a 'conversation' event first (the conversation_id), then 'sources', then incremental 'token' events, then 'done'.\n\nSend no conversation_id to start a new conversation. Postman cannot run a test script against a stream, so copy the id from the first `conversation` event and paste it into the {{conversationId}} collection variable to continue.\n\nAccepts secret OR publishable key (publishable also needs a matching Origin header)."
+            "description": "Server-Sent Events: a 'conversation' event first (the conversation_id), then 'sources', then incremental 'token' events, then 'done'.\n\nSend no conversation_id to start a new conversation. Postman cannot run a test script against a stream, so copy the id from the first `conversation` event and paste it into the {{conversationId}} collection variable to continue.\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) — no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket.\n\nTwo things about the frames that are easy to get wrong. An LLM failure yields a single 'error' event carrying a FIXED string — the gateway's own error body goes to the API log and never to a client (invariant 16), because for a pk_ widget this frame reaches a stranger's browser. And 'done' carries no `data:` field at all, so a browser EventSource — which drops any event with an empty data buffer, per the WHATWG spec — would never fire it. Read the stream with fetch, not EventSource."
           }
         }
-      ]
+      ],
+      "description": "Who may call these, and why it differs per route.\n\n/ask and /ask/stream take the `Actor` extractor and gate NOTHING: a secret key, a publishable key, or a login session all work (invariant 27). That is not a widening. A pk_ is printed in public page source and is expected to be stolen — 'it can only ask questions' is precisely the containment that makes it safe to print — so these are, by design, the routes the weakest credential in the system may reach. Admitting the stronger ones adds no exposure.\n\n/search is the exception: it still takes `AuthTenant`, so a session 401s there. Do not assume the three chat routes share an auth model — they do not.\n\nFor any publishable key, send an Origin header that exactly matches one of the key's allowed_origins, or you get a 403. Rate limiting is keyed on the tenant, not on the credential, so the dashboard and the widget draw on one bucket."
     },
     {
       "name": "Dev",

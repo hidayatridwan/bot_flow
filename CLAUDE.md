@@ -455,10 +455,6 @@ Honest inventory. Each entry states the impact, not merely the fact.
   in the **web BFF**: it protects the dashboard's browser and nothing else. A `pk_` widget calling the
   API directly has no ceiling anywhere. The fix is a `.timeout()` on both clients in `llm.rs` and
   `embedding.rs`; it is small, and it is not done.
-- **The Postman collection has drifted from the API.** `postman/bot_flow.postman_collection.json` is
-  missing `PATCH /auth/keys/{hash}` (invariant 26, shipped in phase 4), and its Chat group predates
-  the ask routes accepting a session (invariant 27). It is the artefact people reach for to learn the
-  surface, so a gap there reads as "this endpoint does not exist".
 - The DB permits an `uploaded` document status that **no code path ever assigns**. A vestige. Either
   give it meaning or drop it from the constraint — an unreachable state is a trap for the next reader.
 - **No `.env.example`**, though `.gitignore` expects one. A new contributor reconstructs the required
