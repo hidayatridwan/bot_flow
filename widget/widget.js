@@ -56,7 +56,20 @@
         #cw-send{flex:0 0 38px;width:38px;height:38px;border:none;border-radius:10px;
           background:var(--cw-bot-bg);color:var(--cw-muted);cursor:not-allowed;
           display:flex;align-items:center;justify-content:center}
-        #cw-send:not(:disabled){background:var(--cw-accent);color:#fff;cursor:pointer}`;
+        #cw-send:not(:disabled){background:var(--cw-accent);color:#fff;cursor:pointer}
+        .cw-sources{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+        .cw-sources-hdr{font-size:11px;font-weight:600;color:var(--cw-muted);
+          text-transform:uppercase;letter-spacing:.04em}
+        .cw-source{font-size:13px;border:1px solid var(--cw-border);border-radius:10px;
+          overflow:hidden;background:#fff}
+        .cw-source-sum{display:flex;align-items:center;gap:8px;padding:6px 10px;cursor:pointer;
+          list-style:none}
+        .cw-source-sum::-webkit-details-marker{display:none}
+        .cw-chip{font-weight:700;color:var(--cw-accent);font-size:12px}
+        .cw-score{color:var(--cw-muted);font-size:12px;font-variant-numeric:tabular-nums}
+        .cw-source-text{padding:0 10px 8px;color:var(--cw-text);white-space:pre-wrap;
+          overflow-wrap:anywhere;line-height:1.45}
+        .cw-bot-muted{color:var(--cw-muted);font-style:italic}`;
             const s = document.createElement('style'); s.textContent = css; document.head.appendChild(s);
         },
 
@@ -115,7 +128,10 @@
             this.send.disabled = true;
             this._append('cw-user', query);
             const bot = this._append('cw-bot', '');
-            let answer = '';
+            // One turn's accumulating state. `tokens` is counted, not inferred from `answer`: a
+            // whitespace-only reply is still the model speaking, and judging the prose is not our
+            // job — only noticing when there is none of it at all.
+            const turn = { bot, answer: '', tokens: 0, sources: [], done: false, error: false, sourcesEl: null };
             try {
                 const body = { query };
                 if (this.conversationId) body.conversation_id = this.conversationId;
@@ -124,7 +140,18 @@
                     headers: { authorization: `Bearer ${this.publicKey}`, 'content-type': 'application/json' },
                     body: JSON.stringify(body),
                 });
-                if (!res.ok) { bot.textContent = `Error ${res.status}`; return; }
+                if (!res.ok) {
+                    // A stranger must not read `Error 403`. The tenant needs the status (a 403 is an
+                    // allowed_origins miss they must fix); the visitor needs a sentence. Log the one,
+                    // show the other. 429 is the single status a visitor can act on, so it gets its own.
+                    console.error('[widget] ask failed:', res.status);
+                    turn.error = true;
+                    bot.textContent = res.status === 429
+                        ? 'The assistant is busy right now — please wait a moment and try again.'
+                        : "The assistant isn't available right now. Please try again later.";
+                    bot.classList.add('cw-bot-muted');
+                    return;
+                }
 
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
@@ -135,27 +162,114 @@
                     buffer += decoder.decode(value, { stream: true });
                     let i;
                     while ((i = buffer.indexOf('\n\n')) !== -1) {
-                        const { event, data } = this._parseEvent(buffer.slice(0, i));
+                        const frame = this._parseEvent(buffer.slice(0, i));
                         buffer = buffer.slice(i + 2);
-                        answer = this._onEvent(bot, event, data, answer);
+                        this._onEvent(turn, frame.event, frame.data);
                     }
                 }
-            } catch (err) { bot.textContent = 'Network error: ' + err.message; }
+            } catch (err) {
+                console.error('[widget] stream error:', err);
+                turn.error = true;
+                bot.textContent = 'The connection was interrupted. Please ask again.';
+                bot.classList.add('cw-bot-muted');
+            }
+            this._finalize(turn);
         },
 
-        // Dispatch one SSE event; returns the answer accumulated so far.
-        // The server still emits a `sources` event — we ignore it rather than render it.
-        _onEvent(bot, event, data, answer) {
+        // Dispatch one SSE frame into the turn's state.
+        _onEvent(turn, event, data) {
             switch (event) {
+                case 'conversation':
+                    this.conversationId = data;
+                    break;
+                case 'sources':
+                    // Citations arrive *before* the first token — the API knows them the moment
+                    // retrieval returns. Rendering them as they land is a real property of the
+                    // product, and the first time this widget has ever shown them (invariant 5).
+                    try { turn.sources = JSON.parse(data); } catch { turn.sources = []; }
+                    this._renderSources(turn);
+                    break;
                 case 'token':
-                    answer += data;
-                    bot.textContent = answer;
+                    turn.tokens += 1;
+                    turn.answer += data;
+                    turn.bot.textContent = turn.answer;
                     this.log.scrollTop = this.log.scrollHeight;
                     break;
-                case 'conversation': this.conversationId = data; break;
-                case 'error': bot.textContent = 'Error: ' + data; break;
+                case 'error':
+                    // Invariant 16: the frame's text is not ours to render, even though the API now
+                    // sends a fixed string. Show our own copy; keep the detail in the console.
+                    console.error('[widget] the api reported a stream failure:', data);
+                    turn.error = true;
+                    turn.bot.textContent = 'Something went wrong. Please ask again.';
+                    turn.bot.classList.add('cw-bot-muted');
+                    break;
+                case 'done':
+                    // The only terminal frame. Before this, the loop ended only when the socket
+                    // closed, so a finished answer and a dropped connection were indistinguishable.
+                    turn.done = true;
+                    break;
             }
-            return answer;
+        },
+
+        // Render (or re-render) the citations under the answer. Ported from web/'s sources.ts.
+        // The one rule that must not drift: the chip shows `index` FROM THE FIELD, never the array
+        // position. The model may not write `[n]` markers (invariant 5), so this number is the only
+        // thing tying the answer back to a passage — and the API sends 1..n in order today, so a
+        // `#{i+1}` would look right in every case that did not check this exact field. Unlike the
+        // dashboard, the widget holds only a `pk_` and cannot call GET /documents, so it names no
+        // filename — the chip, the score and the passage are the honest subset it can show.
+        _renderSources(turn) {
+            if (!turn.sources.length) return;
+            let box = turn.sourcesEl;
+            if (!box) {
+                box = document.createElement('div');
+                box.className = 'cw-sources';
+                turn.bot.parentElement.appendChild(box); // the .cw-col beside the avatar
+                turn.sourcesEl = box;
+            }
+            box.innerHTML = '';
+            const hdr = document.createElement('div');
+            hdr.className = 'cw-sources-hdr'; hdr.textContent = 'Sources';
+            box.appendChild(hdr);
+            for (const s of turn.sources) {
+                const item = document.createElement('details'); item.className = 'cw-source';
+                const sum = document.createElement('summary'); sum.className = 'cw-source-sum';
+                const chip = document.createElement('span');
+                chip.className = 'cw-chip'; chip.textContent = `[${s.index}]`;
+                const score = document.createElement('span');
+                // Two decimals, not a percentage: a cosine score is not a probability, and `54%`
+                // invites "54% confident", a claim the number does not make. Matches sources.ts.
+                score.className = 'cw-score'; score.textContent = Number(s.score).toFixed(2);
+                sum.append(chip, score);
+                const text = document.createElement('div');
+                text.className = 'cw-source-text';
+                text.textContent = s.text; // textContent, never innerHTML — the passage is document text
+                item.append(sum, text);
+                box.appendChild(item);
+            }
+        },
+
+        // Decide what an ended stream means, once. Mirrors ask.ts's terminal logic.
+        _finalize(turn) {
+            if (turn.error) return; // a message is already shown
+            if (!turn.done) {
+                // Ended without the `done` sentinel — a dropped socket or a killed connection.
+                // Whatever tokens arrived are true and stay on screen; only a wholly empty answer
+                // needs a word, or the bubble reads as a broken page.
+                if (turn.tokens === 0) {
+                    turn.bot.textContent = 'The answer was cut short. Please ask again.';
+                    turn.bot.classList.add('cw-bot-muted');
+                }
+                return;
+            }
+            // Completed cleanly, retrieval found passages, and the model still said nothing. Not a
+            // refusal — that carries its canned sentence and has no sources. The cause is upstream: a
+            // reasoning model can spend its whole token budget thinking and emit no content, and
+            // nothing errors, so the API rightly yields `done`. Only the client can see the silence.
+            if (turn.sources.length > 0 && turn.tokens === 0) {
+                turn.bot.textContent = "I found relevant information but couldn't produce an answer. Please ask again.";
+                turn.bot.classList.add('cw-bot-muted');
+            }
         },
 
         _parseEvent(raw) {
