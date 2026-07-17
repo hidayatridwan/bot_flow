@@ -381,6 +381,7 @@ writing the code.
 | Embeddable widget | `widget/widget.js` |
 | The SSE frame contract, and its only *tested* parser — `widget.js` has a second, untested one | `web/src/lib/features/chat/sse.ts` |
 | Browser-side ask: the relative-path/no-credential boundary, and where invariant 4's "a refusal is an answer" is decided by structure rather than by matching `NO_ANSWER` | `web/src/lib/features/chat/ask.ts` |
+| Citations in the UI — the only surface that renders them, and why `sources[].index` is never renumbered | `web/src/lib/features/chat/sources.ts` |
 | Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |
 | Typed API client: `ApiResult`, the JSON-vs-`text/plain` split, timeouts | `web/src/lib/server/api/` |
 | The SSE proxy: why the JSON client cannot carry a stream, and the ceiling that replaces its 10s | `web/src/lib/server/api/stream.ts` |
@@ -405,6 +406,19 @@ Honest inventory. Each entry states the impact, not merely the fact.
   re-indexed or removed. They are permanent. Isolation *is* preserved — the tenant tag is written and
   the filter applies — so this is a data-lifecycle hole, not a leak. **The largest single piece of
   debt in the system.** Demo and testing convenience; not a supported path. Do not build on it.
+  **The playground now makes it visible**: an `/ingest` chunk cites as "Unattributed passage", because
+  there is no document to name. It also means `/documents` reports zero ready while the bot answers
+  perfectly well — the playground's "no documents are ready" warning is wrong for an `/ingest`-only
+  tenant, and right for every supported one.
+- **The playground cannot reproduce the most likely go-live failure.** It authenticates with a
+  `sess_`; the tenant's real widget uses a `pk_` bound to an `Origin`. So an `allowed_origins`
+  mismatch — invariant 15's "403s forever with nothing in any log to say why" — is invisible here: the
+  playground answers happily while the widget is dead. The page says so and links to `/keys`, which is
+  the honest mitigation, not a fix. A preview that hides the most common production failure is worse
+  than no preview if it does not admit it.
+- **Playground traffic shares the tenant's rate-limit bucket with their live widget**, because
+  `rate_limit::check` keys on `tenant_id` rather than on the credential. That is what bounds the spend
+  (invariant 27), and the cost is that a tenant testing enthusiastically can throttle production.
 - **There is no delete path for a document** — record, vectors and bytes persist forever. A "delete my
   data" request cannot presently be honoured. For a product holding customers' support documents this
   is a compliance gap, not a missing feature. Designing it means deciding the order of operations

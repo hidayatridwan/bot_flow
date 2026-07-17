@@ -140,4 +140,6 @@ first.
   problem rather than a spend one.
 - **Widget citations** — the server emits `sources` and `widget.js` ignores it. The README claimed
   otherwise and has been corrected; making it true is a widget change, not a docs one.
-- **The chat playground** — needs `/ask` widened to `Actor`, the deferred spend question.
+- ~~**The chat playground**~~ — done in phase 5. `/ask` and `/ask/stream` now take `Actor` and gate
+  nothing (invariant 27), and the spend question was answered by the limiter that already existed:
+  `rate_limit::check` keys on `tenant_id`, not on the credential.

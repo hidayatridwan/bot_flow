@@ -1,5 +1,6 @@
 <script lang="ts" module>
 	import AudioWaveformIcon from '@lucide/svelte/icons/audio-waveform';
+	import BotMessageSquareIcon from '@lucide/svelte/icons/bot-message-square';
 	import ChartPieIcon from '@lucide/svelte/icons/chart-pie';
 	import CommandIcon from '@lucide/svelte/icons/command';
 	import FileTextIcon from '@lucide/svelte/icons/file-text';
@@ -10,9 +11,10 @@
 	import MapIcon from '@lucide/svelte/icons/map';
 	import Settings2Icon from '@lucide/svelte/icons/settings-2';
 
-	// This is sample data. `user` comes from the session (see the `user` prop below), and Dashboard
-	// and Documents are real routes — the teams, the Config group and every remaining `#` are still
-	// mocked. Nothing backs them yet.
+	// Part sample data. `user` comes from the session (see the `user` prop below). Documents, API keys
+	// and Playground are real routes backed by the API; Dashboard is a real route that is still a
+	// one-line stub. The teams, the Config group and every remaining `#` are mocked — nothing backs
+	// them.
 	//
 	// All three groups share one item shape (`title`/`url`/`icon`, optional `items`), because they
 	// all render through NavGroup. An item WITHOUT `items` is a leaf: a plain link, no chevron.
@@ -46,6 +48,11 @@
 				title: 'Documents',
 				url: '/documents',
 				icon: FileTextIcon
+			},
+			{
+				title: 'Playground',
+				url: '/playground',
+				icon: BotMessageSquareIcon
 			},
 			{
 				title: 'API keys',
