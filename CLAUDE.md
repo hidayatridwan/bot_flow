@@ -380,6 +380,7 @@ writing the code.
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |
 | Embeddable widget | `widget/widget.js` |
 | The SSE frame contract, and its only *tested* parser — `widget.js` has a second, untested one | `web/src/lib/features/chat/sse.ts` |
+| Browser-side ask: the relative-path/no-credential boundary, and where invariant 4's "a refusal is an answer" is decided by structure rather than by matching `NO_ANSWER` | `web/src/lib/features/chat/ask.ts` |
 | Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |
 | Typed API client: `ApiResult`, the JSON-vs-`text/plain` split, timeouts | `web/src/lib/server/api/` |
 | The SSE proxy: why the JSON client cannot carry a stream, and the ceiling that replaces its 10s | `web/src/lib/server/api/stream.ts` |
