@@ -336,6 +336,7 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Add a `<form action>` to the upload card | Leave it JS-only | A multipart action proxies bytes through Node — the deprecated route, one layer up (invariant 24) |
 | Store an `allowed_origins` entry as the tenant typed it | `auth::normalize_origin` first | It is matched against `Origin` by string equality. `https://acme.com/`, `HTTPS://Acme.com` and `https://acme.com:443` all *look* right, mint fine, and never match — the key 403s forever with nothing in any log to say why |
 | Render the embed snippet from any key you are handed | `embedSnippet` refuses a non-`pk_` | The snippet is designed to be pasted into a public page. An `sk_` there is invariant 15 inverted |
+| Ship a `widget.js` fix and trust the served bytes to update | Ensure the build recompiles — advance its mtime or `cargo clean` | `widget.rs` embeds it with `include_str!`, a **compile-time** read cargo fingerprints by mtime. A byte change with an unchanged mtime (a `mv` that preserves it, some checkout patterns) leaves stale bytes in a reused binary, the ETag never moves, and the fix silently does not ship — the very staleness the served route exists to end, one layer lower. Clean CI builds are immune; incremental/container-layer ones are not |
 | "Secure" `/ask` with `require_management()` | Leave it ungated — that is invariant 27 | It is the one route a `pk_` exists to reach. A gate there 403s every deployed widget, and no unit test catches it: `Actor::from_request_parts` needs a database, so tenants find it, not CI |
 | Call the API through `event.fetch` without `credentials: 'omit'` | Pass it, and pin it | Kit counts a *hostname suffix* match as same-origin and injects the browser's cookie jar — `localhost`→`localhost`, `example.com`→`api.example.com`. It happens after your headers are built, so the code reads correctly and still ships `bf_session` to the API (invariant 20) |
 | Reach for `client.ts` to fetch a stream | `server/api/stream.ts` | `parseResponse` opens with `await res.text()` — it consumes the body by construction — and the 10s `AbortSignal` covers the body, not just the headers. Neither is a flag you can pass |
@@ -412,8 +413,9 @@ writing the code.
 | Chunking | `crates/worker/src/chunk.rs` |
 | Reaper — `UPLOAD_GRACE` and `PROCESSING_LEASE` are named constants; read them there | `crates/worker/src/reaper.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |
-| Embeddable widget | `widget/widget.js` |
-| The SSE frame contract, and its only *tested* parser — `widget.js` has a second, untested one | `web/src/lib/features/chat/sse.ts` |
+| Embeddable widget — renders citations, counts token frames, handles `done` | `widget/widget.js` |
+| The route that serves the widget from the binary (`include_str!`), with the ETag/`no-cache` revalidation that lets a fix reach every visitor | `crates/api/src/widget.rs` |
+| The SSE frame contract, and its only *tested* parser — `widget.js` has a second, untested one, now *deployed by us* rather than copied by tenants (D4 kept it separate; the stakes rose) | `web/src/lib/features/chat/sse.ts` |
 | Browser-side ask: the relative-path/no-credential boundary, and where invariant 4's "a refusal is an answer" is decided by structure rather than by matching `NO_ANSWER` | `web/src/lib/features/chat/ask.ts` |
 | Citations in the UI — the only surface that renders them, and why `sources[].index` is never renumbered | `web/src/lib/features/chat/sources.ts` |
 | Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |

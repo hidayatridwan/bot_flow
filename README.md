@@ -82,6 +82,7 @@ weakest one already reaches, which is why the chat routes admit all three.
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/health` | none | Reachability of all five dependencies; `degraded` if any is down |
+| `GET` | `/widget.js` | none | The embeddable widget, served from the binary. `Cache-Control: no-cache` + a strong `ETag`, so a fix reaches every visitor on the next restart |
 | `POST` | `/admin/tenants` | admin key | Creates a tenant, returns its first `sk_` key |
 | `POST` | `/admin/tenants/{tenant_id}/keys` | admin key | Mints a `secret` or `publishable` key |
 | `POST` | `/auth/register` | none | Self-serve: creates a tenant + owner account, returns a session and the first `sk_`. Rate-limited |
@@ -600,10 +601,11 @@ pre-filled with your key and API URL — at mint time, the one moment the raw ke
 is the same thing by hand.
 
 [widget/widget.js](widget/widget.js) is a self-contained script — no build step, no
-dependencies. Drop it on any page and initialise it with a **publishable** key:
+dependencies — **served by the API at `/widget.js`**. Point a page at it and initialise it with a
+**publishable** key:
 
 ```html
-<script src="/path/to/widget.js"></script>
+<script src="http://localhost:3000/widget.js"></script>
 <script>
   ChatWidget.init({
     apiBase:   'http://localhost:3000',
@@ -613,12 +615,17 @@ dependencies. Drop it on any page and initialise it with a **publishable** key:
 </script>
 ```
 
-That renders a launcher button in the bottom-right corner which opens a 360px chat panel.
-The widget talks to `/ask/stream`, so answers appear token by token.
+Serving it from the binary is deliberate: tenants used to host their own copy, so a fix could never
+reach a deployed site. The API answers `/widget.js` with `Cache-Control: no-cache` and a strong
+`ETag`, so a browser revalidates and gets a `304` when nothing changed and the new bytes when it did —
+a fix is live for everyone on the next restart, with no snippet edit. `src` and `apiBase` are the same
+origin, so there is one thing to configure, not two.
 
-It does **not** render citations: the server emits a `sources` event and `widget.js` deliberately
-ignores it. The structured citations are there for a client that wants them (invariant 5) — this
-widget is not yet that client.
+That renders a launcher button in the bottom-right corner which opens a 360px chat panel.
+The widget talks to `/ask/stream`, so answers appear token by token, and it **renders citations**:
+each `[n]` chip carries the passage's `index` from the API (never renumbered — invariant 5), its
+cosine score to two decimals, and the passage text. It shows no filename, because a `pk_` cannot call
+`GET /documents` — the chip, score and passage are the honest subset a public key can see.
 
 Two things the browser enforces, and one the server does:
 

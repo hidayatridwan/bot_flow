@@ -1,12 +1,19 @@
 # Feature: Serving the widget, and making it tell the truth (phase 7)
 
-> Status: **planned, decisions locked.** Audited against `widget/widget.js` (all 173 lines of it),
-> `widget/demo.html`, `web/src/lib/features/keys/embed.ts` and the API's router before writing. All
-> four decisions (D1–D4) are settled below; the reasoning is retained as the spec the implementation is
-> held to, not as an open question. The headline of the audit is in *Does this break existing
-> integrations?* — the short answer is **no, and it cannot**, for a reason more specific than "it is
-> additive". The real risk this phase carries is not breakage; it is doing the work and delivering
-> nothing — which is why D1, the cache header, *is* the feature rather than a detail of it.
+> Status: **implemented.** `GET /widget.js` serves the widget from the binary (`widget.rs`,
+> `include_str!`) with a strong `ETag` and `Cache-Control: no-cache`; `widget.js` now renders
+> citations, counts token frames, and handles `done`; `embed.ts` emits a copy-pasteable `src` and
+> `demo.html` loads the served URL. CLAUDE.md gained two *Where things live* rows and a *Traps* row (the
+> `include_str!` mtime gotcha, found live); README's embed section was corrected. 51 API tests (5 new),
+> 186 web tests (1 new). Verified live in Chrome — citations render from `index`, the empty-answer path
+> shows a message instead of a blank bubble — and by the 200→304→rebuild→200-with-new-bytes cycle that
+> is the whole point of D1.
+>
+> All four decisions (D1–D4) were settled before coding and are retained below as the spec the
+> implementation was held to. The headline of the audit is in *Does this break existing integrations?*
+> — the short answer is **no, and it cannot**, for a reason more specific than "it is additive". The
+> real risk this phase carried was not breakage; it was doing the work and delivering nothing — which is
+> why D1, the cache header, *is* the feature rather than a detail of it.
 
 ## Context — why
 
