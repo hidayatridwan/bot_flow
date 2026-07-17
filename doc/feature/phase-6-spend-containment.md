@@ -1,9 +1,15 @@
 # Feature: Spend containment & gateway stability (phase 6)
 
-> Status: **planned.** This is the Plan of Record — the design below has been audited against the code
-> and against reqwest 0.12.28's vendored source. Two clauses of the original draft were wrong and are
-> corrected here with the evidence inline; read *Known debt & traps* before writing any code, because
-> the obvious implementation of the timeout half breaks every long answer.
+> Status: **implemented.** `/search` gated (`Actor` + `require_management`) and metered; `/ingest`
+> metered; `connect_timeout` + `read_timeout` on both gateway clients, with a total *only* on the
+> non-streaming calls. CLAUDE.md gained invariant 28 and three *Traps* rows, invariant 15's
+> "chat-only" clause became true, and two *Known state* entries were retired or narrowed. 46 API tests
+> (3 new). Two clauses of the original draft were wrong; both are recorded below with the evidence,
+> because the corrections are the useful part of this document.
+>
+> **Two decisions were taken as recommended** (D1: `/search` gets the gate as well as the limiter; D2:
+> `/ingest` gets the limiter). **One decision was reversed during implementation** — the timeout bounds
+> are named constants, not env vars. See *Design*.
 
 ## Context — why
 
@@ -72,8 +78,9 @@ Recommendation: **add the limiter, exclude everything else.** One line, same buc
 CLAUDE.md names. Do not touch `/ingest`'s deeper debt — it is the largest in the system and a phase of
 its own.
 
-**D3 — one timeout value, or several?** See *Design*, below; the embedding client's two callers pull in
-opposite directions and this cannot be one number.
+**D3 — one timeout value on the embedding client, or one per call site?** Its two callers pull in
+opposite directions. Resolved during implementation as **one**, and not the way this document first
+argued — see *Design*.
 
 ## Design
 
@@ -139,8 +146,27 @@ field at all. `Duration::from_secs(120_000)` is **33 hours**.
 **Wrong #3 — and it should not be shared even after conversion.** `ASK_TIMEOUT_MS` bounds the BFF's
 wall clock for the dashboard's browser. The API's ceiling is a different bound protecting a different
 client — the `pk_` widget with no BFF in front. They are independent, and CLAUDE.md's rule applies:
-*do not restate values this file does not own.* New API-side config, named and defaulted in
-`config.rs`, documented in README's env block.
+*do not restate values this file does not own.*
+
+### Named constants, not env vars — reversed from the plan
+
+This document originally said *"new API-side config, named and defaulted in `config.rs`, documented in
+README's env block."* **Implementation found that wrong, for two reasons that only appear once you look
+at the call sites.**
+
+`EmbeddingClient` is constructed in *two* binaries that configure themselves differently: the API from
+`Config::from_env()`, and the worker from **raw `std::env::var` calls inline in `main.rs`** — it has no
+config struct at all. Routing a timeout through `new()` means either duplicating the parsing in two
+styles, or inventing a worker config for one value.
+
+And the house style already answers this. `MAX_TOKENS` lives in `llm.rs` as a documented const;
+`EMBED_BATCH` and `EMBEDDING_DIM` live in `embedding.rs` the same way; CLAUDE.md says of the reaper's
+bounds that they *"are named constants; read them there."* A gateway timeout is the same class of thing
+as `MAX_TOKENS` — a correctness bound on our own resource use with a subtle failure mode, not a
+deployment preference. It belongs next to the code it bounds, with the comment explaining the trade.
+
+Bonus, and it settles D3: with no env vars, the phase adds **zero** new configuration to a repo whose
+*Known state* already admits it has no `.env.example`.
 
 ### The embedding client is shared with the worker — D3
 
@@ -154,10 +180,21 @@ The two callers pull opposite ways:
 - `embed_one_batch` — up to `EMBED_BATCH` inputs, in the worker, ingesting a PDF. Legitimately slow, and
   nobody is waiting.
 
-One number cannot serve both: tight enough for a question is tight enough to fail a full batch, and a
-failed batch is a document that does not index. The timeout must therefore be **per call site, not per
-client** — which the `RequestBuilder::timeout` split above already affords. Read `EMBED_BATCH` from the
-source when picking values; this file does not own it.
+**This document first concluded the timeout must therefore be per call site. That was wrong, and the
+reasoning is worth keeping because the mistake is natural.** It treats the total as the *primary*
+bound. It is not — `read_timeout` is. A hung gateway is silent, and silence is what `read_timeout`
+measures, regardless of whether one input or ninety-six are in flight. The total is only a backstop
+against a gateway that trickles bytes forever, and a backstop does not need to be tight.
+
+Once the total is a backstop, one generous value serves both callers correctly, because **the two
+mistakes are not symmetric** — the same asymmetry `EmbedError::is_fatal` already reasons about. Too
+tight fails a *document*: `Transport`, therefore retryable, therefore five redeliveries and a
+dead-letter for a file that was never broken. Too loose merely lets a hung question hang a little
+longer than necessary — and `read_timeout` catches that first anyway. So the total is sized for the
+batch, and `embed_one` inherits it harmlessly. One constant, not two, and no threading through the
+call stack.
+
+Size it from `EMBED_BATCH`, which lives in that file; this document does not own the number.
 
 **The good news, and it shrinks the phase.** `EmbedError::Transport`'s doc comment already reads *"Could
 not reach the endpoint, or the connection broke: DNS, TLS, **timeout**, reset"*, and `is_fatal()` returns
@@ -168,8 +205,23 @@ classification was written in anticipation of this.
 
 ## Verification plan
 
-**Unit** — `cargo test`, `cargo clippy && cargo fmt`. Note what unit tests *cannot* reach here:
+**Unit** — 46 API tests, clippy and fmt clean. Note what unit tests *cannot* reach here:
 `Actor::from_request_parts` needs a database, so `/search`'s gate is provable only against a live stack.
+
+**The design claim is now observed rather than read.** Three tests in `llm.rs` drive a real socket with
+a real body arriving in real pieces — no backing service, a `TcpListener` on an ephemeral port,
+0.33s:
+
+| Test | Result |
+| --- | --- |
+| `a_total_timeout_kills_a_healthy_body_that_merely_takes_a_while` | **passes** — a 300ms body dies under a 100ms total deadline while the connection is healthy and delivering. This is the drafted design, disproven |
+| `a_read_timeout_lets_a_slow_body_finish_because_it_bounds_the_gap_not_the_total` | passes — same body, same duration, a read timeout *shorter* than the elapsed total, and it completes |
+| `a_read_timeout_aborts_a_gateway_that_stops_talking` | passes — it still catches the thing it exists for |
+
+They test `reqwest`, not us, and that is deliberate: invariant 28 rests entirely on that dependency's
+behaviour, and the claim came from its documentation. Documentation is where this repo's expensive
+mistakes live. If a future reqwest reverses either behaviour, one of these fails loudly instead of
+every long answer failing quietly.
 
 **`/search`, live stack:**
 

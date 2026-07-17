@@ -117,6 +117,10 @@ pub async fn ingest(
     Json(req): Json<IngestRequest>, // FromRequest — consumes body, MUST be last
 ) -> Result<Json<Value>, AppError> {
     tenant.require_secret()?;
+    // `sk_` only, so this is not the stolen-key exposure `/search` was — but it is still a billed
+    // `/embeddings` call per request, and an unmetered one was the other half of the pair.
+    rate_limit::check(&state, &tenant.tenant_id).await?;
+
     let vectors = state.embedder.embed_batch(&req.texts).await?;
 
     // Global UUID IDs: required since going multi-tenant, otherwise points across tenants
@@ -160,9 +164,15 @@ fn default_limit() -> u64 {
 
 pub async fn search(
     State(state): State<AppState>,
-    tenant: AuthTenant, // FromRequestParts — reads headers, no body
+    actor: Actor, // FromRequestParts — reads headers, no body
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<Value>, AppError> {
+    // Raw retrieval is not "asking a question", so a `pk_` is refused here even though it may ask
+    // freely (invariants 15 and 27 are not in tension — they draw the same line from both sides).
+    // Not a confidentiality gate: `/ask` already returns `sources[].text` to a `pk_`. It bounds spend.
+    actor.require_management()?;
+    rate_limit::check(&state, &actor.tenant_id).await?;
+
     let vector = state.embedder.embed_one(&req.query).await?;
 
     let response = state
@@ -171,7 +181,7 @@ pub async fn search(
             QueryPointsBuilder::new(COLLECTION)
                 .query(vector)
                 .limit(req.limit)
-                .filter(tenant_filter(&tenant.tenant_id))
+                .filter(tenant_filter(&actor.tenant_id))
                 .with_payload(true),
         )
         .await?;

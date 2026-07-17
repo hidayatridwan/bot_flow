@@ -4,6 +4,8 @@
 //! to different models or different request shapes, and each would then write vectors the other
 //! cannot meaningfully search — a silent retrieval failure, not a build error.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 /// Vector dimension of `text-embedding-3-small` at its native size. MUST match the Qdrant
@@ -13,6 +15,26 @@ pub const EMBEDDING_DIM: u64 = 1536;
 /// Inputs per `/embeddings` request. The endpoint caps both input count and total tokens, and a
 /// large PDF chunks into thousands of pieces, so a document cannot go up in one call.
 const EMBED_BATCH: usize = 96;
+
+/// TCP + TLS to the gateway. Same reasoning as `llm.rs`: a handshake this slow is misconfiguration,
+/// not load.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max silence between reads. Unlike the LLM there is nothing to wait for here — an embedding
+/// endpoint does not think — so this is tighter than `llm.rs`'s and is the bound that actually fires
+/// on a hung gateway.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Total deadline for **one** `/embeddings` request, i.e. one batch of up to `EMBED_BATCH`.
+///
+/// **Sized for the batch, not for the question, and that asymmetry is deliberate.** This client is
+/// shared by the api and the worker (see the module doc): `embed_one` sends a single question with a
+/// user waiting, while `embed_one_batch` sends up to `EMBED_BATCH` chunks with nobody waiting. One
+/// number must serve both, and the two mistakes are not symmetric — too tight fails a *document*,
+/// which is `Transport`, hence retryable, hence five redeliveries and a dead-letter for a file that
+/// was never broken. Too loose merely makes a hung question slow, and `READ_TIMEOUT` catches the hang
+/// long before this does. So this is a backstop against a gateway that trickles, and it errs generous.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct EmbeddingClient {
@@ -108,7 +130,14 @@ impl EmbedError {
 impl EmbeddingClient {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            // A total `.timeout()` is safe on this client — every response here is one JSON document,
+            // never a stream. That is exactly why `llm.rs` cannot do the same. Invariant 28.
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("embedding http client"),
             base_url,
             api_key,
             model,

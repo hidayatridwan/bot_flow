@@ -114,6 +114,13 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     an allow-listed `Origin`. A `pk_` key is *expected* to be stolen — that containment is the whole
     design. `/admin/*` is guarded by `ADMIN_API_KEY` (a deployment secret, not a DB row) because
     those are the operations that *create* DB rows.
+    **"Chat-only" is a gate, not a description of intent.** `/ask` and `/ask/stream` are the routes a
+    `pk_` may reach; `/search` — a raw retrieval API, not a question — refuses it via
+    `require_management()`. It *accepted* one until phase 6, which made this invariant's own first
+    sentence false, and the answer was to gate the route rather than soften the claim. Note what the
+    gate does and does not buy: `/ask` hands `sources[].text` to a `pk_` already, so this is not a
+    confidentiality boundary and never was. It bounds **spend** — every search is a billed
+    `/embeddings` call — and it makes the sentence above true.
     **The allow-list is that containment, so it is validated at mint, not merely stored.** An origin
     is compared to the `Origin` header by *string equality*, so a value that is not in a browser's
     canonical form is not lax — it is dead, and the key 403s forever. `auth::normalize_origin`
@@ -251,6 +258,27 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     session cannot draw a token more than that tenant's own `pk_` already could. That is what answers
     the spend question this change would otherwise raise: the limiter that was already there.
 
+**Gateways**
+
+28. **Every outgoing gateway call is bounded — and the bound on a streamed body is a *stall*, not a
+    deadline.** The distinction is the whole invariant, because the obvious implementation inverts it.
+    `reqwest`'s `ClientBuilder::timeout` is, in its own words, a *"total request timeout… applied from
+    when the request starts connecting **until the response body has finished**."* `answer_stream`
+    **is** a long-lived body — the LLM's SSE, consumed for the whole life of the answer. So a total
+    deadline there does not bound a hung gateway; it caps **how long an answer may be**, and kills
+    every legitimate answer still streaming when it fires. Worse, silently: the stream yields `Err`,
+    `handlers.rs` sets `failed = true` and emits the `error` frame, and `append_turn` is then skipped —
+    so invariant 7 correctly drops a turn from history that only our own timeout truncated.
+    The instrument for a hang is `read_timeout`: *"applies to each read operation, and resets after a
+    successful read… more appropriate for detecting stalled connections when the size isn't known
+    beforehand."* That bounds silence between tokens, which is what "the gateway hung" actually means,
+    and it is indifferent to how long the answer runs. So: `connect_timeout` + `read_timeout` on every
+    client; a **total** only on the non-streaming calls, per request, via `RequestBuilder::timeout`.
+    The bounds are named constants beside the code they bound (`llm.rs`, `common/src/embedding.rs`),
+    not env vars — the same choice, for the same reason, as `MAX_TOKENS` and `EMBED_BATCH` next to
+    them. A timeout is a correctness bound on our own resource use, not a deployment preference, and
+    `EmbeddingClient` is shared by two binaries that configure themselves differently.
+
 ## Tenant isolation — the three layers
 
 Any one layer would suffice on a good day. All three exist because a good day is not something to
@@ -316,6 +344,9 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Size `max_tokens` for the answer you want | Size it for the answer **plus the thinking you cannot see** | A reasoning model bills `reasoning_content` against the same budget, and `Delta` only reads `content`. Spend the budget on thinking and the completion is *empty*: `finish_reason: "length"`, zero content deltas, no error, `done` yielded normally. The bot answers nothing and nothing anywhere says why. 512 left ~80–180 tokens of margin — enough to look fine until a longer document or a cross-lingual question ate it |
 | Trust an empty answer to look like a failure | `ask.ts` reports zero tokens as one | Retrieval succeeding and the model saying nothing is a *success* everywhere in the stack — the client is the only place that can notice the silence. A refusal is the opposite and must stay `ok` (invariant 4) |
 | Put an error's own text in an SSE `error` frame | A fixed string; `tracing::error!` the detail | The frame goes to a browser — for a `pk_` widget, a *stranger's*. `{e:#}` from `llm.rs` is `LLM replied {status}: {the gateway's raw body}` — a body we do not author and cannot predict. Observed from a 401: a key fragment, **the key's full SHA-256 hash**, and the gateway's internal table names. A mid-stream frame never passes through `AppError::into_response`, so it is the one client-facing surface that does *not* inherit invariant 16 from `?` — it must re-implement that discipline by hand |
+| `.timeout()` a client whose response body is a **stream** | `read_timeout` for the stall; a per-request total only on the non-streaming calls | reqwest's client `timeout` is a *total deadline including the body*, and `answer_stream` **is** a body. It therefore caps answer length, not gateway hangs — and the truncated turn is then dropped from history by invariant 7, so the user loses the answer *and* the record of asking. Exactly the `client.ts`-vs-`stream.ts` trap two rows down, one layer lower and in Rust (invariant 28) |
+| Reuse `ASK_TIMEOUT_MS` for the API's gateway bounds | Named constants in `llm.rs` / `embedding.rs` | It is a **`web/` env var, in milliseconds**, bounding the BFF's own browser — `Duration::from_secs` on it is 33 hours. The API's client is the `pk_` widget, which has no BFF in front of it. Different bound, different client, different file |
+| Put one timeout on `EmbeddingClient` and call it done | Size it for a full `EMBED_BATCH`, not for a question | It is shared by the **api and the worker**. A bound tight enough for a one-input question embed fails a 96-input ingest, and a failed ingest is `Transport` → retryable → five redeliveries → dead-lettered. The tight bound belongs to `read_timeout`, which fires on silence regardless of batch size |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
 The worker classifies these into fatal-vs-retryable. It is a cross-language contract and neither side
@@ -331,14 +362,15 @@ writing the code.
   dump. The cost — we can never show a key again — is the intended trade.
 - **A gate is the first line of any handler that ingests, uploads, lists or manages** — which gate
   depends on who may legitimately reach it:
-  - `actor.require_management()?` — `sk_` **or** `sess_`, never `pk_`. On `GET /documents` and both
-    upload-url routes: the tenant's own server *and* the dashboard reach these (invariant 23).
+  - `actor.require_management()?` — `sk_` **or** `sess_`, never `pk_`. On `GET /documents`, both
+    upload-url routes, and `/search`: the tenant's own server *and* the dashboard reach these
+    (invariant 23). `/search` belongs here because raw retrieval is not "asking a question" —
+    invariant 15's first sentence is this gate, not a description of intent.
   - `tenant.require_secret()?` — `sk_` only. On `/ingest` and the deprecated multipart
     `POST /documents`. Both are paths we are not extending, so neither gets a session.
 
   Correctly absent on `/ask` and `/ask/stream`, which take `Actor` and gate nothing: all three kinds
   pass, because `pk_` is *meant* to reach them and the other two are strictly stronger (invariant 27).
-  Absent **as an outstanding gap** on `/search`.
 - **Two auth principals, do not conflate them.** `AuthTenant` resolves an API key (`sk_`/`pk_`) to a
   tenant — the *machine* credential (a tenant's server, the widget). `SessionAuth` resolves a
   `sess_` token to an account + tenant — the *human* credential (the dashboard, the `/auth/*`
@@ -441,12 +473,9 @@ Honest inventory. Each entry states the impact, not merely the fact.
 - **`POST /documents` (multipart proxy) is deprecated** — it buffers whole files in API memory. Use
   `POST /documents/upload-url`. It gets deleted along with `crates/api/src/queue.rs` and the worker's
   `consume_legacy` / `LEGACY_QUEUE`. Do not add features to it. Do not add callers.
-- **`/search` accepts publishable (`pk_`) keys and is not rate limited; `/ingest` is also unmetered.**
-  This was an unmetered-*CPU* oversight while embedding ran locally. It is now an unmetered-**spend**
-  exposure: every search and every question is a billed `/embeddings` call against `EMBEDDING_API_KEY`.
-  A `pk_` key is printed in public page source and is *expected to be stolen* (invariant 15) — the
-  containment for that theft was "it can only ask questions", which no longer bounds the cost. Rate
-  limiting `/search` is a cost control, not a nicety. Still believed an oversight, not a decision.
+- **`/auth/keys` is unmetered** — a logged-in session can mint unbounded keys. It is session-gated and
+  does not multiply LLM spend (`rate_limit::check` buckets on `tenant_id`), so this is an audit and
+  revocation-surface problem rather than a cost one. The last unmetered route that creates state.
 - **The isolation guarantee is untested.** No automated test asserts that RLS actually denies a
   cross-tenant read. Invariant 1 is the system's most important promise and it rests on code review
   alone. There is no CI and no integration suite; tests are unit tests over pure functions. Highest-
@@ -463,14 +492,14 @@ Honest inventory. Each entry states the impact, not merely the fact.
   not rebuild it, and invariant 10 *skips* a redelivered document whose fingerprint is unchanged. So
   dropping the collection alone leaves it permanently empty, with no error. The document rows must go
   too. Whoever changes the model next will hit both.
-- **Nothing in the API bounds a hung LLM or embedding call.** Both clients are
-  `reqwest::Client::new()` with no `.timeout()`, and reqwest's default is *no timeout at all*. If the
-  gateway accepts a connection and then stalls, the request task waits forever, holding its Tokio
-  task, its DB-free but real memory, and — on `/ask/stream` — an open SSE response. The only bounds
-  that exist today are `max_tokens: 512` on a *well-behaved* gateway and `ASK_TIMEOUT_MS`, which lives
-  in the **web BFF**: it protects the dashboard's browser and nothing else. A `pk_` widget calling the
-  API directly has no ceiling anywhere. The fix is a `.timeout()` on both clients in `llm.rs` and
-  `embedding.rs`; it is small, and it is not done.
+- **`/ask/stream` still has no maximum duration, and that is the residue of invariant 28.** Every
+  gateway call is now bounded, but the streaming answer's bound is a *stall* — silence between reads —
+  not a deadline, because a deadline caps how long an answer may be rather than how long a gateway may
+  hang. So a gateway trickling one token just inside `READ_TIMEOUT` streams indefinitely. In practice
+  `MAX_TOKENS` bounds it, which is a real bound only on a well-behaved gateway — the same caveat that
+  entry has always carried. Closing it properly means a token budget with a wall clock, which is a
+  design rather than a constant. Accepted deliberately: the failure mode is a slow answer, not a
+  leaked task, and capping legitimate long answers is the worse trade.
 - The DB permits an `uploaded` document status that **no code path ever assigns**. A vestige. Either
   give it meaning or drop it from the constraint — an unreachable state is a trap for the next reader.
 - **No `.env.example`**, though `.gitignore` expects one. A new contributor reconstructs the required

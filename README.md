@@ -62,7 +62,7 @@ Three independent layers, so a single mistake doesn't leak data:
 | Prefix | Kind | Where it lives | Can call |
 | --- | --- | --- | --- |
 | `sk_…` | secret | your server only | everything below |
-| `pk_…` | publishable | shipped to browsers | `/ask`, `/ask/stream`, `/search` — and only from an `Origin` on the key's allow-list |
+| `pk_…` | publishable | shipped to browsers | `/ask`, `/ask/stream` — and only from an `Origin` on the key's allow-list. Asking questions, and nothing else |
 
 `ADMIN_API_KEY` (an env var, not a database row) guards `/admin/*`. A third principal — a **login
 session** (a `sess_` bearer token from `/auth/login`) — authenticates the `/auth/*` dashboard routes,
@@ -96,8 +96,8 @@ weakest one already reaches, which is why the chat routes admit all three.
 | `POST` | `/documents/{id}/upload-url` | secret **or** session | Re-mint a URL for a document still `uploading` or `expired`. Only safe for *the same file* — see the note below |
 | `POST` | `/documents` | secret | **Deprecated** multipart proxy — buffers the file in the API's memory |
 | `GET` | `/documents` | secret **or** session | Lists this tenant's documents and their status |
-| `POST` | `/ingest` | secret | `{"texts": [...]}` — indexes raw strings, skipping the upload pipeline |
-| `POST` | `/search` | any key | `{"query": "…", "limit": 3}` — returns raw scored chunks, no LLM |
+| `POST` | `/ingest` | secret | `{"texts": [...]}` — indexes raw strings, skipping the upload pipeline. Rate-limited |
+| `POST` | `/search` | secret **or** session | `{"query": "…", "limit": 3}` — returns raw scored chunks, no LLM. Rate-limited. **Not** open to `pk_`: raw retrieval is not asking a question |
 | `POST` | `/ask` | any key **or** session | Retrieval + LLM answer as one JSON blob. Rate-limited |
 | `POST` | `/ask/stream` | any key **or** session | Same, as SSE: a `conversation` event, a `sources` event, then `token` events, then `done`. An LLM failure yields one `error` event carrying a fixed string — the detail goes to the log, never the client |
 
