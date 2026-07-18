@@ -375,10 +375,10 @@ writing the code.
   dump. The cost — we can never show a key again — is the intended trade.
 - **A gate is the first line of any handler that ingests, uploads, lists or manages** — which gate
   depends on who may legitimately reach it:
-  - `actor.require_management()?` — `sk_` **or** `sess_`, never `pk_`. On `GET /documents`, both
-    upload-url routes, and `/search`: the tenant's own server *and* the dashboard reach these
-    (invariant 23). `/search` belongs here because raw retrieval is not "asking a question" —
-    invariant 15's first sentence is this gate, not a description of intent.
+  - `actor.require_management()?` — `sk_` **or** `sess_`, never `pk_`. On `GET /documents`,
+    `DELETE /documents/{id}`, both upload-url routes, and `/search`: the tenant's own server *and* the
+    dashboard reach these (invariant 23). `/search` belongs here because raw retrieval is not "asking
+    a question" — invariant 15's first sentence is this gate, not a description of intent.
   - `tenant.require_secret()?` — `sk_` only. On `/ingest` and the deprecated multipart
     `POST /documents`. Both are paths we are not extending, so neither gets a session.
 

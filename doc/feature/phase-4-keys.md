@@ -129,17 +129,17 @@ first.
 
 ## Not in this phase
 
-- **Serving `widget.js`.** Tenants self-host a copy, so a widget fix can never reach them — the
-  cache-busting comment in `demo.html` already worries about it. Serving it from the API
-  (`include_str!` + one route — no `ServeDir`, no traversal surface) would fix that *and* make the
-  snippet fully copy-pasteable rather than leaving `/path/to/widget.js` for the tenant to fill in.
-  The most valuable remaining piece of this feature.
+- ~~**Serving `widget.js`**~~ — done in phase 7, exactly as sketched here (`include_str!` + one route,
+  no `ServeDir`). `GET /widget.js` carries `Cache-Control: no-cache` and a strong ETag, so a fix
+  reaches every visitor on the next restart, and `embedSnippet` now emits a real `src` instead of
+  `/path/to/widget.js`. The `demo.html` cache-busting comment this entry cited was rewritten to
+  record what replaced it.
 - **The `/dashboard` stub** — still the words `dashboard tenant`, still where every login lands.
 - **Rate-limiting `/auth/keys`** — a session can mint unbounded keys. Session-gated, and it does not
   multiply LLM spend (`rate_limit` buckets on `tenant_id`), so it is an audit and revocation-surface
   problem rather than a spend one.
-- **Widget citations** — the server emits `sources` and `widget.js` ignores it. The README claimed
-  otherwise and has been corrected; making it true is a widget change, not a docs one.
+- ~~**Widget citations**~~ — done in phase 7. `widget.js` renders the `sources` event: an `[n]` chip
+  from the passage's own `index` (never the array position — invariant 5), its score, and the passage.
 - ~~**The chat playground**~~ — done in phase 5. `/ask` and `/ask/stream` now take `Actor` and gate
   nothing (invariant 27), and the spend question was answered by the limiter that already existed:
   `rate_limit::check` keys on `tenant_id`, not on the credential.

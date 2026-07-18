@@ -194,11 +194,12 @@ obvious to a capture.
 
 ## Not in this phase
 
-- **Serving `widget.js`.** Tenants self-host a copy, so a widget fix can never reach them. Still the
-  most valuable remaining piece of phase 4's feature — and this phase raised its price, see below.
-- **Widget citations.** The playground renders them; `widget.js` still ignores the `sources` event. So
-  invariant 24's justification for the playground's JS spend — *"this is what your end users see"* — is
-  now **false on exactly the surface this phase added**. The playground shows more than the widget does.
-  Fixing it is cheap now in a way it was not before: `chat/sources.ts` exists as a tested reference.
-- **`/search`** — no UI, and its ungated/unmetered gap stays as CLAUDE.md records it. Phase 6.
+- ~~**Serving `widget.js`**~~ — done in phase 7. Served from the API binary with `no-cache` + a strong
+  ETag, so a fix now reaches every visitor rather than being frozen in a tenant's self-hosted copy.
+- ~~**Widget citations**~~ — done in phase 7, and this entry is why it mattered: invariant 24's
+  justification for the playground's JS spend — *"this is what your end users see"* — was **false on
+  exactly the surface this phase added**, because the playground rendered citations the widget threw
+  away. `widget.js` now renders them too, ported from `chat/sources.ts`, so the claim is true again.
+- ~~**`/search`**~~ — gated and metered in phase 6 (`require_management`, so a `pk_` is refused, plus
+  the tenant's rate-limit bucket). Still no UI, deliberately.
 - **The `/dashboard` stub** — still the words `dashboard tenant`, still where every login lands.

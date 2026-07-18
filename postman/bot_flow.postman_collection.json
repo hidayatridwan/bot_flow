@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "bot_flow-collection-0001",
     "name": "bot_flow",
-    "description": "Multi-tenant RAG chatbot SaaS API.\n\nSet the collection variables first:\n- baseUrl: API base (prod domain or http://localhost:3000)\n- adminKey: the ADMIN_API_KEY (guards /admin/*)\n- apiKey: a SECRET key (sk_...) for ingest/search/documents/ask\n- publicKey: a PUBLISHABLE key (pk_...) for browser/chat (needs an allowed Origin)\n- sessionToken: a login session (sess_...) for the /auth/* routes; set automatically by Register / Login\n- keyHash: set automatically by List Keys; the target of Revoke Key\n- tenantId: a tenant slug (e.g. acme-inc); set automatically by Register / Create Tenant\n- uploadUrl: set automatically by Create Upload URL; the presigned PUT target on MinIO :9000\n- documentId: a document_id returned by Create Upload URL\n- conversationId: optional; paste the conversation_id a prior /ask returned to continue that conversation\n\nTwo ways to onboard a tenant: Admin > Create Tenant (needs adminKey), or Auth > Register (self-serve, no admin key). Both return the first sk_ once.\n\nKey rules: /admin/* needs adminKey. /auth/register + /auth/login are public (rate-limited); the other /auth/* routes need a sessionToken. /ingest, /search, /documents (GET+POST) require a SECRET key. /ask + /ask/stream accept secret OR publishable (publishable also requires an allowed Origin header). /health is open.",
+    "description": "Multi-tenant RAG chatbot SaaS API.\n\nSet the collection variables first:\n- baseUrl: API base (prod domain or http://localhost:3000)\n- adminKey: the ADMIN_API_KEY (guards /admin/*)\n- apiKey: a SECRET key (sk_...) for ingest/search/documents/ask\n- publicKey: a PUBLISHABLE key (pk_...) for browser/chat (needs an allowed Origin)\n- sessionToken: a login session (sess_...) for the /auth/* routes; set automatically by Register / Login\n- keyHash: set automatically by List Keys; the target of Revoke Key\n- tenantId: a tenant slug (e.g. acme-inc); set automatically by Register / Create Tenant\n- uploadUrl: set automatically by Create Upload URL; the presigned PUT target on MinIO :9000\n- documentId: a document_id returned by Create Upload URL\n- conversationId: optional; paste the conversation_id a prior /ask returned to continue that conversation\n\nTwo ways to onboard a tenant: Admin > Create Tenant (needs adminKey), or Auth > Register (self-serve, no admin key). Both return the first sk_ once.\n\nKey rules: /admin/* needs adminKey. /auth/register + /auth/login are public (rate-limited); the other /auth/* routes need a sessionToken. /ingest and the deprecated multipart POST /documents require a SECRET key. /search, GET /documents, both upload-url routes and DELETE /documents/{id} take a secret key OR a session, never a publishable one (raw retrieval and document management are not \"asking a question\"). /ask + /ask/stream accept all three - secret, session, or publishable - because a pk_ is exactly what they exist to serve (publishable also requires an allowed Origin header). /health and /widget.js are open.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -55,6 +55,10 @@
       "key": "keyHash",
       "value": "",
       "type": "string"
+    },
+    {
+      "key": "widgetEtag",
+      "value": ""
     }
   ],
   "item": [
@@ -76,6 +80,50 @@
           ]
         },
         "description": "Liveness + dependency check (Postgres, Qdrant). No auth."
+      }
+    },
+    {
+      "name": "Widget Script",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Capture the ETag so the disabled If-None-Match header below can demo a 304.",
+              "if (pm.response.code === 200) {",
+              "    pm.collectionVariables.set('widgetEtag', pm.response.headers.get('ETag'));",
+              "    console.log('widget ETag =', pm.collectionVariables.get('widgetEtag'));",
+              "}",
+              "pm.test('served as javascript', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('javascript'));",
+              "pm.test('revalidates rather than caching blind', () => pm.expect(pm.response.headers.get('Cache-Control')).to.include('no-cache'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "auth": {
+          "type": "noauth"
+        },
+        "method": "GET",
+        "header": [
+          {
+            "key": "If-None-Match",
+            "value": "{{widgetEtag}}",
+            "disabled": true,
+            "description": "Enable after one run to see the 304 (empty body) instead of the full script."
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/widget.js",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "widget.js"
+          ]
+        },
+        "description": "The embeddable chat widget, served from the API binary (include_str!). No auth — it is the file a visitor's browser loads before it holds any credential, and it makes no gateway call, so it is not metered.\n\nCACHING IS THE POINT: `Cache-Control: no-cache` plus a strong ETag means \"revalidate before use\", not \"do not cache\". A browser keeps its copy and asks with If-None-Match; unchanged it gets a ~200-byte 304 and reuses what it holds. That is what lets a widget fix reach every visitor on the next API restart, instead of being frozen in whatever copy a tenant self-hosted. Run once to capture the ETag, then enable the If-None-Match header to see the 304."
       }
     },
     {
@@ -699,6 +747,34 @@
               ]
             },
             "description": "List this tenant's documents with status (RLS-scoped). Requires a SECRET key."
+          }
+        },
+        {
+          "name": "Delete Document",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents/{{documentId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "documents",
+                "{{documentId}}"
+              ]
+            },
+            "description": "Erase a document across ALL THREE stores: its Qdrant vectors, its MinIO object, and its Postgres row. Takes a secret key OR a session — never a publishable one.\n\n204 = done inline. 202 = a worker was mid-index, so the row is tombstoned (`deleting`, already gone from List Documents) and the reaper finishes the store-cleanup once the worker provably releases.\n\n404 for an unknown id AND for another tenant's id — identical, so the endpoint is not an oracle for which ids exist. Deleting an already-gone document is therefore a 404, not an error to worry about.\n\nOrder is vectors -> object -> row, the order that fails toward the least-bad orphan: surviving vectors would still answer questions, whereas a surviving row is an inert ghost."
           }
         }
       ]
