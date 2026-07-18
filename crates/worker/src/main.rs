@@ -412,10 +412,20 @@ async fn finish(
 ) -> Result<(), Failure> {
     match result {
         Ok(n) => {
-            lifecycle::mark_ready(&ctx.db, tenant_id, document_id)
+            if lifecycle::mark_ready(&ctx.db, tenant_id, document_id)
                 .await
-                .map_err(Retryable)?;
-            tracing::info!("indexed {n} chunks for document {document_id}");
+                .map_err(Retryable)?
+            {
+                tracing::info!("indexed {n} chunks for document {document_id}");
+            } else {
+                // The row left `processing` while we were indexing — a delete tombstoned it, or the
+                // reaper reclaimed a stale lease. Not ours to finish; the {n} chunks just written are
+                // orphans the delete sweep clears by document_id. Do NOT resurrect it (invariant 10).
+                tracing::warn!(
+                    "document {document_id} left `processing` during indexing (deleted or reclaimed); \
+                     {n} chunk(s) written will be swept"
+                );
+            }
             Ok(())
         }
         Err(e) => {

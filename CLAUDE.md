@@ -93,9 +93,21 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
    deletes every existing vector for the document first, because a re-parse yielding *fewer* chunks
    would otherwise strand the old tail as orphans that still match searches. This is what makes
    redelivery safe.
-10. **A document is claimed by exactly one worker.** A row lock plus a status check is the entire
-    deduplication story. A second delivery finds the document finished with an identical fingerprint
-    and skips; a *different* fingerprint means the client overwrote the file, so it is re-indexed.
+10. **A document is claimed by exactly one worker, and the worker never resurrects a row it no longer
+    owns.** A row lock plus a status check is the entire deduplication story. A second delivery finds
+    the document finished with an identical fingerprint and skips; a *different* fingerprint means the
+    client overwrote the file, so it is re-indexed.
+    **`claim` skips a `deleting` row, and the two post-index transitions (`mark_ready`, `mark_failed`)
+    fire only `WHERE status = 'processing'`.** Both halves guard the same hazard: the worker releases
+    its row lock at claim time and only *then* parses, embeds and upserts, so for the whole life of an
+    index it holds no lock. A delete that tombstones the row to `deleting` mid-index (phase 8), or a
+    reaper that reclaims a stale lease to `failed`, must not be overwritten by a worker finishing late
+    — an unguarded `mark_ready` would flip `deleting` back to `ready` and resurrect a document being
+    erased, and the deferred-delete sweep, which looks for `deleting`, would never find it again. On a
+    zero-row guard the worker returns "not mine to finish" and stops; the chunks it wrote are orphans
+    the delete sweep clears by `document_id`. `mark_quarantined` is deliberately *not* guarded: it runs
+    on the oversize path *before* the claim, so its row is never `processing`, and its only race is
+    with the synchronous delete path, whose final `DELETE` is unconditional and wins regardless.
 11. **Upload size cannot be enforced at upload time.** A presigned signature covers method, key and
     expiry — **not body length**. The cap is enforced after the fact, by the worker, when the event
     arrives. Oversize documents are quarantined and their bytes deleted. Do not "move this check
