@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "bot_flow-collection-0001",
     "name": "bot_flow",
-    "description": "Multi-tenant RAG chatbot SaaS API.\n\nSet the collection variables first:\n- baseUrl: API base (prod domain or http://localhost:3000)\n- adminKey: the ADMIN_API_KEY (guards /admin/*)\n- apiKey: a SECRET key (sk_...) for ingest/search/documents/ask\n- publicKey: a PUBLISHABLE key (pk_...) for browser/chat (needs an allowed Origin)\n- sessionToken: a login session (sess_...) for the /auth/* routes; set automatically by Register / Login\n- keyHash: set automatically by List Keys; the target of Revoke Key\n- tenantId: a tenant slug (e.g. acme); set automatically by Register / Create Tenant\n- uploadUrl: set automatically by Create Upload URL; the presigned PUT target on MinIO :9000\n- documentId: a document_id returned by Create Upload URL\n- conversationId: optional; paste the conversation_id a prior /ask returned to continue that conversation\n\nTwo ways to onboard a tenant: Admin > Create Tenant (needs adminKey), or Auth > Register (self-serve, no admin key). Both return the first sk_ once.\n\nKey rules: /admin/* needs adminKey. /auth/register + /auth/login are public (rate-limited); the other /auth/* routes need a sessionToken. /ingest, /search, /documents (GET+POST) require a SECRET key. /ask + /ask/stream accept secret OR publishable (publishable also requires an allowed Origin header). /health is open.",
+    "description": "Multi-tenant RAG chatbot SaaS API.\n\nSet the collection variables first:\n- baseUrl: API base (prod domain or http://localhost:3000)\n- adminKey: the ADMIN_API_KEY (guards /admin/*)\n- apiKey: a SECRET key (sk_...) for ingest/search/documents/ask\n- publicKey: a PUBLISHABLE key (pk_...) for browser/chat (needs an allowed Origin)\n- sessionToken: a login session (sess_...) for the /auth/* routes; set automatically by Register / Login\n- keyHash: set automatically by List Keys; the target of Revoke Key\n- tenantId: a tenant slug (e.g. acme-inc); set automatically by Register / Create Tenant\n- uploadUrl: set automatically by Create Upload URL; the presigned PUT target on MinIO :9000\n- documentId: a document_id returned by Create Upload URL\n- conversationId: optional; paste the conversation_id a prior /ask returned to continue that conversation\n\nTwo ways to onboard a tenant: Admin > Create Tenant (needs adminKey), or Auth > Register (self-serve, no admin key). Both return the first sk_ once.\n\nKey rules: /admin/* needs adminKey. /auth/register + /auth/login are public (rate-limited); the other /auth/* routes need a sessionToken. /ingest, /search, /documents (GET+POST) require a SECRET key. /ask + /ask/stream accept secret OR publishable (publishable also requires an allowed Origin header). /health is open.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -28,7 +28,7 @@
     },
     {
       "key": "tenantId",
-      "value": "acme",
+      "value": "acme-inc",
       "type": "string"
     },
     {
@@ -204,7 +204,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"email\": \"owner@acme.test\",\n  \"password\": \"correct horse battery staple\",\n  \"tenant_name\": \"Acme\",\n  \"slug\": \"acme\"\n}",
+              "raw": "{\n  \"email\": \"admin@acme.test\",\n  \"password\": \"acme123#\",\n  \"tenant_name\": \"Acme Inc\",\n  \"slug\": \"acme-inc\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -257,7 +257,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"email\": \"owner@acme.test\",\n  \"password\": \"correct horse battery staple\"\n}",
+              "raw": "{\n  \"email\": \"admin@acme.test\",\n  \"password\": \"acme123#\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
