@@ -30,11 +30,18 @@ const COLLECTION: &str = "documents";
 
 // The context passages stay numbered: the numbering is what keeps the model anchored to a specific
 // passage rather than blending them. It just must not surface those numbers to the reader.
+// The language rule is about presentation, not content: it constrains what the answer is written in,
+// never what it may be drawn from, so it loosens nothing in invariant 4 or 5. Without it the model
+// picks a language on its own and picks inconsistently — the same English CV answered `siapa imam?`
+// in English and a longer Indonesian question in Indonesian. Being answered in a language you did not
+// ask in reads as a broken bot, and the tenant cannot fix it: this prompt is ours, not theirs.
 const RAG_SYSTEM_PROMPT: &str = "You are a customer service assistant. Answer the user's question \
     ONLY using the numbered CONTEXT passages below. If the answer is not in the context, say \
     honestly that you don't have that information — do not make anything up. Be concise. \
     Write the answer as plain prose: never include citation markers, bracketed numbers, or any \
-    reference to the passage numbers.";
+    reference to the passage numbers. \
+    Always answer in the same language as the user's question, even when the passages are in a \
+    different language — translate what you need from them rather than switching language.";
 
 #[derive(serde::Serialize)]
 struct Hit {

@@ -74,6 +74,16 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
 5. **The model may only use the passages it is given**, and is forbidden from writing citation
    markers into its prose. The numbering exists for the machine; citations are returned as structured
    data alongside the answer.
+   **It also answers in the language it was asked in**, which is a rule about *presentation*, not
+   content — it loosens nothing above. Without it the model picks a language on its own and picks
+   inconsistently: the same Indonesian corpus answered `siapa imam?` in English and
+   `ceritakan tentang pengalaman kerja Imam` in Indonesian, because the passages were English and
+   nothing said otherwise. An end user asking in their own language and being answered in another
+   reads as a broken bot, and the tenant cannot fix it — the prompt is ours, not theirs.
+   Note the seam this does **not** close: `NO_ANSWER` is a fixed English string, so a refusal
+   (invariant 4) is still English whatever the question's language. The refusal path never reaches
+   the model, so the prompt cannot reach it either; translating it would mean choosing a language
+   without one to mirror.
 6. **Chunks and questions must be embedded by the same model, through the same endpoint.** A
    collection may never hold vectors from two models: their coordinate spaces are unrelated, so a
    cosine score across them is noise that still looks like a number. Changing `EMBEDDING_MODEL`
