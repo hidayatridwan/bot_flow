@@ -423,7 +423,8 @@ writing the code.
 | Worker claim / status machine | `crates/worker/src/lifecycle.rs` |
 | MinIO event parsing (the percent-encoding trap) | `crates/worker/src/event.rs` |
 | Chunking | `crates/worker/src/chunk.rs` |
-| Reaper — `UPLOAD_GRACE` and `PROCESSING_LEASE` are named constants; read them there | `crates/worker/src/reaper.rs` |
+| Reaper — `UPLOAD_GRACE`/`PROCESSING_LEASE` constants; expired/reclaimed sweeps **and** the deferred-deletion sweep (phase 8) | `crates/worker/src/reaper.rs` |
+| `DELETE /documents/{id}` — the tombstone-guarded saga and `delete_document_stores` (its order/filters mirror the reaper sweep) | `crates/api/src/handlers.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |
 | Embeddable widget — renders citations, counts token frames, handles `done` | `widget/widget.js` |
 | The route that serves the widget from the binary (`include_str!`), with the ETag/`no-cache` revalidation that lets a fix reach every visitor | `crates/api/src/widget.rs` |
@@ -467,12 +468,18 @@ Honest inventory. Each entry states the impact, not merely the fact.
 - **Playground traffic shares the tenant's rate-limit bucket with their live widget**, because
   `rate_limit::check` keys on `tenant_id` rather than on the credential. That is what bounds the spend
   (invariant 27), and the cost is that a tenant testing enthusiastically can throttle production.
-- **There is no delete path for a document** — record, vectors and bytes persist forever. A "delete my
-  data" request cannot presently be honoured. For a product holding customers' support documents this
-  is a compliance gap, not a missing feature. Designing it means deciding the order of operations
-  across three stores and what happens when a step fails halfway.
-  **The dashboard now makes this visible**: `/documents` lists every row with no way to remove one,
-  and `expired`/`failed` rows accumulate in the tenant's own view.
+- **A deferred deletion can still answer for up to one `PROCESSING_LEASE`.** `DELETE /documents/{id}`
+  erases a document across all three stores (phase 8): it tombstones the row to `deleting`, then
+  removes vectors → object → row, the order that fails toward the least-bad orphan. For a document no
+  worker is touching this is synchronous (`204`) and instant. But a delete that lands *while a worker
+  is indexing* returns `202` and defers the store-cleanup to the reaper sweep, which cannot safely
+  delete the vectors until the worker has provably released — i.e. `PROCESSING_LEASE` after indexing
+  began. Until then the row is gone from the tenant's listing but its vectors still answer searches.
+  It affects only a delete racing an active index (rare), and the bound is the lease, but for an
+  *erasure* feature a ~30-minute "deleted but still answering" window is a real gap. Closing it means
+  the worker signalling completion on a `deleting` row so the sweep need not wait out the lease —
+  deferred, not free, because that write must not become a way to resurrect the tombstone (invariant
+  10). The synchronous path — the overwhelming majority of deletes — has no such window.
 - **`GET /documents` has no pagination.** It returns the tenant's entire table, every call, fully
   materialised. Fine for a new tenant; a real problem at scale, and the dashboard polls it. The
   polling backs off to a 15s ceiling precisely because this query is unbounded — that is a mitigation,

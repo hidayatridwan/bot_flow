@@ -41,7 +41,9 @@ const COLLECTION: &str = "documents";
 
 struct Ctx {
     bucket: Box<Bucket>,
-    qdrant: Qdrant,
+    // Arc so the reaper's delete-sweep can share the one client (phase 8). Qdrant methods take
+    // `&self`, so `Arc<Qdrant>` derefs transparently at every existing call site.
+    qdrant: Arc<Qdrant>,
     embedder: EmbeddingClient,
     db: PgPool,
     max_upload_bytes: i64,
@@ -66,9 +68,11 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to connect to Postgres")?;
     tracing::info!("connected to Postgres");
 
-    let qdrant = Qdrant::from_url(&std::env::var("QDRANT_URL").context("QDRANT_URL not set")?)
-        .build()
-        .context("failed to build Qdrant client")?;
+    let qdrant = Arc::new(
+        Qdrant::from_url(&std::env::var("QDRANT_URL").context("QDRANT_URL not set")?)
+            .build()
+            .context("failed to build Qdrant client")?,
+    );
     tracing::info!("Qdrant client ready");
 
     // Must agree with the API's client, or the two write vectors the other cannot search. Both read
@@ -82,8 +86,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let ctx = Arc::new(Ctx {
-        bucket,
-        qdrant,
+        bucket: bucket.clone(),
+        qdrant: Arc::clone(&qdrant),
         embedder,
         db: db.clone(),
         max_upload_bytes: std::env::var("MAX_UPLOAD_BYTES")
@@ -92,7 +96,9 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(25 * 1024 * 1024),
     });
 
-    reaper::spawn(db, Duration::from_secs(60));
+    // The reaper shares the Qdrant client and a clone of the bucket so its delete-sweep can finish
+    // deferred deletions across all three stores (phase 8, invariant 10).
+    reaper::spawn(db, qdrant, bucket, Duration::from_secs(60));
 
     // Reconnect forever. A broker restart must not kill the worker: MinIO buffers events to disk
     // while RabbitMQ is down (QUEUE_DIR) and replays them, so all we have to do is be there when

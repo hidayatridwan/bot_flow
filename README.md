@@ -97,6 +97,7 @@ weakest one already reaches, which is why the chat routes admit all three.
 | `POST` | `/documents/{id}/upload-url` | secret **or** session | Re-mint a URL for a document still `uploading` or `expired`. Only safe for *the same file* — see the note below |
 | `POST` | `/documents` | secret | **Deprecated** multipart proxy — buffers the file in the API's memory |
 | `GET` | `/documents` | secret **or** session | Lists this tenant's documents and their status |
+| `DELETE` | `/documents/{id}` | secret **or** session | Erases the document across Postgres, Qdrant and MinIO. `204` when done inline, `202` when a worker is mid-index and the reaper finishes it. Unknown/other-tenant id → `404` |
 | `POST` | `/ingest` | secret | `{"texts": [...]}` — indexes raw strings, skipping the upload pipeline. Rate-limited |
 | `POST` | `/search` | secret **or** session | `{"query": "…", "limit": 3}` — returns raw scored chunks, no LLM. Rate-limited. **Not** open to `pk_`: raw retrieval is not asking a question |
 | `POST` | `/ask` | any key **or** session | Retrieval + LLM answer as one JSON blob. Rate-limited |

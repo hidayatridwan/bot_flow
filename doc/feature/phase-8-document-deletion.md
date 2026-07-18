@@ -1,10 +1,17 @@
 # Feature: Document deletion — the design (phase 8)
 
-> Status: **design for review. No code.** This document exists to settle the decisions *before* a
-> line is written, because deletion spans three data stores with no transaction across them, and the
-> failure modes live entirely in the ordering. Audited against the code: the three delete primitives
-> already exist, so this is not a "how do I delete from each store" problem — it is an *ordering,
-> atomicity, and concurrency* problem, and that is what the decisions below are about.
+> Status: **implemented** (D1–D9 as recommended; open questions resolved 202 / lease-bounded / 404).
+> Shipped in four commits: the worker fence (`deleting` tombstone + `processing`-guarded marks,
+> invariant 10); `DELETE /documents/{id}` (the synchronous saga); the dashboard delete button; and the
+> reaper's deferred/crash-recovery sweep. Verified live end to end — synchronous delete clears all
+> three stores with non-oracle 404s, and the sweep correctly finishes a crash-recovery row and a
+> past-lease deferred row while leaving a within-lease row untouched (the safety property). The one
+> accepted limitation — a deferred deletion can still answer for up to `PROCESSING_LEASE` — is recorded
+> in CLAUDE.md's *Known state*.
+>
+> The design below is retained as written; it is what the code was held to. Where the audit changed a
+> decision during build (the fence guards the two post-index marks, not the shared `set_status`,
+> because `mark_quarantined` runs pre-claim), the code and invariant 10 are the authority.
 
 ## Context — why this is the biggest gap
 
