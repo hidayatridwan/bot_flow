@@ -556,3 +556,16 @@ Honest inventory. Each entry states the impact, not merely the fact.
   while invariant 20 said it did not; `README` documented `[n]` citation markers that the system
   prompt explicitly forbids. A curl, an echo server, or a captured stream settles in a minute what a
   paragraph can argue for a year.
+- **Stop what you started.** A live check leaves things running: `cargo run -p api`, the worker,
+  `bun run dev`, a scratch `http.server`, a mock gateway. Kill them when the check is done, and
+  revoke any diagnostic key you minted — a stray `sk_` sitting in a tenant is a real credential
+  nobody asked for.
+  This earns a rule rather than being mere tidiness, because a forgotten binary fails the *next*
+  person in a way that hides its own cause. It still holds `:3000`, so `cargo run -p api` dies — but
+  every dependency connects first (Postgres, Qdrant, Redis, S3, RabbitMQ all log success), and then
+  lapin prints `A Tokio 1.x context was found, but it is being shutdown`, which reads like a broken
+  message broker. It is teardown noise: the bind failed, `main` returned `Err`, and the runtime went
+  down underneath lapin's io_loop. The cause is the quiet last line — `Address already in use` — not
+  the loud error above it. `lsof -nP -iTCP:3000 -sTCP:LISTEN` names the offending pid in a second.
+  The five `docker compose` services are the intended dev environment: leave them up unless you
+  started them for the check, and say either way.
