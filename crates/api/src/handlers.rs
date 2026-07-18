@@ -6,9 +6,9 @@ use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use qdrant_client::qdrant::{
-    value::Kind, Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder, Distance,
-    FieldType, Filter, KeywordIndexParamsBuilder, PointStruct, QueryPointsBuilder,
-    UpsertPointsBuilder, VectorParamsBuilder,
+    value::Kind, Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
+    DeletePointsBuilder, Distance, FieldType, Filter, KeywordIndexParamsBuilder, PointStruct,
+    QueryPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use serde::Deserialize;
@@ -658,8 +658,11 @@ pub async fn list_documents(
     let mut tx = crate::db::tenant_tx(&state.db, &actor.tenant_id).await?;
     // Note: NO `WHERE tenant_id` — RLS scopes this to the current tenant automatically.
     // That's the whole point: forgetting the filter can't leak other tenants' rows.
+    // Exclude `deleting`: a tombstoned document is on its way out (phase 8) and must not appear in
+    // the tenant's list — it has already left, as far as they are concerned.
     let rows = sqlx::query(
-        "SELECT id, filename, status, created_at::text AS created_at FROM documents ORDER BY created_at DESC",
+        "SELECT id, filename, status, created_at::text AS created_at
+           FROM documents WHERE status <> 'deleting' ORDER BY created_at DESC",
     )
     .fetch_all(&mut *tx)
     .await?;
@@ -679,6 +682,115 @@ pub async fn list_documents(
         .collect();
 
     Ok(Json(json!({ "documents": docs })))
+}
+
+/// `DELETE /documents/{id}` — erase a document across all three stores (phase 8).
+///
+/// A tombstone-guarded saga, because there is no transaction spanning Postgres, Qdrant and MinIO.
+/// The row is moved to `deleting` first, on its own, under a row lock: that drops it from the
+/// tenant's list immediately and — for a document a worker is still indexing — fences the worker out
+/// (invariant 10). Everything after the tombstone is idempotent cleanup a crash can resume, which is
+/// why the tombstone is committed before any store is touched.
+///
+/// Two outcomes:
+/// - **`processing`** → `202`. A worker may still be writing vectors; deleting them now would race
+///   its upsert and lose. The reaper sweep (a later commit) finishes it once the worker has provably
+///   released. Until then the row is `deleting`: gone from listings, fenced.
+/// - **anything else** (`ready`/`failed`/`expired`/`uploading`/`quarantined`) → `204`, done inline.
+pub async fn delete_document(
+    State(state): State<AppState>,
+    actor: Actor,
+    Path(document_id): Path<uuid::Uuid>,
+) -> Result<StatusCode, AppError> {
+    actor.require_management()?;
+
+    // Lock the row and read what we need before changing anything. Unknown id and another tenant's
+    // id both arrive as `None` — RLS hides the latter — and both must 404: a 403 for one would make
+    // the endpoint an oracle for which ids exist (invariants 8, 26). This SELECT-under-RLS, not a
+    // blind DELETE, is also what dodges the corollary trap: a cross-tenant DELETE matches zero rows
+    // and reports success, which would have us report a deletion that never happened.
+    let mut tx = crate::db::tenant_tx(&state.db, &actor.tenant_id).await?;
+    let row = sqlx::query("SELECT status, object_key FROM documents WHERE id = $1 FOR UPDATE")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(row) = row else {
+        return Err(AppError::client(
+            StatusCode::NOT_FOUND,
+            "document not found",
+        ));
+    };
+    let status: String = row.get("status");
+    let object_key: String = row.get("object_key");
+
+    // Already tombstoned: another delete owns it, or a crashed saga left it for the sweep. Don't
+    // re-run — it is on its way out. Idempotent accept.
+    if status == "deleting" {
+        return Ok(StatusCode::ACCEPTED);
+    }
+    let was_processing = status == "processing";
+
+    // The tombstone. Committed alone, so the row leaves listings and the worker is fenced before any
+    // store is touched. `processing_started_at` is deliberately left intact: the deferred sweep uses
+    // it as the "worker has released" clock.
+    sqlx::query("UPDATE documents SET status = 'deleting' WHERE id = $1")
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    if was_processing {
+        return Ok(StatusCode::ACCEPTED);
+    }
+
+    // The stores, then the record. Vectors → object → row, the order that fails toward the least-bad
+    // orphan (surviving vectors would still answer questions; a surviving row is an inert ghost).
+    delete_document_stores(&state, &actor.tenant_id, document_id, &object_key).await?;
+
+    let mut tx = crate::db::tenant_tx(&state.db, &actor.tenant_id).await?;
+    // Guarded on `deleting` so we only remove the tombstone we set, never a row a concurrent path
+    // has since re-created or moved on.
+    sqlx::query("DELETE FROM documents WHERE id = $1 AND status = 'deleting'")
+        .bind(document_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete a document's vectors and object. Idempotent — deleting absent vectors or an absent object
+/// is a no-op — so it is safe to re-run, which the reaper sweep will. Shared so the two paths cannot
+/// diverge on the order or the filters.
+async fn delete_document_stores(
+    state: &AppState,
+    tenant_id: &str,
+    document_id: uuid::Uuid,
+    object_key: &str,
+) -> Result<(), AppError> {
+    // Filter on BOTH document_id and tenant_id. `document_id` is a globally-unique UUID, so tenant_id
+    // is not strictly required — but isolation is layered precisely so no single condition is load-
+    // bearing (invariant 1's philosophy): a bug that ever collided document_ids still could not cross
+    // a tenant boundary.
+    state
+        .qdrant
+        .delete_points(
+            DeletePointsBuilder::new(COLLECTION)
+                .points(Filter::must([
+                    Condition::matches("document_id", document_id.to_string()),
+                    Condition::matches("tenant_id", tenant_id.to_string()),
+                ]))
+                .wait(true),
+        )
+        .await?;
+
+    // Delete the STORED key, never one reconstructed from (tenant, id): the deprecated multipart path
+    // wrote `{tenant}/{id}` while the live path writes `tenants/{tenant}/documents/{id}/original.{ext}`,
+    // so a reconstruction would miss a legacy object and silently orphan its bytes. Idempotent: MinIO
+    // succeeds on an absent key, and an `uploading` row may have no object at all.
+    state.s3.delete_object(object_key).await?;
+
+    Ok(())
 }
 
 /// Validate and canonicalise an allow-list for a key of `kind`.

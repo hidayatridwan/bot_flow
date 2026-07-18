@@ -17,7 +17,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use anyhow::Context;
 use axum::{
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Router,
 };
 use qdrant_client::Qdrant;
@@ -149,6 +149,12 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/documents/{document_id}/upload-url",
             post(handlers::refresh_upload_url),
+        )
+        // Erase a document across Postgres, Qdrant and MinIO (phase 8). Management-gated, like the
+        // rest of /documents — never a `pk_`.
+        .route(
+            "/documents/{document_id}",
+            delete(handlers::delete_document),
         )
         .route("/ask/stream", post(handlers::ask_stream))
         // Self-serve tenant accounts. /register and /login are public (and rate limited); the rest
