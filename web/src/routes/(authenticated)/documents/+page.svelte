@@ -6,9 +6,11 @@
 	import UploadCard from '$lib/features/documents/components/upload-card.svelte';
 	import { POLL_MIN_MS, nextInterval } from '$lib/features/documents/poll';
 	import { isTransient } from '$lib/features/documents/status';
-	import type { PageData } from './$types';
+	import type { ActionData, PageData } from './$types';
 
-	let { data }: { data: PageData } = $props();
+	let { data, form }: { data: PageData; form: ActionData } = $props();
+
+	const deleteError = $derived(form && 'deleteError' in form ? form.deleteError : null);
 
 	const anyTransient = $derived(data.documents.some((d) => isTransient(d.status)));
 	// The signature of "did anything move?" — cheaper and more precise than deep-comparing the rows.
@@ -70,6 +72,13 @@
 
 <div class="flex flex-col gap-4">
 	<UploadCard onuploaded={() => invalidate('documents:list')} />
+
+	{#if deleteError}
+		<Alert.Root variant="destructive">
+			<CircleAlertIcon />
+			<Alert.Description>{deleteError}</Alert.Description>
+		</Alert.Root>
+	{/if}
 
 	{#if data.loadError}
 		<!-- Not an empty table: telling a tenant their library is gone because our API blinked would

@@ -1,8 +1,10 @@
-import type { PageServerLoad } from './$types';
+import { fail } from '@sveltejs/kit';
+import type { Actions, PageServerLoad } from './$types';
 import { api } from '$lib/server/api';
 import * as documentsApi from '$lib/server/api/documents';
 import { requireSession } from '$lib/server/auth/guard';
 import { toStatus } from '$lib/features/documents/status';
+import { genericMessage } from '$lib/utils/api-copy';
 import type { Document } from '$lib/types/documents';
 
 export const load: PageServerLoad = async (event) => {
@@ -30,4 +32,21 @@ export const load: PageServerLoad = async (event) => {
 
 	// The token is not in this return value, and must never be (invariant 20).
 	return { documents, loadError: false };
+};
+
+export const actions: Actions = {
+	delete: async (event) => {
+		const { token } = requireSession(event.locals, event.url);
+		const id = String((await event.request.formData()).get('id') ?? '');
+
+		const res = await documentsApi.deleteDocument(api(event, token), id);
+
+		// A 404 means it is already gone — from the tenant's side, deleted. Report success rather than
+		// an error for a document that is not there (deletion is idempotent). A session only ever
+		// addresses its own tenant's ids, so this is not the non-oracle concern the API side guards.
+		if (!res.ok && res.error.status !== 404) {
+			return fail(res.error.status || 503, { deleteError: genericMessage(res.error) });
+		}
+		return { deleted: true };
+	}
 };

@@ -52,3 +52,13 @@ export const createUploadUrl = (client: ApiClient, body: UploadUrlBody) =>
  */
 export const refreshUploadUrl = (client: ApiClient, documentId: string) =>
 	client.post<UploadUrlResponse>(`/documents/${documentId}/upload-url`);
+
+/**
+ * Erase a document across all three stores (phase 8).
+ *
+ * `204` when done inline, `202` when a worker was mid-index and the reaper sweep will finish it —
+ * both are `ok`, and both mean the same thing to the tenant: it is gone from their list now. A `404`
+ * means it was already gone (idempotent); the caller treats that as success rather than an error.
+ */
+export const deleteDocument = (client: ApiClient, documentId: string) =>
+	client.del<void>(`/documents/${documentId}`);
