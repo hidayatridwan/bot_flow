@@ -121,6 +121,20 @@ fn sparse_config() -> SparseVectorsConfigBuilder {
     cfg
 }
 
+/// The documents behind an answer, deduplicated. `/ingest`-era chunks carry an empty document_id
+/// and are skipped: there is nothing to attribute them to, which is the debt phase 11 closed for
+/// everything written since.
+fn source_document_ids(hits: &[Hit]) -> Vec<String> {
+    let mut ids: Vec<String> = hits
+        .iter()
+        .filter(|h| !h.document_id.is_empty())
+        .map(|h| h.document_id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// MANDATORY filter: restrict the query to points owned by this tenant only.
 /// The "mandatory filter at the app layer" leg of defense-in-depth.
 fn tenant_filter(tenant_id: &str) -> Filter {
@@ -451,6 +465,7 @@ pub async fn ask(
             conversation_id,
             &req.query,
             NO_ANSWER,
+            &[], // a refusal cites nothing — there was no context (invariant 4)
         )
         .await?;
         return Ok(Json(json!({
@@ -476,6 +491,7 @@ pub async fn ask(
         conversation_id,
         &req.query,
         &answer,
+        &source_document_ids(&relevant),
     )
     .await?;
 
@@ -709,6 +725,10 @@ pub async fn ask_stream(
     // Retrieval happens before streaming, so retrieval errors are normal HTTP errors (not mid-stream).
     let relevant = retrieve(&state, &actor.tenant_id, &standalone, limit).await?;
 
+    // Captured for the turn record: which documents the model was shown. Computed here because
+    // `relevant` is consumed building the SSE payload below.
+    let source_docs = source_document_ids(&relevant);
+
     // We know the sources up front — send them as the first SSE event.
     let sources = json!(relevant
         .iter()
@@ -738,7 +758,7 @@ pub async fn ask_stream(
 
         if empty {
             // Persisted so history stays a faithful record of what the user was told.
-            if let Err(e) = conversation::append_turn(&db, &tenant_id, conversation_id, &question, NO_ANSWER).await {
+            if let Err(e) = conversation::append_turn(&db, &tenant_id, conversation_id, &question, NO_ANSWER, &[]).await {
                 tracing::error!("failed to persist turn: {e:?}");
             }
             yield Ok(Event::default().event("token").data(NO_ANSWER));
@@ -778,7 +798,7 @@ pub async fn ask_stream(
         // 4. persist the turn. A stream that errored may have emitted a partial answer —
         // storing it would make the next rewrite reason over a truncated sentence.
         if !failed && !answer.is_empty() {
-            if let Err(e) = conversation::append_turn(&db, &tenant_id, conversation_id, &question, &answer).await {
+            if let Err(e) = conversation::append_turn(&db, &tenant_id, conversation_id, &question, &answer, &source_docs).await {
                 tracing::error!("failed to persist turn: {e:?}");
             }
         }
@@ -847,6 +867,17 @@ pub async fn delete_document(
 ) -> Result<StatusCode, AppError> {
     actor.require_management()?;
 
+    // Opened before anything is touched, closed when the stores are clear. A row left open is an
+    // erasure that started and did not finish — the case worth being able to find.
+    let audit_id = crate::erasure::begin(
+        &state.db,
+        &actor.tenant_id,
+        "document",
+        Some(document_id),
+        crate::erasure::actor_label(&actor.kind),
+    )
+    .await?;
+
     // Lock the row and read what we need before changing anything. Unknown id and another tenant's
     // id both arrive as `None` — RLS hides the latter — and both must 404: a 403 for one would make
     // the endpoint an oracle for which ids exist (invariants 8, 26). This SELECT-under-RLS, not a
@@ -890,6 +921,15 @@ pub async fn delete_document(
     // orphan (surviving vectors would still answer questions; a surviving row is an inert ghost).
     delete_document_stores(&state, &actor.tenant_id, document_id, &object_key).await?;
 
+    // Answers that quoted this document are redacted, not left standing. `messages` never held the
+    // passages, but an answer derived from them routinely recites them — so erasing the source and
+    // leaving the recitation is an erasure with a hole in it.
+    let redacted =
+        crate::erasure::redact_messages_citing(&state.db, &actor.tenant_id, document_id).await?;
+    if redacted > 0 {
+        tracing::info!(document = %document_id, "redacted {redacted} conversation turn(s)");
+    }
+
     let mut tx = crate::db::tenant_tx(&state.db, &actor.tenant_id).await?;
     // Guarded on `deleting` so we only remove the tombstone we set, never a row a concurrent path
     // has since re-created or moved on.
@@ -899,6 +939,7 @@ pub async fn delete_document(
         .await?;
     tx.commit().await?;
 
+    crate::erasure::finish(&state.db, audit_id, None, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1070,6 +1111,51 @@ pub struct MintKeyRequest {
 }
 fn default_kind() -> String {
     "secret".to_string()
+}
+
+/// `DELETE /admin/tenants/{tenant_id}` — erase a tenant and everything it owns.
+///
+/// **Admin-only, and that is the point.** Every other erasure in this system is something a tenant
+/// does to their own data. This one ends the tenant, so it is guarded by `ADMIN_API_KEY` — a
+/// deployment secret, not a database row — for the same reason tenant *creation* is: these are the
+/// operations that make and unmake the tenancy registry itself.
+///
+/// Returns `200` with what was removed, rather than `204`. A caller acting on an erasure request
+/// needs evidence, and "how many vectors and objects went" is the evidence. The same numbers land in
+/// `erasures`, which survives the deletion because it holds no foreign key to `tenants`.
+///
+/// An unknown tenant is a `404` — and here that is not a non-oracle concern (the admin key already
+/// sees every tenant) but simple honesty: reporting success for a tenant that never existed would
+/// let a typo read as a completed erasure.
+pub async fn delete_tenant(
+    _admin: AdminAuth,
+    State(state): State<AppState>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    // `tenants` has no RLS — it is the registry itself — so this is the plain pool.
+    let exists = sqlx::query("SELECT 1 FROM tenants WHERE id = $1")
+        .bind(&tenant_id)
+        .fetch_optional(&state.db)
+        .await?
+        .is_some();
+    if !exists {
+        return Err(AppError::client(StatusCode::NOT_FOUND, "tenant not found"));
+    }
+
+    let audit_id = crate::erasure::begin(&state.db, &tenant_id, "tenant", None, "admin").await?;
+    let (vectors, objects) = crate::erasure::erase_tenant(&state, &tenant_id).await?;
+    crate::erasure::finish(&state.db, audit_id, Some(vectors), Some(objects)).await?;
+
+    tracing::warn!(
+        tenant = %tenant_id,
+        "tenant erased: {vectors} vector(s), {objects} object(s), all rows"
+    );
+    Ok(Json(json!({
+        "tenant_id": tenant_id,
+        "vectors_deleted": vectors,
+        "objects_deleted": objects,
+        "erasure_id": audit_id.to_string(),
+    })))
 }
 
 pub async fn mint_key(

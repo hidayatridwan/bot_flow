@@ -390,7 +390,17 @@ impl TestApp {
     /// for this exact text scores ~1.0 and anything else ~0.0 — which is what makes a denial
     /// unambiguous rather than merely empty.
     pub async fn plant_chunk(&self, tenant_id: &str, text: &str) -> String {
-        let document_id = uuid::Uuid::new_v4().to_string();
+        self.plant_chunk_for(tenant_id, &uuid::Uuid::new_v4().to_string(), text)
+            .await
+    }
+
+    /// The same, for a document that already has a row — so `DELETE /documents/{id}` can reach it.
+    ///
+    /// Needed because the harness runs no worker: `/ingest` creates the row and stores the object,
+    /// but nothing indexes it, so a test about *retrieval and erasure together* has to stand in for
+    /// the indexing step.
+    pub async fn plant_chunk_for(&self, tenant_id: &str, document_id: &str, text: &str) -> String {
+        let document_id = document_id.to_string();
         self.qdrant
             .upsert_points(
                 qdrant_client::qdrant::UpsertPointsBuilder::new(
@@ -411,6 +421,30 @@ impl TestApp {
             .await
             .expect("failed to plant a chunk");
         document_id
+    }
+
+    /// Run a read against a tenant-scoped (RLS) table.
+    ///
+    /// **`self.db` alone is not enough.** `documents`, `conversations` and `messages` are RLS-forced
+    /// and the harness connects as `app_user`, so a query without `app.current_tenant` set matches
+    /// zero rows and *reports success* — the corollary trap, arriving in a test rather than in
+    /// production. A test that read directly got 0 and looked like a missing feature.
+    pub async fn count_as_tenant(&self, tenant_id: &str, sql: &str, bind: Value) -> i64 {
+        use sqlx::Row;
+        let mut tx = self.db.begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let n: i64 = sqlx::query(sql)
+            .bind(bind)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap()
+            .get(0);
+        tx.commit().await.unwrap();
+        n
     }
 
     /// `POST /search` with the given credential.

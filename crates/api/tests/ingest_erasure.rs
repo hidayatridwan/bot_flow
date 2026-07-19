@@ -215,3 +215,109 @@ async fn the_ingest_contract_is_validated() {
 
     app.cleanup().await;
 }
+
+/// Deleting a document redacts the answers that quoted it.
+///
+/// **`messages` never stored the retrieved passages** — only the question and the model's answer.
+/// But an answer is *derived* from those passages and routinely recites them, so erasing a document
+/// while leaving the recitation standing is an erasure with a hole in it. Nothing could find those
+/// answers until assistant turns started carrying their sources in `metadata` (phase 12).
+///
+/// The turn is redacted, not deleted: removing the row would leave a user's question answering
+/// itself, and renumber a conversation the client is still holding.
+#[tokio::test]
+#[ignore = "needs docker compose services + the bot_flow_test database"]
+async fn deleting_a_document_redacts_the_answers_that_quoted_it() {
+    let app = TestApp::new().await;
+    let (tenant, sk) = app.create_tenant().await;
+
+    // A document, and an answer that cites it. The fake gateway makes retrieval deterministic, so
+    // the passage is certain to be in context.
+    let nonce = format!("nonce-{}", uuid::Uuid::new_v4().simple());
+    // A real document (row + object), then a chunk planted for it — the harness runs no worker, so
+    // the indexing step is stood in for.
+    let (status, body) = app
+        .request(
+            json_request("POST", "/ingest", &sk)
+                .body(ingest_body(
+                    "secret.md",
+                    &format!("{nonce} the secret is 42"),
+                    None,
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, 202, "{body}");
+    let document_id = body["document_id"].as_str().unwrap().to_string();
+    app.plant_chunk_for(&tenant, &document_id, &format!("{nonce} the secret is 42"))
+        .await;
+
+    let (status, body) = app
+        .request(
+            json_request("POST", "/ask", &sk)
+                .body(Body::from(
+                    serde_json::json!({ "query": format!("{nonce} the secret is 42") }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, 200, "ask failed: {body}");
+    assert!(
+        !body["sources"].as_array().unwrap().is_empty(),
+        "the answer must have cited the document, or this test proves nothing: {body}"
+    );
+
+    // The assistant's turn records which documents it was shown.
+    let cited = app
+        .count_as_tenant(
+            &tenant,
+            "SELECT count(*) FROM messages WHERE metadata -> 'document_ids' @> $1::jsonb",
+            serde_json::json!([document_id]),
+        )
+        .await;
+    assert_eq!(
+        cited, 1,
+        "the assistant's turn must record its sources, or deletion can never find it"
+    );
+
+    // Erase the document.
+    let (status, _) = app
+        .request(
+            json_request("DELETE", &format!("/documents/{document_id}"), &sk)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(status, 204);
+
+    // The turn survives; its content does not. Read under tenant context — `messages` is RLS-forced
+    // and a query without it matches zero rows while reporting success.
+    let redacted = app
+        .count_as_tenant(
+            &tenant,
+            "SELECT count(*) FROM messages
+              WHERE role = 'assistant' AND content LIKE '[redacted%' AND $1::jsonb IS NOT NULL",
+            serde_json::json!([document_id]),
+        )
+        .await;
+    assert_eq!(
+        redacted, 1,
+        "an answer quoting a deleted document must be redacted, not left standing"
+    );
+
+    // And the turn itself is still there — redaction, not deletion. Removing the row would leave
+    // the user's question answering itself and renumber a conversation the client still holds.
+    let turns = app
+        .count_as_tenant(
+            &tenant,
+            "SELECT count(*) FROM messages WHERE $1::jsonb IS NOT NULL",
+            serde_json::json!([document_id]),
+        )
+        .await;
+    assert_eq!(
+        turns, 2,
+        "the question and the redacted answer must both remain"
+    );
+
+    app.cleanup().await;
+}

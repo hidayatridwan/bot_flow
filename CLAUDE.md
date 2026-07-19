@@ -312,10 +312,19 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     random ids and no `document_id`, and CLAUDE.md carried them as *"permanent"* for eight phases.
     The fix was not a second ingestion path but the **absence** of one — `/ingest` now writes its
     text to MinIO and the ordinary pipeline indexes it.
-    Note precisely what this does and does not promise. It is **per-document** erasure. Deleting a
-    *tenant* still erases nothing outside Postgres, `messages` still retains the passage text a model
-    was shown, and there is no audit trail of erasures. Those are the next phase, and calling this
-    one "GDPR compliant" would be the kind of claim this file exists to prevent.
+    **A tenant is erasable too, and the record of an erasure outlives its subject** (phase 12).
+    `DELETE /admin/tenants/{id}` removes vectors, objects and rows; access is revoked *first* so
+    nothing can authenticate mid-erasure, and the vector sweep runs *twice* because a worker already
+    indexing holds no lock and can upsert between them. Answers that quoted a deleted document are
+    **redacted, not deleted** — the turn stays, its content becomes a tombstone — which is possible
+    only because assistant turns now carry their sources in `metadata`.
+    **`erasures` has no foreign key to `tenants` and no RLS, deliberately.** Every neighbouring table
+    cascades on tenant deletion; an audit row that did the same would be destroyed by the erasure it
+    records, in the same statement, and the destruction would look like diligence.
+    Still not promised: turns written before phase 12 carry no provenance and cannot be found; there
+    is no retention policy; the audit is a table an operator can edit, not a tamper-evident log; and
+    `purge-unattributed` writes no audit row. Calling this "GDPR compliant" would be the kind of
+    claim this file exists to prevent.
 
 **Gateways**
 
@@ -424,6 +433,9 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Judge a chunking recipe on recall alone | Read context cost beside it | "Did a passage contain the answer" is trivially satisfied by returning the whole document. Measured: one-chunk-per-document scored a *perfect* recall and a *better* MRR while handing the model 1.8× the context. On recall alone the deliberately-broken variant wins |
 | Pick `RAG_SCORE_THRESHOLD` by reasoning about it | Sweep it on the bench | Every value in this repo's history was wrong: 0.70 (E5-era) refuses everything, 0.35 silently drops 4.5% of answers. 0.25 is the highest floor that costs no recall — and it was only knowable by measuring |
 | Change the chunker, the model or the payload in place | Bump `common::COLLECTION` | `ensure_collection` early-returns when the collection exists, so an in-place change **silently does not happen**. The version is also this system's only rollback: the old collection stays queryable while the new one fills |
+| Trust `sqlx::migrate!` to notice a new migration file | Rebuild the crate that embeds it (touch a source file, or `cargo clean -p worker`) | It is a **compile-time** read of a directory, exactly like `include_str!` for `widget.js`. The worker embeds `../api/migrations`; adding `0013` and running `cargo test --workspace` failed with `VersionMissing(13)` because the worker binary still held the old set. The database was ahead of the binary, and the error names the version rather than the cause |
+| Give an audit table the foreign key its neighbours have | `erasures` references nothing | It would cascade away in the same statement as the erasure it documents. Postgres will even refuse to add the constraint once real rows exist — the schema disagreeing with itself *is* the property |
+| Query an RLS table from a test on the app pool | Set `app.current_tenant` first | `documents`, `conversations` and `messages` are RLS-forced. A direct read returns zero rows and *reports success* — the corollary trap, arriving in a test and reading as a missing feature. `TestApp::count_as_tenant` exists for this |
 | Add a second way to write vectors | Write the bytes and let the worker index them | Invariant 29 breaks exactly one way: a path that skips the `documents` row. `/ingest` was that path for eight phases, and its points were unerasable the whole time. If a new route needs to index text, it should produce an object, not a point |
 | Republish ingest events to re-index everything | `cargo run -p worker -- reindex` | Invariant 10 skips a redelivered document whose fingerprint is unchanged — the very thing that makes redelivery safe makes a migration a silent no-op. The driver bypasses `claim` deliberately, which is also why the normal worker must be stopped first |
 | List only the tables you name in a `TRUNCATE … CASCADE` prompt | Name what CASCADE will reach as well | `accounts` and `sessions` hang off `tenants` by FK, so a wipe of "tenants, api_keys, documents" silently destroys every dashboard login too. Verified from the `NOTICE` output. A prompt that understates its blast radius is approved by someone who did not know what they were approving |
@@ -502,6 +514,8 @@ writing the code.
 | `worker purge-unattributed` — erasing pre-phase-11 points that belong to no document; dry-run by default, optionally scoped to one tenant | `crates/worker/src/main.rs` |
 | Inline documents: `checked_extension` (shared with the presigned path) and `inline_document` (the row, and `external_id` reuse) | `crates/api/src/upload/mod.rs` |
 | That an ingested document is listable, deletable, and gone afterwards | `crates/api/tests/ingest_erasure.rs` |
+| Erasing a tenant across all three stores, the audit trail, and redacting answers that quoted a deleted document | `crates/api/src/erasure.rs` |
+| That a tenant's data goes and the record of it staying does not | `crates/api/tests/tenant_erasure.rs` |
 | Reaper — `UPLOAD_GRACE`/`PROCESSING_LEASE` constants; expired/reclaimed sweeps **and** the deferred-deletion sweep (phase 8) | `crates/worker/src/reaper.rs` |
 | `DELETE /documents/{id}` — the tombstone-guarded saga and `delete_document_stores` (its order/filters mirror the reaper sweep) | `crates/api/src/handlers.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |

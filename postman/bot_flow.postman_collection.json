@@ -231,6 +231,54 @@
             },
             "description": "Mint a key for a tenant. kind = \"secret\" or \"publishable\". For publishable, set allowed_origins. Raw key returned once. Requires adminKey."
           }
+        },
+        {
+          "name": "Erase Tenant (DESTRUCTIVE)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/admin/tenants/{{tenantId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "admin",
+                "tenants",
+                "{{tenantId}}"
+              ]
+            },
+            "description": "Erases a tenant across ALL THREE stores: Qdrant vectors, MinIO objects, Postgres rows. Irreversible, and there is no confirmation step \u2014 the admin key IS the confirmation.\n\nReturns what was removed rather than 204, because a caller acting on an erasure request needs evidence. The same counts are written to the `erasures` table, which has no foreign key to `tenants` and therefore SURVIVES the deletion \u2014 an audit row that cascaded away with its subject would be worse than none.\n\nAccess is revoked before anything is deleted, and vectors are swept twice (a worker mid-index holds no lock and can write between the sweeps). Unknown tenant \u2192 404, so a typo cannot read as a completed erasure."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 with evidence of what was erased', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b).to.have.property('vectors_deleted');",
+                  "    pm.expect(b).to.have.property('objects_deleted');",
+                  "    pm.expect(b).to.have.property('erasure_id');",
+                  "});",
+                  "// The tenant's sk_/pk_ keys are gone too. Every later request in this collection will 401",
+                  "// until you create a new tenant."
+                ]
+              }
+            }
+          ]
         }
       ]
     },

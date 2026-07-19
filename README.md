@@ -93,6 +93,7 @@ weakest one already reaches, which is why the chat routes admit all three.
 | `GET` | `/widget.js` | none | The embeddable widget, served from the binary. `Cache-Control: no-cache` + a strong `ETag`, so a fix reaches every visitor on the next restart |
 | `POST` | `/admin/tenants` | admin key | Creates a tenant, returns its first `sk_` key |
 | `POST` | `/admin/tenants/{tenant_id}/keys` | admin key | Mints a `secret` or `publishable` key |
+| `DELETE` | `/admin/tenants/{tenant_id}` | admin key | **Erases a tenant**: vectors, objects and rows. Returns what was removed, and records it in `erasures` — which survives the deletion. Unknown id → `404` |
 | `POST` | `/auth/register` | none | Self-serve: creates a tenant + owner account, returns a session and the first `sk_`. Rate-limited |
 | `POST` | `/auth/login` | none | Verifies email + password, returns a session. Rate-limited per email |
 | `POST` | `/auth/logout` | session | Ends the current session |

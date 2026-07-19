@@ -10,25 +10,31 @@
 | # | Blocker | Severity | Closed by |
 | --- | --- | --- | --- |
 | 1 | ~~`/ingest` vectors cannot be attributed to a document~~ | ~~blocking~~ | **CLOSED** — [phase 11](feature/phase-11-ingest-gdpr.md), invariant 29 |
-| 2 | No tenant-level erasure, no erasure audit trail, history retains passage text | **blocking** | phase 12 (D8 of phase 11) — not designed |
+| 2 | ~~No tenant-level erasure, no audit trail, history unredacted~~ | ~~blocking~~ | **CLOSED** — [phase 12](feature/phase-12-tenant-erasure.md); one window left open, stated below |
 | 3 | No metrics, no alerting, no backups | **blocking** | not designed |
 | 4 | `failed` cannot tell a tenant whether to re-upload or wait | high | not designed |
 | 5 | `GET /documents` unpaginated; `/auth/keys` unmetered; `/ask/stream` unbounded | high | not designed |
 
-Verified against the tree on 2026-07-19: `/ingest` makes **zero** chunker calls and writes a payload of
-exactly `text` + `tenant_id`; there is **no** tenant-deletion endpoint, **no** metrics endpoint, **no**
-endpoint exposing `documents.error`, and **no** `LIMIT`/`OFFSET` in `list_documents`.
+Blockers 1 and 2 were closed by phases 11 and 12 and are struck through above, with what remains
+stated in each. **Blocker 3 is now the one that matters most**: the system can erase data correctly
+and cannot tell you when it is failing.
+
+Re-verified 2026-07-19 after phase 12: there is still **no** metrics endpoint, **no** endpoint
+exposing `documents.error`, and **no** `LIMIT`/`OFFSET` in `list_documents`.
 
 ## Verdict
 
 **Ready for a design-partner or internal pilot. Not ready for self-serve signups from strangers
 handling real customer policy.**
 
-The distinction is not polish. It is that a pilot has a named operator who can avoid `/ingest`, watch
-the logs, and re-upload when something breaks — and self-serve has none of those. Three of the five
-blockers below are invisible to the person they hurt: they produce a *plausible* answer, a silent
-refusal, or an erasure that did not happen. That is the specific reason this list exists rather than
-a general sense of "needs hardening".
+Unchanged by phases 11 and 12, and worth being clear about why: those closed the two *correctness*
+blockers — the system can now erase a document and erase a tenant, and prove it. What still argues
+against self-serve is **operational**: nothing here tells you when it is going wrong, and there are
+no backups. A pilot has a named operator watching; self-serve does not.
+
+The distinction is not polish. Most of what goes wrong in this system goes wrong *quietly* — a
+plausible answer, a silent refusal, a partially re-indexed collection. That is the specific reason
+this list exists rather than a general sense of "needs hardening".
 
 ## What is genuinely solid
 
@@ -84,22 +90,31 @@ The original assessment follows, for the record.
 
 *Closed by:* [phase 11](feature/phase-11-ingest-gdpr.md).
 
-### 2. No erasure guarantees beyond the happy path
+### 2. ~~No erasure guarantees beyond the happy path~~ — CLOSED (phase 12)
 
-Even for properly-uploaded documents, the erasure story has holes a compliance review would find:
+**Closed.** `DELETE /admin/tenants/{id}` erases a tenant across Postgres, Qdrant and MinIO, revoking
+access first and sweeping vectors twice (a worker mid-index holds no lock and can write between the
+sweeps). Every erasure — document and tenant — is recorded in `erasures`, which has **no foreign key
+to `tenants`**, so the audit row outlives the thing it audits. Verified live: erasing one tenant took
+its vector and its object, left the other tenant intact, and left an audit row naming a tenant that
+no longer exists.
 
-- **A delete racing an active index defers for up to one `PROCESSING_LEASE` (~30 min)** during which
-  the row is gone from listings but its vectors still answer searches (CLAUDE.md; tested in both
-  directions by phase 9b, so it is a *known* window rather than an unknown one).
-- **There is no "delete this tenant" operation.** Removing a tenant means `DELETE FROM tenants`
-  cascading in Postgres and *nothing* in Qdrant or MinIO — the vectors and objects survive. For a
-  processor obligation this is the gap that matters most after (1).
-- **There is no audit trail of erasures.** Nothing records that a deletion happened, when, or by
-  which principal.
-- **Conversation history is not covered by document deletion.** `messages` retains the passage text
-  the model was shown; deleting the source document does not redact it.
+**One claim here was wrong and is corrected.** This document said `messages` "retains the passage
+text the model was shown". It does not — `append_turn` stores the question and the answer, nothing
+else. The real gap was narrower and is also closed: an *answer* quotes the passages, so assistant
+turns now carry their sources in `metadata` and deleting a document **redacts** the turns that cite
+it (redacts, not deletes — removing the row would leave a question answering itself).
 
-*Closes when:* a tenant-erasure endpoint plus an audit log exist. Partly in scope for phase 11.
+**What is deliberately still open**, and why it is no longer blocking:
+
+- **The ~30-minute deferred-delete window** on a *document* deletion racing an active index. Phase
+  8's known trade, pinned in both directions by phase 9b — a bounded, tested window rather than an
+  unknown one.
+- **Turns written before phase 12 carry no provenance** and cannot be found by redaction. Not
+  recoverable: nothing ever recorded which document an old answer quoted.
+- **The audit is not tamper-evident** — a table an operator with database access can edit. Making it
+  append-only is a different phase with a different threat model.
+- **No retention policy**, and **`purge-unattributed` writes no audit row**.
 
 ### 3. Operational blindness
 

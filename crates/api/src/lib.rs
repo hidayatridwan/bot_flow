@@ -14,6 +14,7 @@ mod accounts;
 mod auth;
 mod conversation;
 mod db;
+mod erasure;
 mod error;
 mod handlers;
 mod llm;
@@ -204,6 +205,12 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/admin/tenants", post(handlers::create_tenant))
         .route("/admin/tenants/{tenant_id}/keys", post(handlers::mint_key))
+        // Ends a tenant: vectors, objects, rows. Admin-gated like tenant creation — these are the
+        // operations that make and unmake the tenancy registry (phase 12).
+        .route(
+            "/admin/tenants/{tenant_id}",
+            delete(handlers::delete_tenant),
+        )
         .layer(cors)
         .with_state(state)
 }

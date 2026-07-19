@@ -118,18 +118,32 @@ pub async fn append_turn(
     conversation_id: Uuid,
     question: &str,
     answer: &str,
+    // The documents whose passages were in the model's context for this answer.
+    //
+    // `messages` never stored the passages themselves — but an answer is *derived* from them and
+    // routinely quotes them, so erasing a document while leaving the answers that recite it is an
+    // erasure with a hole in it. Nothing could find those answers until they carried this.
+    // Empty for a refusal: no context, nothing to attribute (invariant 4).
+    source_documents: &[String],
 ) -> Result<(), AppError> {
     let mut tx = db::tenant_tx(db, tenant_id).await?;
     for (role, content) in [("user", question), ("assistant", answer)] {
+        // Only the assistant's turn cites anything. The user's question is their own words.
+        let metadata = if role == "assistant" && !source_documents.is_empty() {
+            serde_json::json!({ "document_ids": source_documents })
+        } else {
+            serde_json::json!({})
+        };
         sqlx::query(
-            "INSERT INTO messages (id, conversation_id, tenant_id, role, content)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO messages (id, conversation_id, tenant_id, role, content, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(Uuid::new_v4())
         .bind(conversation_id)
         .bind(tenant_id)
         .bind(role)
         .bind(content)
+        .bind(&metadata)
         .execute(&mut *tx)
         .await?;
     }
