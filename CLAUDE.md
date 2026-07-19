@@ -71,7 +71,11 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
 **Answering**
 
 4. **An answer is grounded in retrieved context, or it is refused.** If nothing clears the relevance
-   floor, the system returns a canned response and **does not call the LLM at all**. This bot answers
+   floor, the system returns a canned response and **does not call the LLM at all**. That floor is
+   now a single **measured** number (`0.25`, `config.rs`) rather than the three disagreeing values it
+   used to be, and it is applied **after** an over-fetch so it sharpens the context instead of
+   shrinking it. Retune it with `cargo run -p eval`, never by intuition: 0.35 looks reasonable and
+   costs recall@3 1.000 → 0.955. This bot answers
    *as the tenant's business*: a hallucinated refund policy is worse than an admission of ignorance,
    because the customer acts on it and the tenant is held to it.
 5. **The model may only use the passages it is given**, and is forbidden from writing citation
@@ -94,6 +98,17 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
    wearing the costume of a configuration detail.
    (`text-embedding-3-small` is *symmetric*: it takes no `passage: ` / `query: ` prefixes. Those were
    an E5 artifact and were deleted with it. Re-adding them embeds the literal words into every vector.)
+   **The rule is about the whole index recipe, not only the model.** Chunking strategy, `CHUNK_SIZE`
+   and `CHUNK_OVERLAP` are inside this sentence: a collection may not hold chunks cut two different
+   ways any more than vectors from two models, and the failure is identical — a score that is noise
+   but still looks like a number. That is why the chunker, the embedding client and the collection
+   name all live in `common`, and why the collection name is **versioned** (`documents_v2`). Changing
+   any of them is a migration with a rollback, not a setting.
+   **A chunk carries its provenance**: every indexed point has `document_id`, `chunk_index`,
+   `char_start`, `char_end` and `created_at`. None of the last four can be reconstructed — the point
+   id is a UUIDv5 hash and does not invert — and adding one later is a *second* full re-index, which
+   is why they are written now and read by almost nothing yet. `POST /ingest` writes none of them,
+   which is that path's debt made visible rather than argued about.
 7. **A conversation turn is recorded only once an answer exists.** Otherwise a failed request leaves a
    dangling question, and the next question's rewrite reasons over it.
 8. **An unknown conversation and another tenant's conversation are indistinguishable** — both 404.
@@ -387,6 +402,10 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Drop the `lapin::Connection` returned by `build_state` | Bind it (`let (state, _amqp) = ..`) for the state's whole life | It closes the `Channel` inside `AppState`, and the only symptom anywhere is `/health` reporting rabbitmq down. `build_state` returns it rather than hiding it in `main` so the compiler carries half of this |
 | Let a test skip itself when its service is missing | Fail, or do not run it at all | A silent skip turns "untested" into "green" — the same lie as the superuser trap, and worse than a visible gap |
 | Rely on a test's own `cleanup()` to keep the Qdrant collection clean | Also sweep stale test tenants at startup | `cleanup()` runs only when a test **passes**. A panicking test — i.e. every failing one, and every break-verification — strands its points forever, because `/ingest` writes them with random ids and no `document_id` and nothing in the product can remove them. Observed: this suite's own break table leaked four tenants |
+| Judge a chunking recipe on recall alone | Read context cost beside it | "Did a passage contain the answer" is trivially satisfied by returning the whole document. Measured: one-chunk-per-document scored a *perfect* recall and a *better* MRR while handing the model 1.8× the context. On recall alone the deliberately-broken variant wins |
+| Pick `RAG_SCORE_THRESHOLD` by reasoning about it | Sweep it on the bench | Every value in this repo's history was wrong: 0.70 (E5-era) refuses everything, 0.35 silently drops 4.5% of answers. 0.25 is the highest floor that costs no recall — and it was only knowable by measuring |
+| Change the chunker, the model or the payload in place | Bump `common::COLLECTION` | `ensure_collection` early-returns when the collection exists, so an in-place change **silently does not happen**. The version is also this system's only rollback: the old collection stays queryable while the new one fills |
+| Republish ingest events to re-index everything | `cargo run -p worker -- reindex` | Invariant 10 skips a redelivered document whose fingerprint is unchanged — the very thing that makes redelivery safe makes a migration a silent no-op. The driver bypasses `claim` deliberately, which is also why the normal worker must be stopped first |
 | List only the tables you name in a `TRUNCATE … CASCADE` prompt | Name what CASCADE will reach as well | `accounts` and `sessions` hang off `tenants` by FK, so a wipe of "tenants, api_keys, documents" silently destroys every dashboard login too. Verified from the `NOTICE` output. A prompt that understates its blast radius is approved by someone who did not know what they were approving |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
@@ -456,7 +475,10 @@ writing the code.
 | Worker claim / status machine | `crates/worker/src/lifecycle.rs` |
 | MinIO event parsing (the percent-encoding trap) | `crates/worker/src/event.rs` |
 | Chunking — `chunk_text` and the `CHUNK_SIZE`/`CHUNK_OVERLAP` constants. In `common` because it is half the index recipe: the worker writes chunks and the bench must reproduce them byte for byte | `crates/common/src/chunk.rs` |
-| The retrieval bench — fixture corpus, golden set, the metrics, and the sabotage table that must move before any number is believed. Writes to `eval_bench`, never `documents` | `crates/eval/` |
+| The retrieval bench — fixture corpus, golden set, the metrics, and the sabotage table that must move before any number is believed. Writes to `eval_bench`, never the live collection | `crates/eval/` |
+| The lexical (sparse) encoder — written from phase 10, queried in 10b; FNV ids pinned by test because a changed hash orphans every dimension already written | `crates/common/src/sparse.rs` |
+| The versioned collection name, and why a version is the only rollback this system has | `crates/common/src/lib.rs` |
+| The migration driver (`worker reindex`) — why it bypasses `claim`, and why the worker must be stopped | `crates/worker/src/main.rs` |
 | Reaper — `UPLOAD_GRACE`/`PROCESSING_LEASE` constants; expired/reclaimed sweeps **and** the deferred-deletion sweep (phase 8) | `crates/worker/src/reaper.rs` |
 | `DELETE /documents/{id}` — the tombstone-guarded saga and `delete_document_stores` (its order/filters mirror the reaper sweep) | `crates/api/src/handlers.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |
@@ -551,15 +573,25 @@ Honest inventory. Each entry states the impact, not merely the fact.
   refusal to erase a row whose lease is still live; **lease reclaim**; and two worker-side tenancy
   assertions (a foreign document is invisible to `claim`; a sweep bound to one tenant cannot touch
   another's rows, which is the corollary trap asserted rather than trusted).
-  **Not covered, and worth knowing precisely:** `/ask/stream`; retrieval *quality*, which these
-  phases say nothing about. And one gap that is structural rather than deferred — removing the
+  **Not covered, and worth knowing precisely:** `/ask/stream`; the *migration* driver, which is
+  exercised by hand rather than by a test. Retrieval quality is no longer uncovered but it is
+  measured rather than asserted — see the bench. And one gap that is structural rather than deferred — removing the
   `tenant_id` leg of `delete_document_stores`' Qdrant filter turns **nothing** red, because
   `document_id` is a globally-unique UUID and no test can construct a collision. That filter is
   layered defence, and the suite cannot prove it; a test that *could* would be asserting on internals.
   CI is **report-only** — no branch protection yet.
-- **Vector storage has no migration path.** Changing the embedding model, its dimension, or the
-  chunking parameters invalidates every stored vector, and there is no rollback — only recreating the
-  collection and re-indexing every document of every tenant. A **partially** re-indexed collection
+- **Vector storage now has a migration path — used once, and still expensive.** Phase 10 gave it the
+  two things it lacked: a **versioned collection** (`common::COLLECTION`, now `documents_v2`) so the
+  old one stays intact and queryable while the new one fills, and a **driver**
+  (`cargo run -p worker -- reindex`) that re-embeds every document of every tenant from its stored
+  object. Cutover and back-out are both one constant. What has *not* changed is the cost: it is still
+  a full re-embed of every chunk, still billed, and still something to schedule rather than trigger.
+  Two hazards remain, both by construction. **`/ingest` chunks cannot be migrated at all** — no
+  `document_id`, no source object, so a re-index abandons them where they are. And the driver holds
+  no claim, so **the normal worker must be stopped** or the two can interleave on one document.
+  Historically: changing the embedding model, its dimension, or the chunking parameters invalidates
+  every stored vector, and there was no rollback — only recreating the collection and re-indexing
+  every document of every tenant. A **partially** re-indexed collection
   produces quietly degraded retrieval with no error anywhere. Any such change is a migration project,
   not a configuration change.
   This was paid, not solved, at the `MultilingualE5Small` → `text-embedding-3-small` cutover

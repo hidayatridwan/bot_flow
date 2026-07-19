@@ -17,7 +17,7 @@ infrastructure containers.
 | `eval` | `crates/eval` | The retrieval bench (phase 10). Not part of the running system: builds its own index over a committed fixture corpus in its own collection, so a chunking recipe can be measured before an irreversible re-index. |
 | `sidecar` | `sidecar/parser.py` | Python text extractor the worker shells out to. Handles `.pdf` (pypdf), `.txt`, `.md`. |
 | `postgres` | Postgres 16 | Tenants, API keys, document records, conversation history. Row-Level Security enforces tenant isolation. |
-| `qdrant` | Qdrant 1.18 | Vector store. One `documents` collection, partitioned by a `tenant_id` payload index. |
+| `qdrant` | Qdrant 1.18 | Vector store. One **versioned** collection (`documents_v2`), partitioned by a `tenant_id` payload index, with a lexical sparse vector written alongside each dense one for phase 10b. |
 | `minio` | MinIO (S3 API) | Raw uploaded files, keyed `tenants/{tenant_id}/documents/{document_id}/original.{ext}`. |
 | `rabbitmq` | RabbitMQ 3.13 | Carries MinIO's `ObjectCreated` events on a quorum queue with a dead-letter queue. |
 | `redis` | Redis 7 | Fixed-window per-tenant rate limiting. |
@@ -44,8 +44,10 @@ lets a client render them as it likes — or, like today's widget, not at all.
   `EMBEDDING_API_KEY` — separate from `LLM_API_KEY` even when both point at the same gateway.
 - **LLM**: any OpenAI-compatible `/chat/completions` endpoint. Defaults to Gemini via its
   OpenAI compatibility layer.
-- **Chunking**: 800 characters with 100 characters of overlap, UTF-8 safe. Defined once in
-  `common::chunk` — it is half the index recipe, so the worker and the retrieval bench cannot drift.
+- **Chunking**: boundary-aware (paragraph → sentence → clause → word), 500 characters with 60 of
+  overlap, UTF-8 safe. Defined once in `common::chunk` — it is half the index recipe, so the worker
+  and the retrieval bench cannot drift. The numbers were **measured, not chosen**: see
+  [Measuring retrieval quality](#measuring-retrieval-quality).
 - **Widget**: dependency-free vanilla JS, ~200 lines, no build step.
 
 ## Tenant isolation
@@ -150,7 +152,7 @@ RABBITMQ_URL=amqp://bot_flow:bot_flow@localhost:5672/%2f
 REDIS_URL=redis://localhost:6379
 BIND_ADDR=0.0.0.0:3000
 RATE_LIMIT_PER_MINUTE=60
-RAG_SCORE_THRESHOLD=0.35        # cosine floor; a starting point for text-embedding-3-small — retune from logs (see note below)
+# RAG_SCORE_THRESHOLD=0.25      # optional; 0.25 is the compiled default and was measured, not guessed
 
 LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
 LLM_API_KEY=<your key>
@@ -584,19 +586,21 @@ near-verbatim match actually scores with `text-embedding-3-small`, which is why 
 below matters. (`document_id` is empty here only because this chunk came from `/ingest`; a real
 uploaded document reports its id.)
 
-If nothing clears `RAG_SCORE_THRESHOLD` (default `0.70`), the API returns a canned "couldn't find any
+If nothing clears `RAG_SCORE_THRESHOLD` (default `0.25`), the API returns a canned "couldn't find any
 relevant information" rather than letting the model guess. The retrieval scores are logged on
-every request, so compare them against the floor before assuming retrieval is broken.
+every request, and `POST /search` returns them **unfiltered** alongside the configured floor, so you
+can see exactly what `/ask` would have dropped.
 
-> **The compiled default is `0.70`, which is wrong for `text-embedding-3-small`** — the `.env` above
-> already overrides it to `0.35`. `0.70` was tuned for `MultilingualE5Small`, which scored a
-> verbatim-matching chunk around `0.78–0.86`; `text-embedding-3-small` scores materially lower (a
-> verbatim CV match lands near `0.53`, noise near `0.27`). Left at `0.70`, the bot refuses every
-> question — and it does so **silently**, because refusing when nothing clears the floor is the
-> designed behaviour, not an error. A system that knows nothing looks exactly like one that works.
+> **`0.25` is measured, not chosen, and this used to be three different numbers.** The compiled
+> default was `0.70` (an E5-era value that made the bot refuse everything with
+> `text-embedding-3-small`), README recommended `0.35`, and `.env` said something else again — a
+> floor that disagrees with itself in three places is a floor nobody owns.
 >
-> `0.35` is only a starting point. Set it from your own data: ingest a document, ask a question you
-> know it answers, read the logged retrieval scores, and put the floor just below them.
+> It was picked by sweeping it on the bench: `0.20` and `0.25` retrieve identically (`0.25` just
+> carries ~5% less context), `0.30` starts losing a question, and **`0.35` costs recall@3
+> 1.000 → 0.955**. Getting this wrong is silent — refusing when nothing clears the floor is the
+> designed behaviour, not an error, so a system that knows nothing looks exactly like one that works.
+> Re-sweep with `cargo run -p eval` after any change to the chunker or the embedding model.
 
 ## The event pipeline
 

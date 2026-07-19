@@ -22,8 +22,10 @@
 //! cargo run -p eval -- baseline   # one variant
 //! ```
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
-use common::chunk::{chunk_text, CHUNK_OVERLAP, CHUNK_SIZE};
+use common::chunk::{chunk_text, chunk_text_recursive, CHUNK_OVERLAP, CHUNK_SIZE};
 use common::embedding::{EmbeddingClient, EMBEDDING_DIM};
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, Distance, Filter, PointStruct, QueryPointsBuilder,
@@ -72,12 +74,18 @@ struct Variant {
     /// Replace the query vector with noise. Every metric must hit the floor; anything that survives
     /// means the golden set is matching on something other than retrieval.
     random_query: bool,
+    /// D3 — boundary-aware splitting instead of the fixed window.
+    recursive: bool,
+    /// D13 — prepend the document title to each chunk's embedded text.
+    inject_title: bool,
+    /// D14 — at most this many chunks from any one document may occupy the top-k. `None` = no cap.
+    per_doc_cap: Option<usize>,
 }
 
 impl Variant {
     const fn baseline() -> Self {
         Self {
-            name: "baseline (production recipe)",
+            name: "production (boundary-aware, CHUNK_SIZE/CHUNK_OVERLAP)",
             chunk_size: CHUNK_SIZE,
             overlap: CHUNK_OVERLAP,
             // The live value. Read from the environment so the bench measures the deployment rather
@@ -85,8 +93,75 @@ impl Variant {
             threshold: f32::NAN,
             reverse_rank: false,
             random_query: false,
+            // Production uses the boundary-aware chunker as of phase 10, so the bench's reference
+            // row must too — a "baseline" that measures a recipe nobody runs is a number that
+            // will be compared against and is wrong.
+            recursive: true,
+            inject_title: false,
+            per_doc_cap: None,
         }
     }
+}
+
+/// The candidate recipes (D3, D13, D14). None of these touches production: the bench builds its own
+/// index, so an irreversible decision gets made reversibly here first.
+fn candidates() -> Vec<Variant> {
+    let b = Variant::baseline();
+    let mut v = vec![Variant {
+        name: "D3 boundary-aware, 800/100",
+        recursive: true,
+        ..b
+    }];
+    // The size sweep. The `chunk_size=8000` sabotage scored the BEST retrieval on this corpus at
+    // 1.8x the context cost, which is evidence that 800 may simply be too small — so size is a
+    // variable to measure, not a constant to assume.
+    for (size, overlap) in [
+        (300usize, 40usize),
+        (400, 50),
+        (500, 60),
+        (600, 75),
+        (1200, 150),
+        (1600, 200),
+    ] {
+        v.push(Variant {
+            name: Box::leak(format!("D3 boundary-aware, {size}/{overlap}").into_boxed_str()),
+            recursive: true,
+            chunk_size: size,
+            overlap,
+            ..b
+        });
+    }
+    // D13 and D14 are measured at 400/50 as well as 800/100: a modifier that helps at one chunk
+    // size need not help at another, and shipping it on the strength of the wrong size is exactly
+    // the unattributable-delta mistake this bench exists to prevent.
+    for (size, overlap) in [(800usize, 100usize), (400, 50)] {
+        v.push(Variant {
+            name: Box::leak(format!("D3 {size}/{overlap} + D13 title").into_boxed_str()),
+            recursive: true,
+            chunk_size: size,
+            overlap,
+            inject_title: true,
+            ..b
+        });
+        v.push(Variant {
+            name: Box::leak(format!("D3 {size}/{overlap} + D14 cap 2").into_boxed_str()),
+            recursive: true,
+            chunk_size: size,
+            overlap,
+            per_doc_cap: Some(2),
+            ..b
+        });
+        v.push(Variant {
+            name: Box::leak(format!("D3 {size}/{overlap} + D13 + D14").into_boxed_str()),
+            recursive: true,
+            chunk_size: size,
+            overlap,
+            inject_title: true,
+            per_doc_cap: Some(2),
+            ..b
+        });
+    }
+    v
 }
 
 fn sabotages() -> Vec<Variant> {
@@ -189,7 +264,9 @@ async fn main() -> Result<()> {
         threshold,
         ..Variant::baseline()
     }];
-    if which.as_deref() != Some("baseline") {
+    if which.as_deref() == Some("candidates") {
+        variants.extend(candidates().into_iter().map(|v| Variant { threshold, ..v }));
+    } else if which.as_deref() != Some("baseline") {
         variants.extend(sabotages().into_iter().map(|v| Variant {
             threshold: if v.threshold.is_nan() {
                 threshold
@@ -226,6 +303,17 @@ fn resolve_threshold() -> f32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.70)
+}
+
+/// A human-ish title from the filename. Production would join `documents.filename` (D5 argues
+/// against denormalising it into the payload); the bench has only the file, which is the same
+/// information.
+fn title_of(filename: &str) -> String {
+    filename
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(filename)
+        .replace(['-', '_'], " ")
 }
 
 fn load_corpus() -> Result<Vec<(String, String)>> {
@@ -267,12 +355,28 @@ async fn run_variant(
 
     let mut chunks: Vec<(String, String)> = Vec::new(); // (document, text)
     for (name, text) in corpus {
-        for c in chunk_text(text, variant.chunk_size, variant.overlap) {
+        let pieces = if variant.recursive {
+            chunk_text_recursive(text, variant.chunk_size, variant.overlap)
+        } else {
+            chunk_text(text, variant.chunk_size, variant.overlap)
+        };
+        for c in pieces {
             chunks.push((name.clone(), c));
         }
     }
 
-    let texts: Vec<String> = chunks.iter().map(|(_, t)| t.clone()).collect();
+    // D13: the title goes into the EMBEDDED text, so it shapes the vector — that is the whole
+    // point, and also why it can never be corrected without a re-embed.
+    let texts: Vec<String> = chunks
+        .iter()
+        .map(|(doc, t)| {
+            if variant.inject_title {
+                format!("[{}]\n{}", title_of(doc), t)
+            } else {
+                t.clone()
+            }
+        })
+        .collect();
     let vectors = embedder
         .embed_batch(&texts)
         .await
@@ -280,13 +384,14 @@ async fn run_variant(
 
     let points: Vec<PointStruct> = chunks
         .iter()
+        .zip(texts.iter())
         .zip(vectors)
-        .map(|((doc, text), vector)| {
+        .map(|(((doc, _raw), embedded), vector)| {
             PointStruct::new(
                 uuid::Uuid::new_v4().to_string(),
                 vector,
                 [
-                    ("text", text.clone().into()),
+                    ("text", embedded.clone().into()),
                     ("document", doc.clone().into()),
                     ("tenant_id", TENANT.into()),
                 ],
@@ -334,15 +439,39 @@ async fn run_variant(
         // Mirrors production exactly: fetch, then filter by the floor. The floor SHRINKS the result
         // set rather than digging deeper — that is the defect D6 exists to fix, and the bench must
         // reproduce it or the baseline flatters the system.
-        let mut passages: Vec<String> = response
+        let scored: Vec<(String, String)> = response
             .result
             .into_iter()
             .filter(|p| p.score >= variant.threshold)
-            .filter_map(|p| match p.payload.get("text")?.kind.as_ref()? {
-                qdrant_client::qdrant::value::Kind::StringValue(s) => Some(s.clone()),
-                _ => None,
+            .filter_map(|p| {
+                let text = match p.payload.get("text")?.kind.as_ref()? {
+                    qdrant_client::qdrant::value::Kind::StringValue(s) => s.clone(),
+                    _ => return None,
+                };
+                let doc = match p.payload.get("document").and_then(|v| v.kind.as_ref()) {
+                    Some(qdrant_client::qdrant::value::Kind::StringValue(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                Some((doc, text))
             })
             .collect();
+
+        // D14: bound how much of the context one document may occupy. Applied AFTER the floor and
+        // over the over-fetched set, so a capped slot is refilled from deeper rather than lost —
+        // which is the same defect D6 fixes for the threshold.
+        let mut passages: Vec<String> = Vec::new();
+        if let Some(cap) = variant.per_doc_cap {
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            for (doc, text) in scored {
+                let n = seen.entry(doc).or_insert(0);
+                if *n < cap {
+                    *n += 1;
+                    passages.push(text);
+                }
+            }
+        } else {
+            passages = scored.into_iter().map(|(_, t)| t).collect();
+        }
 
         if variant.reverse_rank {
             passages.reverse();
@@ -473,6 +602,30 @@ fn report(results: &[(Variant, Scores)]) {
     // The sabotage check, asserted rather than eyeballed. A metric that does not move when the
     // system is deliberately broken is decoration, and a decorative metric is worse than none: it
     // is a number that will be believed.
+    //
+    // Candidates are NOT sabotages: they are supposed to score better, so running this assertion
+    // over them would report every improvement as a failure.
+    let sabotages_only = results[1..]
+        .iter()
+        .all(|(v, _)| v.name.starts_with("SABOTAGE"));
+    if results.len() > 1 && !sabotages_only {
+        println!(
+            "\ncandidate comparison — baseline recall@1 {:.3}, MRR {:.3}, ctx {:.0}",
+            baseline.recall_at_1, baseline.mrr, baseline.ctx_chars_at_3
+        );
+        let mut ranked: Vec<&(Variant, Scores)> = results[1..].iter().collect();
+        ranked.sort_by(|a, b| b.1.recall_at_1.partial_cmp(&a.1.recall_at_1).unwrap());
+        for (v, s) in ranked.iter().take(3) {
+            println!(
+                "  best: {} — recall@1 {:+.3}, MRR {:+.3}, ctx {:+.0}",
+                v.name,
+                s.recall_at_1 - baseline.recall_at_1,
+                s.mrr - baseline.mrr,
+                s.ctx_chars_at_3 - baseline.ctx_chars_at_3
+            );
+        }
+        return;
+    }
     if results.len() > 1 {
         println!(
             "\nsabotage verification (a metric proves nothing until you have watched it drop):"

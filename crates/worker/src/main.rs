@@ -18,7 +18,7 @@ use lapin::{
     Channel, Connection, ConnectionProperties, ExchangeKind,
 };
 use qdrant_client::qdrant::{
-    Condition, DeletePointsBuilder, Filter, PointStruct, UpsertPointsBuilder,
+    Condition, DeletePointsBuilder, Filter, NamedVectors, PointStruct, UpsertPointsBuilder, Vector,
 };
 use qdrant_client::Qdrant;
 use s3::{creds::Credentials, Bucket, Region};
@@ -38,8 +38,8 @@ const DLQ_QUEUE: &str = "document_events.dlq";
 /// Legacy queue for the deprecated proxy upload path. Drained, then deleted.
 const LEGACY_QUEUE: &str = "ingest_jobs";
 
-/// Must match the API's collection (handlers.rs). The API owns its creation at startup.
-const COLLECTION: &str = "documents";
+// Defined in `common` so it cannot drift from the API's; the API still owns its creation at startup.
+use common::{sparse::SPARSE_VECTOR, COLLECTION};
 
 struct Ctx {
     bucket: Box<Bucket>,
@@ -57,6 +57,10 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // `worker reindex` re-embeds every document of every tenant from its stored object. It is the
+    // migration driver for a collection version bump (phase 10), not a routine command.
+    let reindex = std::env::args().nth(1).as_deref() == Some("reindex");
 
     let addr = std::env::var("RABBITMQ_URL").context("RABBITMQ_URL not set")?;
 
@@ -97,6 +101,10 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(25 * 1024 * 1024),
     });
+
+    if reindex {
+        return reindex_all(&ctx).await;
+    }
 
     // The reaper shares the Qdrant client and a clone of the bucket so its delete-sweep can finish
     // deferred deletions across all three stores (phase 8, invariant 10).
@@ -512,7 +520,7 @@ async fn ingest(
 
     let document_id = doc_uuid.to_string();
     let text = parser::parse_to_text(bytes, filename_hint, &document_id).await?;
-    let chunks = common::chunk::chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
+    let chunks = common::chunk::chunk_with_spans(&text, CHUNK_SIZE, CHUNK_OVERLAP);
     if chunks.is_empty() {
         tracing::warn!("no extractable text in '{object_key}'");
         return Ok(0);
@@ -523,8 +531,17 @@ async fn ingest(
         chunks.len()
     );
 
+    // D12: the document's own creation time, carried into the payload. Read nothing today — it is
+    // here because adding a payload field later is a SECOND full re-index, and because it is the
+    // only thing that could ever distinguish a superseded policy from the one that replaced it.
+    // `/ingest` chunks have no row and therefore no created_at; the field is simply absent there.
+    let created_at = document_created_at(&ctx.db, tenant_id, doc_uuid)
+        .await
+        .unwrap_or_default();
+
     // Batched internally: a large document is more chunks than one request may carry.
-    let vectors = ctx.embedder.embed_batch(&chunks).await?;
+    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+    let vectors = ctx.embedder.embed_batch(&texts).await?;
 
     // Drop whatever a previous attempt left behind. Deterministic ids alone would overwrite
     // chunks 0..n, but a re-parse yielding FEWER chunks would strand the old tail.
@@ -546,14 +563,31 @@ async fn ingest(
         .iter()
         .zip(vectors)
         .enumerate()
-        .map(|(i, (text, vector))| {
+        .map(|(i, (chunk, vector))| {
+            // D7: dense under the default (unnamed) slot so every existing query is untouched, and
+            // the lexical vector beside it under its own name. Written now, queried in 10b — see
+            // `common::sparse`. A chunk that tokenises to nothing (punctuation only) simply has no
+            // sparse vector; Qdrant treats an absent named vector as a non-match, not an error.
+            let (indices, values) = common::sparse::encode(&chunk.text);
+            let mut vectors = NamedVectors::default().add_vector("", Vector::new_dense(vector));
+            if !indices.is_empty() {
+                vectors = vectors.add_vector(SPARSE_VECTOR, Vector::new_sparse(indices, values));
+            }
             PointStruct::new(
                 point_id(doc_uuid, i).to_string(),
-                vector,
+                vectors,
                 [
-                    ("text", text.clone().into()),
+                    ("text", chunk.text.clone().into()),
                     ("tenant_id", tenant_id.to_string().into()),
                     ("document_id", document_id.clone().into()),
+                    // D5: provenance. `chunk_index` gives order, the offsets give extent. Neither
+                    // can be reconstructed — the point id is a UUIDv5 hash and does not invert —
+                    // and both are the prerequisite for expanding a hit to its neighbours later
+                    // without paying for another re-index.
+                    ("chunk_index", (i as i64).into()),
+                    ("char_start", (chunk.char_start as i64).into()),
+                    ("char_end", (chunk.char_end as i64).into()),
+                    ("created_at", created_at.clone().into()),
                 ],
             )
         })
@@ -565,6 +599,116 @@ async fn ingest(
         .await
         .context("failed to upsert points")?;
     Ok(count)
+}
+
+/// Re-embed every document of every tenant from its stored object, into the current collection.
+///
+/// **This deliberately bypasses `claim`, and that is the whole reason it exists.** Invariant 10
+/// skips a redelivered document whose fingerprint is unchanged — which is exactly what makes
+/// redelivery safe, and exactly what would make a migration a silent no-op: republishing every
+/// event would leave the new collection permanently empty with nothing anywhere reporting it. That
+/// hazard had to be written down as a manual procedure at the last model cutover; here it is a
+/// property of the tool.
+///
+/// **Stop the normal worker first.** This holds no claim and no lock, so a concurrently running
+/// worker could interleave its own upsert for the same document. `ingest` deletes the document's
+/// points before writing, so the loser leaves a partial document — the quiet degradation this whole
+/// phase is about.
+///
+/// Per tenant, never in bulk: a cross-tenant statement under RLS matches zero rows and reports
+/// success (see `reaper.rs`, which loops for the same reason).
+async fn reindex_all(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
+    use sqlx::Row;
+
+    // `tenants` has no RLS, so this read needs no tenant context.
+    let tenants = sqlx::query("SELECT id FROM tenants ORDER BY id")
+        .fetch_all(&ctx.db)
+        .await
+        .context("failed to list tenants")?;
+    tracing::info!(
+        "reindex: {} tenant(s) into collection '{COLLECTION}'",
+        tenants.len()
+    );
+
+    let (mut done, mut failed, mut chunks_total) = (0u64, 0u64, 0usize);
+    for t in &tenants {
+        let tenant_id: String = t.get("id");
+
+        let mut tx = tenant_tx(&ctx.db, &tenant_id).await?;
+        // Only documents whose bytes are actually in MinIO. `uploading` and `expired` never got an
+        // object; `deleting` is mid-erasure and must not be resurrected (invariant 10).
+        let rows = sqlx::query(
+            "SELECT id, object_key, filename FROM documents
+              WHERE status IN ('ready', 'failed', 'quarantined')
+              ORDER BY created_at",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        for row in &rows {
+            let id: uuid::Uuid = row.get("id");
+            let object_key: String = row.get("object_key");
+            let filename: String = row.get("filename");
+
+            match ingest(ctx, &tenant_id, &id, &object_key, &filename).await {
+                Ok(n) => {
+                    chunks_total += n;
+                    done += 1;
+                    tracing::info!(tenant = %tenant_id, document = %id, "reindexed {n} chunk(s)");
+                }
+                Err(e) => {
+                    failed += 1;
+                    // Keep going. One unreadable document must not strand every document behind it,
+                    // and a partial migration you can see is better than one that stopped silently.
+                    tracing::error!(tenant = %tenant_id, document = %id, "reindex failed: {e:#}");
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        "reindex complete: {done} document(s), {chunks_total} chunk(s), {failed} failed"
+    );
+    if failed > 0 {
+        anyhow::bail!("{failed} document(s) failed to reindex — the collection is PARTIAL");
+    }
+    Ok(())
+}
+
+/// Open a transaction bound to one tenant, so RLS confines every statement in it.
+async fn tenant_tx<'a>(
+    db: &'a PgPool,
+    tenant_id: &str,
+) -> anyhow::Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+/// The document row's `created_at`, as text. Under tenant RLS like every other `documents` read.
+async fn document_created_at(
+    db: &PgPool,
+    tenant_id: &str,
+    document_id: &uuid::Uuid,
+) -> Option<String> {
+    use sqlx::Row;
+    let mut tx = db.begin().await.ok()?;
+    sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .ok()?;
+    let row = sqlx::query("SELECT created_at::text AS created_at FROM documents WHERE id = $1")
+        .bind(document_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()??;
+    tx.commit().await.ok()?;
+    Some(row.get("created_at"))
 }
 
 /// Stable id for one chunk of one document. UUIDv5 is a hash, not a random draw, so the same

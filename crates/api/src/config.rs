@@ -68,15 +68,24 @@ impl Config {
             rabbitmq_url: std::env::var("RABBITMQ_URL").context("RABBITMQ_URL is not set")?,
             // Cosine similarity floor for a retrieved chunk to count as "relevant".
             //
-            // This default is inherited from MultilingualE5Small and is NOT calibrated for
-            // text-embedding-3-small, which scores materially lower. Too high a floor makes the bot
-            // refuse every question, and it does so silently — refusing when nothing clears the floor
-            // is the designed behaviour, so nothing logs an error. Watch the logged retrieval scores
-            // and set this from them.
+            // 0.25, measured on the phase-10 bench, and it is the ONLY value now. It used to be three: 0.70 compiled (an E5-era
+            // number that made the bot refuse everything with text-embedding-3-small), 0.35
+            // recommended by README, and whatever was actually in `.env`. A floor that disagrees
+            // with itself in three places is a floor nobody owns, and getting it wrong is silent —
+            // refusing when nothing clears the floor is the designed behaviour (invariant 4), so a
+            // system that knows nothing looks exactly like one that works.
+            //
+            // Chosen by sweeping it on the bench rather than by reasoning about it, and the
+            // reasoning would have been wrong: README recommended 0.35, which costs recall@3
+            // 1.000 -> 0.955 and recall@1 0.909 -> 0.886 — it silently drops real answers. 0.25 is
+            // the highest floor that costs nothing (identical recall to 0.20, ~5% less context);
+            // 0.30 already loses a question. Re-sweep with `cargo run -p eval` after any change to
+            // the chunker or the embedding model, and read `POST /search`, which deliberately does
+            // not apply this floor so you can see what sits just below it.
             rag_score_threshold: std::env::var("RAG_SCORE_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0.70),
+                .unwrap_or(0.25),
             redis_url: std::env::var("REDIS_URL").context("REDIS_URL is not set")?,
             rate_limit_per_minute: std::env::var("RATE_LIMIT_PER_MINUTE")
                 .ok()

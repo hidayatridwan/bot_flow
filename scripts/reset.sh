@@ -14,7 +14,8 @@ MINIO_USER="${MINIO_USER:-minio}"
 MINIO_PASS="${MINIO_PASS:-minio12345}"
 MINIO_BUCKET="${MINIO_BUCKET:-documents}"
 QDRANT_HTTP="${QDRANT_HTTP:-http://localhost:6333}"   # REST port, not the 6334 gRPC one
-QDRANT_COLLECTION="${QDRANT_COLLECTION:-documents}"
+# Must match `common::COLLECTION`. Versioned (phase 10), so this moves when the index recipe does.
+QDRANT_COLLECTION="${QDRANT_COLLECTION:-documents_v2}"
 QDRANT_BENCH_COLLECTION="${QDRANT_BENCH_COLLECTION:-eval_bench}"  # crates/eval rebuilds it per run
 
 KEEP_AUTH=0
@@ -113,7 +114,7 @@ curl -sS "$QDRANT_HTTP/collections" \
 
 echo
 echo "Done. Restart the binaries so the collection + bucket are recreated:"
-echo "    cargo run -p api    # expect log: collection 'documents' created (dim=1536, cosine) + tenant_id index"
+echo "    cargo run -p api    # expect log: collection '$QDRANT_COLLECTION' created (dim=1536, cosine)"
 echo "    cargo run -p worker"
 if [ "$KEEP_AUTH" -eq 1 ]; then
   echo "Your tenants, keys and logins were kept — the same sk_ still works."

@@ -7,8 +7,9 @@ use axum::http::StatusCode;
 use axum::Json;
 use qdrant_client::qdrant::{
     value::Kind, Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
-    DeletePointsBuilder, Distance, FieldType, Filter, KeywordIndexParamsBuilder, PointStruct,
-    QueryPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    DeletePointsBuilder, Distance, FieldType, Filter, KeywordIndexParamsBuilder, Modifier,
+    PointStruct, QueryPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
+    UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use serde::Deserialize;
@@ -25,8 +26,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures_util::{Stream, StreamExt};
 use std::convert::Infallible;
 
-/// Qdrant collection name. Hardcoded in Phase 1 — multi-tenancy arrives in Phase 3.
-const COLLECTION: &str = "documents";
+// The collection name lives in `common` (versioned — see its doc). Defined once for the same
+// reason the chunker and the embedding client are: the api searches what the worker wrote, and a
+// disagreement here is a silently empty result set, not a build error.
+use common::{sparse::SPARSE_VECTOR, COLLECTION};
 
 // The context passages stay numbered: the numbering is what keeps the model anchored to a specific
 // passage rather than blending them. It just must not surface those numbers to the reader.
@@ -59,7 +62,14 @@ pub async fn ensure_collection(qdrant: &Qdrant) -> anyhow::Result<()> {
     qdrant
         .create_collection(
             CreateCollectionBuilder::new(COLLECTION)
-                .vectors_config(VectorParamsBuilder::new(EMBEDDING_DIM, Distance::Cosine)),
+                .vectors_config(VectorParamsBuilder::new(EMBEDDING_DIM, Distance::Cosine))
+                // D7: a sparse vector is WRITTEN by the worker from phase 10 and QUERIED by nobody
+                // until 10b. Splitting write from query is what buys one migration and one variable
+                // per measurement: phase 10's delta is attributable to chunking alone, and 10b's to
+                // fusion alone, with no second re-index in between. `Modifier::Idf` makes Qdrant
+                // compute IDF server-side at query time — a client-side IDF would need corpus
+                // statistics that change on every ingest and would silently drift.
+                .sparse_vectors_config(sparse_config()),
         )
         .await
         .context("failed to create collection")?;
@@ -74,10 +84,32 @@ pub async fn ensure_collection(qdrant: &Qdrant) -> anyhow::Result<()> {
         .await
         .context("failed to create tenant_id index")?;
 
+    // D5: `document_id` is filtered by the worker's re-index delete AND by phase 8's deletion saga.
+    // Unindexed, both were full scans of the collection.
+    qdrant
+        .create_field_index(CreateFieldIndexCollectionBuilder::new(
+            COLLECTION,
+            "document_id",
+            FieldType::Keyword,
+        ))
+        .await
+        .context("failed to create document_id index")?;
+
     tracing::info!(
-        "collection '{COLLECTION}' created (dim={EMBEDDING_DIM}, cosine) + tenant_id index"
+        "collection '{COLLECTION}' created (dim={EMBEDDING_DIM}, cosine) + tenant_id/document_id \
+         indexes + sparse '{SPARSE_VECTOR}' (written from phase 10, queried in 10b)"
     );
     Ok(())
+}
+
+/// The sparse leg's config: one named vector, with IDF computed server-side (D7).
+fn sparse_config() -> SparseVectorsConfigBuilder {
+    let mut cfg = SparseVectorsConfigBuilder::default();
+    cfg.add_named_vector_params(
+        SPARSE_VECTOR,
+        SparseVectorParamsBuilder::default().modifier(Modifier::Idf),
+    );
+    cfg
 }
 
 /// MANDATORY filter: restrict the query to points owned by this tenant only.
@@ -169,6 +201,33 @@ fn default_limit() -> u64 {
     3
 }
 
+/// The most passages a caller may ask for. `limit` came straight off the request body as a `u64`
+/// with no ceiling, so `{"limit": 100000}` was a valid request — one embedding call and a Qdrant
+/// scan sized by a stranger.
+const MAX_LIMIT: u64 = 20;
+
+/// How much deeper than `limit` to search before applying the relevance floor.
+///
+/// **The floor used to be applied *after* the limit, which made it shrink the answer instead of
+/// improving it.** Ask for 3, have one hit fall below the floor, get 2 — while a perfectly good
+/// fourth sat one rank down, already retrieved and thrown away. Over-fetching means the floor
+/// removes weak passages and the strong ones behind them move up, which is what a relevance floor
+/// is supposed to do.
+fn over_fetch(limit: u64) -> u64 {
+    (limit * 4).max(limit + 8)
+}
+
+/// `limit` is the caller's, bounded. Anything above the cap is the caller's mistake, not ours.
+fn checked_limit(limit: u64) -> Result<u64, AppError> {
+    if limit == 0 || limit > MAX_LIMIT {
+        return Err(AppError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 20",
+        ));
+    }
+    Ok(limit)
+}
+
 pub async fn search(
     State(state): State<AppState>,
     actor: Actor, // FromRequestParts — reads headers, no body
@@ -178,6 +237,7 @@ pub async fn search(
     // freely (invariants 15 and 27 are not in tension — they draw the same line from both sides).
     // Not a confidentiality gate: `/ask` already returns `sources[].text` to a `pk_`. It bounds spend.
     actor.require_management()?;
+    let limit = checked_limit(req.limit)?;
     rate_limit::check(&state, &actor.tenant_id).await?;
 
     let vector = state.embedder.embed_one(&req.query).await?;
@@ -187,7 +247,7 @@ pub async fn search(
         .query(
             QueryPointsBuilder::new(COLLECTION)
                 .query(vector)
-                .limit(req.limit)
+                .limit(limit)
                 .filter(tenant_filter(&actor.tenant_id))
                 .with_payload(true),
         )
@@ -222,7 +282,15 @@ pub async fn search(
         })
         .collect();
 
-    Ok(Json(json!({ "hits": hits })))
+    // D11: `/search` deliberately does NOT apply the floor — it is the instrument README tells you
+    // to use to *choose* the floor, and applying it there destroys the only way to see what sits
+    // just below. Returning the threshold makes that divergence legible instead of surprising: a
+    // caller can see exactly which of these hits `/ask` would have dropped.
+    Ok(Json(json!({
+        "hits": hits,
+        "rag_score_threshold": state.rag_score_threshold,
+        "note": "raw scores; /ask drops hits below rag_score_threshold",
+    })))
 }
 
 const NO_ANSWER: &str = "Sorry, I couldn't find any relevant information.";
@@ -307,11 +375,12 @@ pub async fn ask(
 ) -> Result<Json<Value>, AppError> {
     // Keyed on the tenant, not the credential, so a dashboard question and a widget question draw on
     // one bucket. That is what bounds the spend this route's openness would otherwise invite.
+    let limit = checked_limit(req.limit)?;
     rate_limit::check(&state, &actor.tenant_id).await?;
 
     let (conversation_id, standalone) = prepare(&state, &actor.tenant_id, &req).await?;
 
-    let relevant = retrieve(&state, &actor.tenant_id, &standalone, req.limit).await?;
+    let relevant = retrieve(&state, &actor.tenant_id, &standalone, limit).await?;
 
     if relevant.is_empty() {
         conversation::append_turn(
@@ -511,7 +580,9 @@ async fn retrieve(
         .query(
             QueryPointsBuilder::new(COLLECTION)
                 .query(vector)
-                .limit(limit)
+                // Deeper than asked for: the floor below removes weak hits, and without the extra
+                // depth it would shrink the context rather than sharpen it.
+                .limit(over_fetch(limit))
                 .filter(tenant_filter(tenant_id))
                 .with_payload(true),
         )
@@ -552,9 +623,11 @@ async fn retrieve(
         state.rag_score_threshold
     );
 
+    // Floor first, THEN truncate to what the caller asked for. The order is the whole fix.
     Ok(hits
         .into_iter()
         .filter(|h| h.score >= state.rag_score_threshold)
+        .take(limit as usize)
         .collect())
 }
 
@@ -565,13 +638,14 @@ pub async fn ask_stream(
     actor: Actor,
     Json(req): Json<AskRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    let limit = checked_limit(req.limit)?;
     rate_limit::check(&state, &actor.tenant_id).await?;
 
     // Memory + rewrite before retrieval, so failures here are normal HTTP errors, not mid-stream.
     let (conversation_id, standalone) = prepare(&state, &actor.tenant_id, &req).await?;
 
     // Retrieval happens before streaming, so retrieval errors are normal HTTP errors (not mid-stream).
-    let relevant = retrieve(&state, &actor.tenant_id, &standalone, req.limit).await?;
+    let relevant = retrieve(&state, &actor.tenant_id, &standalone, limit).await?;
 
     // We know the sources up front — send them as the first SSE event.
     let sources = json!(relevant

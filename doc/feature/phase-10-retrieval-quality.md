@@ -1,13 +1,18 @@
 # Feature: Retrieval quality — an irreversible change to the one thing nothing measures (phase 10)
 
-> Status: **the meter is built and the baseline is recorded; the index is untouched.**
+> Status: **built and shipped. D3–D14 decided — two of them by the bench saying no.**
 >
 > `crates/eval` is the bench, `crates/eval/fixtures/` the committed corpus and golden set, and the
 > chunker has moved to `common` so the bench and the worker cannot drift apart. The full sabotage
 > table has been run and every metric moved as it should — one of them only after the bench proved
-> the table's own second row wrong (see *Verification*). **Nothing in the production index has
-> changed**: no payload field, no chunker, no re-index. D3–D14 remain open, and now have a number to
-> be argued against rather than an opinion.
+> the table's own second row wrong (see *Verification*).
+>
+> **Shipped:** boundary-aware chunking at 500/60 (D3/D4), chunk provenance in the payload (D5/D12),
+> over-fetch before the floor and a `limit` cap (D6), one measured threshold (D8), `/search` reporting
+> the floor it does not apply (D11), a sparse vector written for 10b (D7), and a versioned collection
+> `documents_v2` with a re-index driver (D9).
+> **Not shipped, because the bench said no:** title injection (D13) and the per-document cap (D14).
+> **Not in scope, as designed:** reranking (D10).
 >
 > This is the phase the last one deferred. Phase 9's header named the fork out loud — *"the other
 > candidate for phase 9 is retrieval quality (chunking + hybrid search), which is the bigger *product*
@@ -438,12 +443,42 @@ bench is where that decision gets made reversibly — every row below is a candi
 
 | Measurement | recall@1 | recall@3 | recall@10 | MRR | ctx chars@3 |
 | --- | --- | --- | --- | --- | --- |
-| **Baseline — 800/100 fixed window, dense only** | **0.659** | 1.000 | 1.000 | **0.818** | **1952** |
-| Boundary-aware chunking (D3) | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
-| …+ title injection (D13) | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
-| …+ per-document cap (D14) | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
-| **Shipped recipe → phase 10 re-index** | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+| Baseline — 800/100 fixed window, dense only | 0.659 | 1.000 | 1.000 | 0.818 | 1952 |
+| D3 boundary-aware, 800/100 | 0.750 | 1.000 | 1.000 | 0.871 | 1761 |
+| D3 boundary-aware, 300/40 | 0.886 | 0.977 | 1.000 | 0.938 | 691 |
+| D3 boundary-aware, 400/50 | 0.886 | 0.977 | 1.000 | 0.930 | 946 |
+| **D3 boundary-aware, 500/60 — SHIPPED** | **0.909** | **1.000** | **1.000** | **0.947** | **1124** |
+| D3 boundary-aware, 600/75 | 0.886 | 1.000 | 1.000 | 0.943 | 1427 |
+| D3 boundary-aware, 1200/150 | 0.841 | 1.000 | 1.000 | 0.920 | 2519 |
+| D3 500/60 + D13 title injection | 0.886 | 1.000 | 1.000 | 0.936 | 995* |
+| D3 500/60 + D14 per-doc cap 2 | 0.886 | 0.955 | 0.977 | 0.922 | 931* |
 | Phase 10b — hybrid + RRF | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+
+<sub>*measured at 400/50, the then-leading size; neither improved on its base at any size tested.</sub>
+
+**Shipped: boundary-aware chunking at 500/60.** Better on every metric than the fixed window —
+recall@1 `0.659 → 0.909`, MRR `0.818 → 0.947` — while delivering **42% less context** (1952 → 1124
+chars). Nothing regressed, so the ship criterion is met.
+
+**Not shipped: D13 and D14, because the bench said no.** Title injection helped at 800/100
+(`0.750 → 0.795`) and did nothing at the winning size except cost context. The per-document cap was
+inert at 800 and actively *harmful* at 400, dropping recall@3 to 0.955 and recall@10 to 0.977 — it
+discards true passages to buy a diversity this corpus does not need. Both were written, measured, and
+left out. That is the bench working: the doc committed to "ships only if it earns its place on the
+bench" before the numbers existed, and the numbers said no.
+
+**The threshold was swept, not reasoned about — and the reasoning would have been wrong.**
+
+| floor | recall@1 | recall@3 | MRR | ctx chars@3 |
+| --- | --- | --- | --- | --- |
+| 0.20 | 0.909 | 1.000 | 0.947 | 1124 |
+| **0.25 — SHIPPED** | **0.909** | **1.000** | **0.947** | **1064** |
+| 0.30 | 0.909 | 0.977 | 0.939 | 982 |
+| 0.35 | 0.886 | 0.955 | 0.917 | 815 |
+| 0.40 | 0.841 | 0.909 | 0.871 | 642 |
+
+`0.25` is the highest floor that costs nothing: identical retrieval to `0.20`, ~5% less context.
+README had recommended `0.35` for months; it silently drops 4.5% of answers.
 
 **Read the baseline honestly, because two of its columns are useless.** `recall@3` and `recall@10`
 are **saturated at 1.000** — on eight documents every answer is somewhere in the top three, so those
