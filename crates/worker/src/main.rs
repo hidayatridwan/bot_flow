@@ -1,4 +1,3 @@
-mod chunk;
 mod event;
 mod lifecycle;
 mod parser;
@@ -7,6 +6,7 @@ mod reaper;
 mod testsupport;
 
 use anyhow::Context;
+use common::chunk::{CHUNK_OVERLAP, CHUNK_SIZE};
 use common::embedding::{EmbedError, EmbeddingClient};
 use futures_lite::StreamExt;
 use lapin::{
@@ -512,7 +512,7 @@ async fn ingest(
 
     let document_id = doc_uuid.to_string();
     let text = parser::parse_to_text(bytes, filename_hint, &document_id).await?;
-    let chunks = chunk::chunk_text(&text, 800, 100);
+    let chunks = common::chunk::chunk_text(&text, CHUNK_SIZE, CHUNK_OVERLAP);
     if chunks.is_empty() {
         tracing::warn!("no extractable text in '{object_key}'");
         return Ok(0);

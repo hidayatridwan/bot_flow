@@ -1,0 +1,33 @@
+Northwind Supplies — Billing and Invoicing Guide
+
+Plain text on purpose: the corpus must not be all markdown, because the parser treats .txt and .md
+identically today and a structure-aware chunker would not.
+
+INVOICES
+
+Invoices are issued on the first working day of the month for the preceding month. Each invoice
+carries a reference in the format INV followed by the year and a five digit sequence, for example
+INV-2024-00317. An invoice cannot be reissued with a different billing address once it has been
+finalised; a credit note is issued instead.
+
+PAYMENT TERMS
+
+Consumer orders are charged at dispatch, not at the time of ordering. Business accounts are invoiced
+monthly with 30 day payment terms. Late payment carries interest at 8 percent above the base rate,
+applied from the day after the due date.
+
+VAT
+
+Prices shown to consumers include VAT at the destination country's rate. Business customers with a
+valid VAT number registered in the account are invoiced without VAT under the reverse charge
+mechanism. A VAT number added after an invoice is finalised does not retroactively change it.
+
+PURCHASE ORDERS
+
+Business accounts may quote a purchase order number, which is printed on the invoice. We do not
+require a purchase order and will not block a dispatch waiting for one.
+
+DISPUTES
+
+A billing dispute must be raised within 60 days of the invoice date. Disputed amounts are not subject
+to late payment interest while an investigation is open.

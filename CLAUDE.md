@@ -12,7 +12,8 @@ streamed over SSE.
 > the wrong half.
 
 `crates/api` (Axum HTTP server) · `crates/worker` (RabbitMQ consumer) · `crates/common` (shared
-object-key contract **and the embedding client**) · `sidecar/` (Python `pypdf` extractor) ·
+object-key contract, the embedding client **and the chunker** — the index recipe) · `crates/eval`
+(the retrieval bench) · `sidecar/` (Python `pypdf` extractor) ·
 `widget/` (vanilla JS, no build step) · `web/` (SvelteKit BFF — the dashboard).
 
 Backing services: Postgres 16, Qdrant, MinIO, RabbitMQ, Redis. Embeddings are an OpenAI-compatible
@@ -28,6 +29,7 @@ cargo run -p api          # http://localhost:3000 — also runs DB migrations on
 cargo run -p worker       # ingestion consumer
 cargo test                # inline #[cfg(test)] unit tests — offline, no services needed
 cargo test -- --ignored   # the integration suite: needs `docker compose up -d` (phase 9)
+cargo run -p eval         # the retrieval bench: real, billed embeddings; own collection (phase 10)
 cargo clippy && cargo fmt # stock defaults, no config files
 ```
 
@@ -452,7 +454,8 @@ writing the code.
 | Env vars and their defaults | `crates/api/src/config.rs` |
 | Worker claim / status machine | `crates/worker/src/lifecycle.rs` |
 | MinIO event parsing (the percent-encoding trap) | `crates/worker/src/event.rs` |
-| Chunking | `crates/worker/src/chunk.rs` |
+| Chunking — `chunk_text` and the `CHUNK_SIZE`/`CHUNK_OVERLAP` constants. In `common` because it is half the index recipe: the worker writes chunks and the bench must reproduce them byte for byte | `crates/common/src/chunk.rs` |
+| The retrieval bench — fixture corpus, golden set, the metrics, and the sabotage table that must move before any number is believed. Writes to `eval_bench`, never `documents` | `crates/eval/` |
 | Reaper — `UPLOAD_GRACE`/`PROCESSING_LEASE` constants; expired/reclaimed sweeps **and** the deferred-deletion sweep (phase 8) | `crates/worker/src/reaper.rs` |
 | `DELETE /documents/{id}` — the tombstone-guarded saga and `delete_document_stores` (its order/filters mirror the reaper sweep) | `crates/api/src/handlers.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |

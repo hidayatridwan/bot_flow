@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "Ground truth is a SUBSTRING a correct passage must contain — never a chunk id and never chunk",
+    "text. Re-chunking renumbers and rewrites every chunk, so ground truth tied to chunks evaporates",
+    "on exactly the change it exists to evaluate (D1). A substring survives any chunking strategy.",
+    "Matching is case-insensitive with whitespace collapsed, so a cut across a line break still counts.",
+    "",
+    "tags: 'conflict' = the corpus deliberately contradicts itself (the superseded-policy case; the",
+    "expected value is the CURRENT policy, so this question measures whether retrieval surfaces the",
+    "governing document). 'crosslingual' = asked in Indonesian against an Indonesian document,",
+    "because invariant 5 makes that a supported case."
+  ],
+  "questions": [
+    { "q": "How long does standard shipping take?", "expects": "3 to 5 business days" },
+    { "q": "When do I qualify for free shipping?", "expects": "free on orders above 75 euros" },
+    { "q": "What is the flat shipping fee?", "expects": "4.95 euros" },
+    { "q": "How long does delivery outside the mainland take?", "expects": "7 to 12 business days" },
+    { "q": "What does a tracking code look like?", "expects": "NW004182337" },
+    { "q": "How quickly must I report a damaged item?", "expects": "within 48 hours of delivery" },
+    { "q": "How long is the hardware warranty?", "expects": "24 month warranty" },
+    { "q": "Are batteries covered by the warranty?", "expects": "covered for 6 months" },
+    { "q": "What are your support hours?", "expects": "08:00 to 18:00 CET" },
+    { "q": "What number do I call to reach support?", "expects": "+31 20 555 0134" },
+    { "q": "Can I get help through social media?", "expects": "do not offer support through social media" },
+
+    { "q": "How many days do I have to request a refund?", "expects": "within 30 days of delivery", "tags": ["conflict"] },
+    { "q": "Is there a restocking fee on returns?", "expects": "has been abolished", "tags": ["conflict"] },
+    { "q": "How do I start a refund request?", "expects": "Request refund" },
+    { "q": "Which items cannot be refunded?", "expects": "Gift cards, downloadable software licences" },
+    { "q": "How long do I have to return unopened goods?", "expects": "up to 60 days after delivery" },
+
+    { "q": "Can I change the delivery address after ordering?", "expects": "until the order is dispatched" },
+    { "q": "Do you offer a student discount?", "expects": "10 percent to verified students" },
+    { "q": "Is there a minimum order value?", "expects": "There is no minimum" },
+    { "q": "Can I place an order over the phone?", "expects": "cannot place one" },
+    { "q": "Which payment methods do you accept?", "expects": "Card, iDEAL, SEPA direct debit, and PayPal" },
+    { "q": "How do I cancel my subscription?", "expects": "end of the paid period" },
+    { "q": "Do business customers get payment terms?", "expects": "30 day payment terms" },
+
+    { "q": "When are invoices issued?", "expects": "first working day of the month" },
+    { "q": "What format is an invoice reference?", "expects": "INV-2024-00317" },
+    { "q": "What interest is charged on late payment?", "expects": "8 percent above the base rate" },
+    { "q": "How is VAT handled for business customers?", "expects": "reverse charge" },
+    { "q": "How long do I have to dispute an invoice?", "expects": "within 60 days of the invoice date" },
+    { "q": "Do I need a purchase order number?", "expects": "do not require a purchase order" },
+
+    { "q": "Berapa lama pengiriman ke Indonesia?", "expects": "7 sampai 12 hari kerja", "tags": ["crosslingual"] },
+    { "q": "Jam berapa tim dukungan tersedia?", "expects": "08.00 sampai 18.00", "tags": ["crosslingual"] },
+    { "q": "Apakah garansi mencakup baterai?", "expects": "komponen habis pakai seperti baterai", "tags": ["crosslingual"] },
+    { "q": "Siapa yang menanggung bea masuk?", "expects": "ditanggung oleh penerima", "tags": ["crosslingual"] },
+
+    { "q": "Where did Rina Halim study?", "expects": "Institut Teknologi Bandung" },
+    { "q": "What did Rina build at Kirana Payments?", "expects": "reconciliation service" },
+    { "q": "How far did Rina reduce unmatched transactions?", "expects": "0.04 percent" },
+    { "q": "What did Rina do at Trellis Logistics?", "expects": "shipment tracking" },
+
+    { "q": "What is the minimum password length?", "expects": "at least 12 characters" },
+    { "q": "Do you support two-factor authentication by SMS?", "expects": "SMS codes were withdrawn" },
+    { "q": "When does a session expire?", "expects": "30 days of inactivity" },
+    { "q": "Do you store full card numbers?", "expects": "never stored on our systems" },
+    { "q": "How long are invoices retained after account deletion?", "expects": "7 years" },
+    { "q": "How quickly are customers told about a data breach?", "expects": "within 72 hours" },
+    { "q": "Do you pay a bug bounty?", "expects": "do not operate a paid bug bounty" }
+  ]
+}

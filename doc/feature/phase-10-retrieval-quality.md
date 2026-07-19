@@ -1,6 +1,13 @@
 # Feature: Retrieval quality — an irreversible change to the one thing nothing measures (phase 10)
 
-> Status: **design for review. No code.**
+> Status: **the meter is built and the baseline is recorded; the index is untouched.**
+>
+> `crates/eval` is the bench, `crates/eval/fixtures/` the committed corpus and golden set, and the
+> chunker has moved to `common` so the bench and the worker cannot drift apart. The full sabotage
+> table has been run and every metric moved as it should — one of them only after the bench proved
+> the table's own second row wrong (see *Verification*). **Nothing in the production index has
+> changed**: no payload field, no chunker, no re-index. D3–D14 remain open, and now have a number to
+> be argued against rather than an opinion.
 >
 > This is the phase the last one deferred. Phase 9's header named the fork out loud — *"the other
 > candidate for phase 9 is retrieval quality (chunking + hybrid search), which is the bigger *product*
@@ -398,30 +405,62 @@ the system does is the same failure wearing a decimal point, and it is far more 
 is not trusted until it has been **sabotaged** — the mirror of phase 9's break table, run *before* the
 baseline is believed:
 
-| Sabotage | Metric that must drop, measurably |
-| --- | --- |
-| `chunk_size = 40` — chunks too small to contain any answer | recall@3 collapses |
-| `chunk_size = 8000` — one chunk per document, no locality | MRR flattens toward chance |
-| Return results in reverse rank order | MRR drops; recall@10 must **not** move — proving the two measure different things |
-| `RAG_SCORE_THRESHOLD = 0.9` | recall@3 → ~0, reproducing README's `0.70` bug as a number |
-| Replace the query embedding with a random vector | every metric → floor. If anything survives, the golden set is matching on something other than retrieval |
+| Sabotage | Metric that must move | Observed |
+| --- | --- | --- |
+| `chunk_size = 40` — too small to contain any answer | recall@3 collapses | 1.000 → 0.273 ✅ |
+| `chunk_size = 8000` — one chunk per document | **context cost rises** (see below) | 1952 → 3542 chars ✅ |
+| Reverse the rank order | MRR drops; recall@10 must **not** move | MRR 0.818 → 0.202, recall@10 held at 1.000 ✅ |
+| `RAG_SCORE_THRESHOLD = 0.9` | recall@3 → ~0 | 1.000 → 0.000 ✅ |
+| Replace the query embedding with a random vector | every metric → floor | all → 0.000 ✅ |
 
 If a sabotage leaves a number unmoved, that metric is decoration and the eval is wrong before the
 chunker is touched.
+
+**And one of them was — this table's second row is a correction, not a prediction.** As originally
+written it expected `chunk_size = 8000` to flatten MRR toward chance. It does the opposite: MRR
+*improved*, 0.818 → 0.932, and recall stayed a perfect 1.000. The reason is structural and it
+invalidates recall-by-substring as a complete metric: **"did a returned passage contain the answer"
+is trivially satisfied by returning the whole document.** A one-chunk-per-document recipe cannot miss.
+Judged on recall alone, the deliberately-broken variant looked like the best recipe on the bench.
+
+So the eval gained a fifth column — **`ctx chars@3`, the mean characters handed to the model at
+production's `limit = 3`** — and that is what sees this sabotage: 1952 → 3542. Retrieval quality is
+finding the answer *and* not burying it; recall measures only the first half. The bench caught this on
+its first run, which is the entire argument for sabotaging a meter before believing it.
 
 **Then the bench.** This is the part worth stating plainly, because it changes what the eval is *for*:
 it builds its own index over the committed fixture corpus, so **a variant can be measured without
 touching production at all.** The irreversible decision is which recipe the migration carries, and the
 bench is where that decision gets made reversibly — every row below is a candidate, not a plan.
 
-| Measurement | recall@3 | recall@10 | MRR | Notes |
-| --- | --- | --- | --- | --- |
-| Baseline — 800/100 fixed window, dense only | *TBD* | *TBD* | *TBD* | pre-change, the number everything is judged against |
-| Boundary-aware chunking (D3) | *TBD* | *TBD* | *TBD* | the phase's primary variable |
-| …+ title injection (D13) | *TBD* | *TBD* | *TBD* | earns its place or is dropped |
-| …+ per-document cap (D14) | *TBD* | *TBD* | *TBD* | measured with D13, since they pull against each other |
-| **Shipped recipe → phase 10 re-index** | *TBD* | *TBD* | *TBD* | whichever of the above won |
-| Phase 10b — hybrid + RRF | *TBD* | *TBD* | *TBD* | same index, query-side only |
+**Measured**, 8 fixture documents, 44 golden questions, `RAG_SCORE_THRESHOLD=0.20`,
+`text-embedding-3-small`, `cargo run -p eval`:
+
+| Measurement | recall@1 | recall@3 | recall@10 | MRR | ctx chars@3 |
+| --- | --- | --- | --- | --- | --- |
+| **Baseline — 800/100 fixed window, dense only** | **0.659** | 1.000 | 1.000 | **0.818** | **1952** |
+| Boundary-aware chunking (D3) | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+| …+ title injection (D13) | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+| …+ per-document cap (D14) | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+| **Shipped recipe → phase 10 re-index** | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+| Phase 10b — hybrid + RRF | *TBD* | *TBD* | *TBD* | *TBD* | *TBD* |
+
+**Read the baseline honestly, because two of its columns are useless.** `recall@3` and `recall@10`
+are **saturated at 1.000** — on eight documents every answer is somewhere in the top three, so those
+columns can register neither an improvement nor a regression. They stay in the table as guardrails
+(a change that breaks them is badly wrong) but **`recall@1`, MRR and `ctx chars@3` are the operative
+metrics** until the corpus grows. That the answer is the single best hit only **66%** of the time,
+on a corpus this small and with questions written from the documents themselves, is the real signal
+here — and it is the number a chunking change has to move.
+
+**One result worth pausing on, because it points the opposite way to this phase's assumption.** The
+`chunk_size = 8000` variant — intended as a sabotage — scored the *best* retrieval on the bench:
+recall@1 0.864 against the baseline's 0.659, MRR 0.932 against 0.818. It costs 1.8× the context to do
+it. That is not an argument for 8000-character chunks; it is evidence that **800 may be too small for
+this corpus**, and that the real trade in D3 is recall against context cost rather than recall
+against nothing. Chunk size should therefore be a variable the bench sweeps, not a constant the
+design assumes — and D3's boundary-aware splitter must be measured at more than one size before a
+number is committed to an irreversible index.
 
 **"Better" is defined before the numbers exist, so it cannot be defined by them:** phase 10 ships only
 if recall@3 improves and neither other metric regresses. A variant that does not clear that bar is not
@@ -438,6 +477,9 @@ change that quietly degrades retrieval fails a command rather than a customer. I
 | Don't | Do | Why |
 | --- | --- | --- |
 | Extend phase 9's harness to measure quality | Build a separate eval on real embeddings | Its embedder is content-addressed *by design* — exact match 1.0, everything else ~0.0. A better chunker and a worse one score identically, and a chunking change breaks its assertions outright |
+| Judge a chunking recipe on recall alone | Read `ctx chars@3` beside it | "Did a passage contain the answer" is trivially satisfied by returning the whole document. Measured: `chunk_size=8000` scored a *perfect* recall and a *better* MRR while handing the model 1.8× the context. On recall alone the deliberately-broken variant won |
+| Trust a metric sitting at 1.000 | Use one with headroom — here `recall@1` and MRR | A saturated metric registers neither improvement nor regression. Baseline `recall@3` is exactly 1.000 on this corpus and is a guardrail, not a measurement |
+| Point the bench at the `documents` collection | `eval_bench`, dropped and rebuilt per run | A variant that inherited the previous variant's points measures a blend of two recipes and looks plausible doing it — and production is not a scratch space |
 | Key golden answers to a chunk id or chunk text | Key them to a substring the passage must contain | Re-chunking renumbers and rewrites every chunk. Ground truth tied to chunks evaporates on the change it exists to evaluate |
 | Ship chunking now and hybrid later | One re-index, both payload changes; flip fusion on afterwards | The migration is the expensive, irreversible part. Paying it twice is the one avoidable mistake in this phase |
 | Change chunking and restart | Treat it as a migration | `ensure_collection` early-returns on an existing collection, and invariant 10 skips unchanged fingerprints. The change silently does not happen and nothing anywhere errors |
@@ -496,6 +538,11 @@ same commit."*
   `EMBEDDING_MODEL` invalidates every vector, and calls it *"a correctness rule wearing the costume of a
   configuration detail."* Chunking strategy, size and overlap belong inside that sentence: a collection
   may not hold chunks cut two different ways any more than vectors from two models.
+  **Partly paid already:** `chunk_text` and its `CHUNK_SIZE` / `CHUNK_OVERLAP` constants have moved
+  from the worker binary into `common`, beside `EmbeddingClient`, for exactly the reason that module
+  exists — the worker writes chunks and the bench must reproduce them byte for byte, or the bench
+  measures a system we do not run. This is the same argument the trap table already makes about the
+  api and worker sharing one embedding client, applied to the other half of the recipe.
 - **New invariant — a chunk carries its provenance.** Every indexed point carries `document_id`,
   `chunk_index` and `created_at`. A passage that cannot say where it came from cannot be cited, merged
   with its neighbour, or ordered — and one that cannot say *when* it came from cannot be weighed
@@ -516,9 +563,13 @@ same commit."*
    means shipping a payload we cannot yet prove is correct. The alternative — hybrid in one phase —
    costs either a second re-index or an unattributable measurement. I think the split is worth it, but
    this is the decision I am least sure of.
-2. **What is the fixture corpus, and can it be committed?** It must be public-safe, multilingual, large
-   enough that recall@3 is not trivially 1.0, and small enough to re-embed for pennies. Roughly 5–10
-   documents. Nothing in the repo is a candidate today.
+2. ~~**What is the fixture corpus, and can it be committed?**~~ **Built** — `crates/eval/fixtures/`:
+   8 synthetic public-safe documents (a support handbook, the superseded refund-policy pair, an FAQ,
+   a plain-text billing guide, an Indonesian support guide, a CV, a security policy) and 44 golden
+   questions keyed to substrings. **But the requirement "large enough that recall@3 is not trivially
+   1.0" was not met** — it is exactly 1.0, which is why `recall@1` and `ctx chars@3` now carry the
+   measurement. Growing the corpus until recall@3 has headroom is the first task of any follow-up,
+   and it is a prerequisite for trusting a *small* improvement.
 3. **Does the versioned collection name become permanent policy** — `documents_v3`, `v4` — or is it a
    one-off? Permanent gives every future embedding change a rollback this system has never had. It also
    means the collection name is forever something that can be stale in a deployment.

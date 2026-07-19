@@ -13,7 +13,8 @@ infrastructure containers.
 | --- | --- | --- |
 | `api` | `crates/api` — Axum HTTP server on `:3000` | Auth, tenant/key admin, uploads, retrieval, LLM answering (incl. SSE streaming). Runs DB migrations at startup. |
 | `worker` | `crates/worker` — RabbitMQ consumer | Consumes MinIO `ObjectCreated` events: verifies the object, parses, chunks, embeds, upserts into Qdrant, drives the document lifecycle. Also runs the reaper. |
-| `common` | `crates/common` | Shared by API and worker so the two can't drift apart: the object-key contract, and the embedding client (`EmbeddingClient`, `EMBEDDING_DIM`). |
+| `common` | `crates/common` | Shared by API and worker so the two can't drift apart: the object-key contract, the embedding client (`EmbeddingClient`, `EMBEDDING_DIM`), and the chunker (`chunk_text`, `CHUNK_SIZE`, `CHUNK_OVERLAP`) — together, the index recipe. |
+| `eval` | `crates/eval` | The retrieval bench (phase 10). Not part of the running system: builds its own index over a committed fixture corpus in its own collection, so a chunking recipe can be measured before an irreversible re-index. |
 | `sidecar` | `sidecar/parser.py` | Python text extractor the worker shells out to. Handles `.pdf` (pypdf), `.txt`, `.md`. |
 | `postgres` | Postgres 16 | Tenants, API keys, document records, conversation history. Row-Level Security enforces tenant isolation. |
 | `qdrant` | Qdrant 1.18 | Vector store. One `documents` collection, partitioned by a `tenant_id` payload index. |
@@ -43,7 +44,8 @@ lets a client render them as it likes — or, like today's widget, not at all.
   `EMBEDDING_API_KEY` — separate from `LLM_API_KEY` even when both point at the same gateway.
 - **LLM**: any OpenAI-compatible `/chat/completions` endpoint. Defaults to Gemini via its
   OpenAI compatibility layer.
-- **Chunking**: 800 characters with 100 characters of overlap, UTF-8 safe.
+- **Chunking**: 800 characters with 100 characters of overlap, UTF-8 safe. Defined once in
+  `common::chunk` — it is half the index recipe, so the worker and the retrieval bench cannot drift.
 - **Widget**: dependency-free vanilla JS, ~200 lines, no build step.
 
 ## Tenant isolation
@@ -300,6 +302,20 @@ docker compose up -d            # all five: Postgres, Qdrant, MinIO, RabbitMQ, R
 ./scripts/test-setup.sh         # creates the bot_flow_test database (idempotent)
 cargo test -- --ignored         # the integration suite
 ```
+
+### Measuring retrieval quality
+
+`cargo run -p eval` builds its own index over a committed fixture corpus (`crates/eval/fixtures/`)
+and scores 44 golden questions — `recall@1/@3/@10`, MRR, and the mean characters of context handed to
+the model. It writes to its own `eval_bench` collection and never touches `documents`, but it does
+make **real, billed** embedding calls, which is why it is a deliberate command rather than a CI job.
+
+It runs a sabotage table first — deliberately broken variants that each metric must react to — because
+a metric that reports the same number whatever the system does is worse than no metric: it is a number
+that gets believed. Two lessons from its first run are worth knowing before reading its output:
+recall alone cannot see an over-large chunk (returning the whole document always "contains" the
+answer), and `recall@3` is saturated at 1.0 on today's small corpus, so `recall@1` and context cost
+carry the measurement.
 
 The suite is `#[ignore]`d so a bare `cargo test` stays honest for anyone without Docker — and CI runs
 that bare command *before* it starts any service, which is what actually keeps the promise true.

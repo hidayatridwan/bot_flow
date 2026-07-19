@@ -1,0 +1,17 @@
+[package]
+name = "eval"
+version = "0.1.0"
+edition = "2021"
+
+# The retrieval bench (phase 10). Not part of the running system: it builds its own index over a
+# committed fixture corpus, in its own collection, so a chunking recipe can be measured WITHOUT
+# touching production. That is the point — the migration is irreversible, the bench is not.
+[dependencies]
+common = { workspace = true }
+qdrant-client = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dotenvy = { workspace = true }
+uuid = { workspace = true }
