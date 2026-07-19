@@ -176,3 +176,150 @@ async fn sweep_one(db: &PgPool, tenant_id: &str, sql: &str) -> anyhow::Result<u6
     tx.commit().await?;
     Ok(affected)
 }
+
+/// Integration tests (phase 9b). `#[ignore]`d; see `testsupport` for why they are in-crate.
+///
+/// These drive `finish_deletions` and the reclaim sweep directly, which is the reason this module
+/// has no `lib.rs`: both, plus `PROCESSING_LEASE`, are private, and making them `pub` would buy
+/// nothing but the test.
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use crate::testsupport::{seed_document, seed_tenant, status_of, test_pool};
+
+    /// **The case the phase-9 design says took a live stack to check.**
+    ///
+    /// A delete that lands while a worker is indexing returns `202` and defers cleanup to this
+    /// sweep — which must not erase the vectors until the worker has provably released, i.e. one
+    /// `PROCESSING_LEASE` after indexing began. The worker holds no DB lock while it indexes, so
+    /// the lease is the *only* thing standing between the sweep and a delete racing an active
+    /// upsert. Erase early and the worker's in-flight chunks land after the delete: orphaned
+    /// vectors, answering searches for a document that no longer exists.
+    ///
+    /// Both directions are asserted, because only checking the erase half would pass on a sweep
+    /// that ignored the lease entirely — which is precisely the bug.
+    #[tokio::test]
+    #[ignore = "needs docker compose services + the bot_flow_test database"]
+    async fn the_delete_sweep_waits_out_a_live_lease_but_not_an_expired_one() {
+        let db = test_pool().await;
+        let qdrant = Qdrant::from_url(&std::env::var("QDRANT_URL").expect("QDRANT_URL is not set"))
+            .build()
+            .expect("failed to build Qdrant client");
+        let bucket = crate::build_bucket().expect("failed to build S3 bucket");
+        let tenant = seed_tenant(&db).await;
+
+        // Tombstoned one minute ago, while a worker was indexing: the lease is still live.
+        let live = seed_document(&db, &tenant, "deleting", Some("1 minute")).await;
+        // Tombstoned long enough ago that the worker is provably done or dead.
+        let stale = seed_document(&db, &tenant, "deleting", Some("31 minutes")).await;
+        // Never touched by a worker at all — nothing to wait for, safe immediately.
+        let untouched = seed_document(&db, &tenant, "deleting", None).await;
+
+        let finished = finish_deletions(&db, &qdrant, &bucket, &tenant)
+            .await
+            .expect("finish_deletions errored");
+
+        assert_eq!(
+            status_of(&db, &tenant, live).await.as_deref(),
+            Some("deleting"),
+            "the sweep erased a row whose worker may still be writing vectors. The lease has not \
+             elapsed, so an in-flight upsert can still land after this delete and strand orphaned \
+             vectors that answer searches for an erased document."
+        );
+        assert_eq!(
+            status_of(&db, &tenant, stale).await,
+            None,
+            "the sweep left a row whose lease expired {PROCESSING_LEASE} ago — a deferred delete \
+             that never completes is a document the tenant asked us to erase and we did not"
+        );
+        assert_eq!(
+            status_of(&db, &tenant, untouched).await,
+            None,
+            "a tombstoned row with no processing_started_at has no worker to wait for and must be \
+             erased on the first sweep"
+        );
+        assert_eq!(
+            finished, 2,
+            "expected exactly the two safe rows to be erased"
+        );
+    }
+
+    /// The reclaim sweep: a worker that died mid-index leaves `processing` forever, because nothing
+    /// else ever moves that row. Back to `failed` rather than `uploaded` — the object is still
+    /// there, so `failed` is a re-claimable state and a redelivery can pick it up.
+    #[tokio::test]
+    #[ignore = "needs docker compose services + the bot_flow_test database"]
+    async fn a_stale_lease_is_reclaimed_and_a_live_one_is_left_alone() {
+        let db = test_pool().await;
+        let tenant = seed_tenant(&db).await;
+
+        let live = seed_document(&db, &tenant, "processing", Some("1 minute")).await;
+        let dead = seed_document(&db, &tenant, "processing", Some("31 minutes")).await;
+
+        let reclaimed = sweep_one(
+            &db,
+            &tenant,
+            &format!(
+                "UPDATE documents
+                    SET status = 'failed',
+                        error = 'processing lease expired; worker presumed dead',
+                        processing_started_at = null
+                  WHERE status = 'processing'
+                    AND processing_started_at < now() - interval '{PROCESSING_LEASE}'"
+            ),
+        )
+        .await
+        .expect("sweep_one errored");
+
+        assert_eq!(
+            reclaimed, 1,
+            "expected exactly the dead lease to be reclaimed"
+        );
+        assert_eq!(
+            status_of(&db, &tenant, dead).await.as_deref(),
+            Some("failed"),
+            "a worker presumed dead must release its document, or it is stuck in `processing` forever"
+        );
+        assert_eq!(
+            status_of(&db, &tenant, live).await.as_deref(),
+            Some("processing"),
+            "the reaper reclaimed a lease that had not expired — it would be racing a live worker, \
+             and `mark_ready`'s fence would then silently drop that worker's finished index"
+        );
+    }
+
+    /// The corollary trap, asserted rather than trusted: a sweep run under one tenant's context
+    /// must not touch another tenant's rows — and under RLS the failure mode is *silent success*,
+    /// zero rows matched and no error.
+    #[tokio::test]
+    #[ignore = "needs docker compose services + the bot_flow_test database"]
+    async fn a_sweep_cannot_reach_another_tenants_rows() {
+        let db = test_pool().await;
+        let owner = seed_tenant(&db).await;
+        let stranger = seed_tenant(&db).await;
+        let doc = seed_document(&db, &owner, "processing", Some("31 minutes")).await;
+
+        // Same sweep, wrong tenant. It should match nothing at all.
+        let reclaimed = sweep_one(
+            &db,
+            &stranger,
+            &format!(
+                "UPDATE documents SET status = 'failed'
+                  WHERE status = 'processing'
+                    AND processing_started_at < now() - interval '{PROCESSING_LEASE}'"
+            ),
+        )
+        .await
+        .expect("sweep_one errored");
+
+        assert_eq!(
+            reclaimed, 0,
+            "TENANCY LEAK: a sweep bound to one tenant updated another tenant's document"
+        );
+        assert_eq!(
+            status_of(&db, &owner, doc).await.as_deref(),
+            Some("processing"),
+            "the owner's row was modified by a sweep running as a different tenant"
+        );
+    }
+}

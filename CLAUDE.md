@@ -441,7 +441,8 @@ writing the code.
 | Composition root — `app()` (routes + CORS), `build_state()` (every dependency; returns the amqp `Connection` so it cannot be dropped), `run_migrations()`. `main.rs` is a ~25-line shell over it | `crates/api/src/lib.rs` |
 | The integration harness — test-database bring-up, the two guards (`_test` name, `NOT rolsuper`), the `TestApp` fixture and its Qdrant teardown | `crates/api/tests/common/mod.rs` |
 | The fake LLM/embedding gateway, and the deterministic content-addressed embedder that makes a denial assertion unambiguous | `crates/api/tests/common/gateway.rs` |
-| Cross-tenant denial (both mechanisms, each with its control) and the auth matrix | `crates/api/tests/{tenant_isolation,auth_matrix}.rs` |
+| Cross-tenant denial (both mechanisms, each with its control), the auth matrix, and the deletion saga's API half | `crates/api/tests/{tenant_isolation,auth_matrix,deletion}.rs` |
+| Worker integration tests — concurrent claim and the fence (`lifecycle.rs`), the lease-respecting sweeps (`reaper.rs`), and their shared setup. In-crate on purpose; the module doc says why | `crates/worker/src/{lifecycle,reaper,testsupport}.rs` |
 | CI — and why `cargo test` runs *before* the services start, and why `bun run lint` is absent | `.github/workflows/ci.yml` |
 | Handlers, Qdrant search, SSE stream | `crates/api/src/handlers.rs` |
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
@@ -509,6 +510,11 @@ Honest inventory. Each entry states the impact, not merely the fact.
   the worker signalling completion on a `deleting` row so the sweep need not wait out the lease —
   deferred, not free, because that write must not become a way to resurrect the tombstone (invariant
   10). The synchronous path — the overwhelming majority of deletes — has no such window.
+  **Phase 9b pins this window rather than closing it**, in both directions: the sweep must *not*
+  erase a row whose lease is still live (doing so would race the worker's in-flight upsert and
+  strand orphaned vectors) and must erase one whose lease has elapsed. So the trade is now a tested
+  decision instead of an assumed one — and whoever closes it has a test that will tell them if the
+  fix reintroduces the race.
 - **`GET /documents` has no pagination.** It returns the tenant's entire table, every call, fully
   materialised. Fine for a new tenant; a real problem at scale, and the dashboard polls it. The
   polling backs off to a 15s ceiling precisely because this query is unbounded — that is a mitigation,
@@ -533,9 +539,15 @@ Honest inventory. Each entry states the impact, not merely the fact.
   `require_management()`, `pk_` admitted to `/ask`, origin rejection including an absent `Origin`,
   `sess_` where invariant 23 says it belongs, and 401-vs-403 kept distinct. Each was verified to go
   **red** against a deliberate break before being trusted.
-  **Not covered, and worth knowing precisely:** concurrent claim of one document by two workers and
-  the deletion sweep (both worker-side — phase 9b); `/ask/stream`; retrieval *quality*, which this
-  phase says nothing about. And one gap that is structural rather than deferred — removing the
+  Phase 9b added the worker half: **concurrent claim** (two workers racing one row — invariant 10's
+  whole deduplication story, looped ten times, and red at round 1 without `FOR UPDATE`); the
+  **phase-8 fence** (`mark_ready`/`mark_failed` cannot resurrect a `deleting` row); the **deletion
+  saga** on both sides — the API's `204`-vs-`202` split and tombstone, and the reaper sweep's
+  refusal to erase a row whose lease is still live; **lease reclaim**; and two worker-side tenancy
+  assertions (a foreign document is invisible to `claim`; a sweep bound to one tenant cannot touch
+  another's rows, which is the corollary trap asserted rather than trusted).
+  **Not covered, and worth knowing precisely:** `/ask/stream`; retrieval *quality*, which these
+  phases say nothing about. And one gap that is structural rather than deferred — removing the
   `tenant_id` leg of `delete_document_stores`' Qdrant filter turns **nothing** red, because
   `document_id` is a globally-unique UUID and no test can construct a collision. That filter is
   layered defence, and the suite cannot prove it; a test that *could* would be asserting on internals.
@@ -590,7 +602,8 @@ Honest inventory. Each entry states the impact, not merely the fact.
   `AppState` are the composition root and **`main` is the first consumer of each** — the binary and
   the tests want the same seam. `crates/worker` has none: its reaper's seams (`sweep_one`,
   `finish_deletions`, `PROCESSING_LEASE`) are private, and making them `pub` would buy nothing but
-  the test. So worker integration tests (phase 9b) go in-crate under `#[cfg(test)]`.
+  the test. So its integration tests sit in-crate under `#[cfg(test)] mod integration`, beside the
+  code they drive, sharing `testsupport.rs`. Nothing in the worker was widened to test it.
   **Do not widen visibility just to test something.** No handler, gate or query is `pub` — the tests
   reach them through HTTP, which is the point of `tests/` over an in-crate module. If a *sixth* item
   in `api` needs widening, the lib split has stopped paying: fall back to an in-crate module rather

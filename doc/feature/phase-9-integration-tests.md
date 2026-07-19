@@ -1,7 +1,7 @@
 # Feature: An integration harness for the guarantees unit tests cannot reach (phase 9)
 
-> Status: **built, for the API half.** Tests 1 and 2 ship with CI; tests 3 and 4 are worker-side and
-> deferred to phase 9b. What was actually built, and the three places this design was wrong, are
+> Status: **built — all four tests, plus CI.** Tests 1 and 2 (API) landed first; tests 3 and 4
+> (worker) followed as 9b. What was actually built, and the places this design was wrong, are
 > recorded in [Outcome](#outcome) at the foot of this document. CLAUDE.md and README.md are the
 > current source of truth; this file is kept as the reasoning that produced them.
 >
@@ -179,7 +179,20 @@ reminder that it is waiting.
 ## Outcome
 
 Built: the `crates/api` lib split, the harness, the fake gateway, tests 1 and 2, CI, and
-`scripts/test-setup.sh`. Deferred to **9b**: tests 3 and 4, both worker-side.
+`scripts/test-setup.sh` — then **9b**: tests 3 and 4, worker-side. Eleven integration tests total.
+
+**Open question 3 answered by building it.** The worker got coverage, but *not* the way the API did:
+no `lib.rs`, no `tests/` directory. The reaper's seams (`sweep_one`, `finish_deletions`,
+`PROCESSING_LEASE`) are private, and making them `pub` for a test is exactly what CLAUDE.md forbids —
+so its tests sit in-crate under `#[cfg(test)] mod integration`. The asymmetry is one rule applied
+twice: *where the seam is real API, split the lib; where it would exist only for the test, test
+in-crate.* Nothing in the worker was widened.
+
+9b also went slightly beyond the design, cheaply, because the fixtures were already there: the
+phase-8 fence (`mark_ready` cannot resurrect a `deleting` row), and two tenancy assertions the
+worker had never had — a foreign document is invisible to `claim`, and a sweep bound to one tenant
+cannot reach another's rows. That last one is the *corollary trap* (a cross-tenant `UPDATE` matches
+zero rows and reports success) asserted rather than trusted.
 
 **Three things this design got wrong, recorded because the reasoning above still reads persuasive:**
 
@@ -220,6 +233,19 @@ points on the happy path looked fine; scrolling the payloads did not). The fix i
 test tenants older than an hour — by age rather than by truncation, so it cannot corrupt a concurrent
 run. Worth recording as the phase's own small lesson: *the audit that found this was checking
 tenant ids, not counts.*
+
+**Every break in the table was executed, in both phases, and each was reverted in the same sitting.**
+9b's additions behaved the same way: removing `FOR UPDATE` fails the concurrent-claim test at round 1
+(three runs of three — the loop earns its keep); removing the `WHERE status = 'processing'` fence
+fails the resurrection test; dropping the lease predicate from `finish_deletions` fails exactly the
+sweep test and nothing else.
+
+**One process lesson from 9b, recorded because it cost real work.** Reverting a break with
+`git checkout <file>` destroyed ~120 lines of *uncommitted new tests* in that same file — the file
+was unmodified in the last commit, so "revert" meant "discard everything since". Every other break in
+both phases was reverted with a targeted edit, which is the right instrument; `git checkout` is not a
+revert, it is a reset to a commit that may predate your work. The tests were rewritten and the work
+committed before the next break was attempted.
 
 **The design's claim that CLAUDE.md's "fatal-versus-retryable classification" entry is stale: verified
 true** (`common/src/embedding.rs:305-331`) and struck.

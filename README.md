@@ -320,6 +320,11 @@ Two things it refuses to do, both deliberate:
   pass, and have tested nothing at all. `TEST_DATABASE_URL` and `TEST_APP_DATABASE_URL` override the
   derived URLs if you need them elsewhere; the second one must point at `app_user`.
 
+The worker's integration tests live **inside** `crates/worker/src/` rather than in a `tests/`
+directory, and run under the same command. That is deliberate: the reaper's seams are private, and
+exporting them purely for a test is the thing not to do. The api's are in `crates/api/tests/` because
+its composition root is real API that `main` uses too.
+
 What it covers, and what it does not, is inventoried in CLAUDE.md — including one gap that is
 structural rather than merely deferred.
 
