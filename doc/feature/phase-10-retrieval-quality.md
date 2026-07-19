@@ -77,6 +77,44 @@ Two corollaries fall straight out, and both shape the phase:
    At cutover they are not re-indexed, they are **abandoned**. The largest single piece of debt in the
    system presents its bill in this phase, and the honest answer is that we pay it rather than fix it.
 
+## A worked example: the superseded policy
+
+Everything above argues about quality in the abstract. This is what it looks like as behaviour, and it
+is the failure a tenant will actually hit.
+
+**The scenario.** A tenant uploads `handbook_v1.pdf` — *"Refunds are accepted within 14 days"* — and
+later uploads `handbook_v2.pdf`, which supersedes it: *"Refunds are accepted within 30 days."* Nothing
+is deleted, because uploading a correction feels like making a correction.
+
+**Observed, on a minimal two-chunk reproduction of exactly this shape** (a live stack, an `/ingest` of
+two contradictory one-line facts, the older one first — the numbers below are that run, not the
+handbook wording):
+
+- **Ranking is semantic, never temporal.** For a neutral question the **older** chunk won, `0.747` to
+  `0.597`, purely because its wording sat closer to the question's. Insertion order contributed
+  nothing. There is no timestamp in the payload to rank by — `text`, `tenant_id`, `document_id` is the
+  whole of it — so recency is not deprioritised, it is *absent*.
+- **The system merges the contradiction.** Both chunks clear the floor, both land in the CONTEXT block
+  as `[1]` and `[2]`, and the model reconciles them however it sees fit. A neutral question produced a
+  both-things-are-true summary. **A leading question confirmed whichever premise it was handed** — the
+  matching chunk jumped to ~`0.91` and the model agreed, so the same corpus answered *yes* to two
+  mutually exclusive questions, confidently, with no hedge.
+- **Invariant 4 held perfectly, and that is the uncomfortable part.** Nothing was hallucinated. The
+  model reported its context faithfully; the context genuinely contained both policies. Every rule in
+  this system worked as written, and the tenant still gets told the wrong refund window — which is
+  precisely the outcome invariant 4 exists to prevent, arrived at by a route it does not cover.
+
+**Diagnosis.** The system has no notion of document *hygiene*. It treats every indexed chunk as an
+undifferentiated mass of truth, with no way to express that one document supersedes another and no
+logic to arbitrate when two disagree. Today the only defence is operational: delete the stale document
+(`DELETE /documents/{id}`, phase 8). That works, it is supported, and it is *easily forgotten* — which
+makes it a defence in the same sense that "remember to run the migration" is a defence.
+
+Note also how this compounds with D6: on a two-chunk corpus both claims are retrieved and the conflict
+is at least *visible* in `sources`. At a realistic corpus size with `limit = 3`, whether the current
+policy appears at all becomes a matter of ranking luck — and the failure stops being "the bot said
+both" and becomes "the bot confidently stated the expired policy, alone."
+
 ## Decisions to settle (open — recommendations given)
 
 ### D1 — what is the meter, and what may its ground truth key on?
@@ -149,7 +187,9 @@ Nothing downstream — merging adjacent chunks, ordering by position, citing a l
 without it, and it costs a re-index we are already paying. So it rides along.
 
 **Recommendation: add `chunk_index` and `char_start`/`char_end`; index `document_id` as a keyword
-field; do *not* store `filename`.**
+field; do *not* store `filename`.** (`created_at` is the fourth addition and gets its own decision —
+D12 — because it is justified by a different argument: not an enabler for merging or ordering, but the
+only thing that makes a superseded document distinguishable from a current one.)
 
 - `chunk_index` and offsets cannot be reconstructed from anything (the point id is a hash) and cannot
   be joined from Postgres. They must be stored.
@@ -254,6 +294,42 @@ destroys the only instrument for choosing the floor. It is a management-gated di
 end-user surface. Make it legible instead: return the configured threshold alongside the hits, so a
 caller can see which hits `/ask` would have dropped.
 
+### D12 — does `created_at` ride along in the payload?
+
+The worked example above is not a retrieval-ranking bug; it is a missing *property*. The system cannot
+prefer the newer of two contradictory passages, cannot tie-break on age, and cannot tell a user that
+its sources disagree — not because the logic is unwritten, but because **the fact needed to write it is
+not stored**. `documents` has the row's `created_at` in Postgres; the vector knows nothing about it.
+
+**Recommendation: write `created_at` into the payload during this phase's re-index, derived from the
+`documents` row, and use it for nothing yet.**
+
+The case rests on cost and timing rather than on the feature. Adding it later is a *second* full
+migration — the expensive, irreversible thing corollary 1 exists to avoid — while adding it now costs
+one more payload key on a re-index already being paid for. That asymmetry is the entire argument, and
+it is the same argument that puts `chunk_index` in D5.
+
+What it buys is optionality, stated honestly: **it converts recency from an absent property into an
+expressible one.** Temporal tie-breaking, a recency boost, a "these sources disagree and one is newer"
+signal in the UI, or a retention policy — none are built here, and any of them can be built afterwards
+without touching the index. Without it, all four require another migration before they can even be
+prototyped.
+
+**Why not use it in phase 10's ranking too?** Because that is a scoring change, and D7's whole
+structure exists to keep one variable per measurement. A recency boost mixed into the same release as
+the chunker would make the baseline delta unattributable — and worse, recency is not obviously
+desirable: an older FAQ entry is not less true than a recently uploaded invoice. *Newer wins* is a
+policy decision that deserves its own evidence, and storing the field is what makes gathering that
+evidence possible.
+
+**Risk if this is dropped:** the system stays structurally incapable of arbitrating superseded
+documents, and manual deletion remains the sole defence — an operational discipline, not a property of
+the product, and one that fails silently and in the tenant's favour exactly never.
+
+**Consistency note:** `/ingest` chunks have no `documents` row and therefore no `created_at`. The field
+is absent there, like `document_id` — the same debt surfacing in the same place, and one more reason
+that path is not a supported one.
+
 ## Verification
 
 Phase 9's principle was *"a passing test proves nothing until you have watched it fail."* The analogue
@@ -306,11 +382,16 @@ change that quietly degrades retrieval fails a command rather than a customer. I
 | Make chunk size an env var | Named constants in `chunk.rs` | Two deployments with different sizes produce incomparable collections and nothing errors — invariant 6's argument, one layer down |
 | Take `limit` from the client unbounded | Cap it; 422 above the cap | It is `u64` straight off the request body today |
 | Assume the re-index covered everything | Audit point counts per tenant, per collection | A partially re-indexed collection degrades quietly with no error — and `/ingest` points cannot be covered at all |
+| Leave `created_at` out because nothing reads it yet | Write it in this re-index anyway (D12) | Adding a payload field later is a *second* full migration. The field is what makes recency expressible at all — without it, superseded-policy arbitration cannot even be prototyped |
+| Assume uploading a correction supersedes the original | Delete the stale document | Nothing in the system relates two documents. A correction is an additional voice, not a replacement, and the older one can outrank it — see the worked example |
 
 **Left standing, deliberately:** page-aware PDF parsing (a sidecar change, and the true prerequisite for
 page citations); adjacent-chunk merging and MMR de-duplication (both become *possible* once
 `chunk_index` and offsets exist, neither is built here); reranking (D10); LLM-judge answer scoring (D1);
 query expansion, and the serial rewrite round-trip on every follow-up turn; per-tenant threshold tuning.
+**And every use of `created_at`** — D12 stores it and reads it nowhere. Temporal tie-breaking, recency
+boosting, a sources-disagree signal and document supersession are all deliberately unbuilt; the field
+exists so that none of them costs a migration, not because any of them is decided.
 And the one that is not a deferral but a loss: **`/ingest`-only tenants are abandoned at cutover**,
 because their vectors carry no `document_id` and no source object, and nothing in the product can find
 them.
@@ -324,10 +405,11 @@ same commit."*
   `EMBEDDING_MODEL` invalidates every vector, and calls it *"a correctness rule wearing the costume of a
   configuration detail."* Chunking strategy, size and overlap belong inside that sentence: a collection
   may not hold chunks cut two different ways any more than vectors from two models.
-- **New invariant — a chunk carries its provenance.** Every indexed point carries `document_id` and
-  `chunk_index`. A passage that cannot say where it came from cannot be cited, merged with its
-  neighbour, or ordered. This turns `/ingest`'s missing `document_id` from a debt entry into a rule it
-  visibly breaks.
+- **New invariant — a chunk carries its provenance.** Every indexed point carries `document_id`,
+  `chunk_index` and `created_at`. A passage that cannot say where it came from cannot be cited, merged
+  with its neighbour, or ordered — and one that cannot say *when* it came from cannot be weighed
+  against a passage that contradicts it (D12). This turns `/ingest`'s missing `document_id` from a debt
+  entry into a rule it visibly breaks.
 - **New invariant (10b) — the grounding floor applies to a similarity, never to a fused rank.** D8.
   Invariant 4 is unchanged in *meaning* and changes entirely in *mechanism*, which is the dangerous kind
   of change.
@@ -355,3 +437,7 @@ same commit."*
 5. **Does the `filename`-by-join (D5) hold under load?** It adds one RLS-scoped query per `/ask`. I
    believe correctness beats the round-trip, but the denormalised copy is defensible and I may be
    over-weighting a rename feature that does not exist.
+6. **Is "newer wins" even the right policy, once `created_at` exists (D12)?** A superseded handbook
+   says yes; an old FAQ entry versus a recently uploaded invoice says no. The honest answer may be that
+   recency should surface a *conflict* to the user rather than silently resolve one — which is a
+   product decision, not a retrieval one, and is why D12 stores the field and rules on nothing.
