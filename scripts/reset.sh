@@ -17,6 +17,9 @@ QDRANT_HTTP="${QDRANT_HTTP:-http://localhost:6333}"   # REST port, not the 6334 
 # Must match `common::COLLECTION`. Versioned (phase 10), so this moves when the index recipe does.
 QDRANT_COLLECTION="${QDRANT_COLLECTION:-documents_v2}"
 QDRANT_BENCH_COLLECTION="${QDRANT_BENCH_COLLECTION:-eval_bench}"  # crates/eval rebuilds it per run
+# Superseded collection versions. A version bump leaves the old one intact on purpose — that is the
+# migration's rollback — but a dev wipe should not leave it behind forever.
+QDRANT_LEGACY_COLLECTIONS="${QDRANT_LEGACY_COLLECTIONS:-documents}"
 
 KEEP_AUTH=0
 ASSUME_YES=0
@@ -56,7 +59,7 @@ else
   echo "  Postgres ($PG_TEST_DB) : TRUNCATE everything, if the database exists"
 fi
 echo "  MinIO    : all objects in bucket '$MINIO_BUCKET' (bucket + notifications kept)"
-echo "  Qdrant   : drop collections '$QDRANT_COLLECTION' and '$QDRANT_BENCH_COLLECTION'"
+echo "  Qdrant   : drop '$QDRANT_COLLECTION', '$QDRANT_BENCH_COLLECTION' and superseded versions ($QDRANT_LEGACY_COLLECTIONS)"
 echo "  Redis    : FLUSHALL"
 if [ "$KEEP_AUTH" -ne 1 ]; then
   echo
@@ -92,9 +95,10 @@ docker compose exec -T minio sh -c \
   "mc alias set local http://localhost:9000 $MINIO_USER $MINIO_PASS >/dev/null \
    && mc rm --recursive --force local/$MINIO_BUCKET >/dev/null 2>&1 || true"
 
-echo "==> Qdrant: dropping collections '$QDRANT_COLLECTION' and '$QDRANT_BENCH_COLLECTION'"
-curl -sS -X DELETE "$QDRANT_HTTP/collections/$QDRANT_COLLECTION" >/dev/null || true
-curl -sS -X DELETE "$QDRANT_HTTP/collections/$QDRANT_BENCH_COLLECTION" >/dev/null || true
+echo "==> Qdrant: dropping '$QDRANT_COLLECTION', '$QDRANT_BENCH_COLLECTION' and superseded versions"
+for c in "$QDRANT_COLLECTION" "$QDRANT_BENCH_COLLECTION" $QDRANT_LEGACY_COLLECTIONS; do
+  curl -sS -X DELETE "$QDRANT_HTTP/collections/$c" >/dev/null || true
+done
 
 echo "==> Redis: FLUSHALL"
 docker compose exec -T redis redis-cli FLUSHALL >/dev/null
