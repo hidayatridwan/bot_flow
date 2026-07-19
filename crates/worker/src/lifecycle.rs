@@ -249,3 +249,131 @@ mod tests {
         );
     }
 }
+
+/// Integration tests (phase 9b) — the halves the pure tests above cannot reach: the row lock, and
+/// the `WHERE status = 'processing'` fence. `#[ignore]`d; see `testsupport` for why they live here.
+#[cfg(test)]
+mod integration {
+    use super::*;
+    use crate::testsupport::{seed_document, seed_tenant, status_of, test_pool};
+
+    /// **Invariant 10's entire deduplication story, executed concurrently for the first time.**
+    ///
+    /// A row lock plus a status check is all that stops two workers indexing one document twice —
+    /// and until now it had only ever been reasoned about. Two `claim` calls race the same row:
+    /// exactly one must `Proceed`, and the loser must see `processing` and skip.
+    ///
+    /// Looped, because a race that fails one time in five is worse than no test at all: a single
+    /// pass would let an interleaving that only sometimes goes wrong look permanently fine.
+    /// (Verified: with `FOR UPDATE` removed this fails at round 1, three runs out of three.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs docker compose services + the bot_flow_test database"]
+    async fn two_workers_racing_one_document_produce_exactly_one_proceed() {
+        let db = test_pool().await;
+        let tenant = seed_tenant(&db).await;
+
+        for round in 0..10 {
+            let doc = seed_document(&db, &tenant, "uploading", None).await;
+
+            // Same arguments both sides: a duplicate MinIO delivery, not two different uploads.
+            let (a, b) = tokio::join!(
+                claim(&db, &tenant, doc, 1234, "etag-same"),
+                claim(&db, &tenant, doc, 1234, "etag-same"),
+            );
+            let (a, b) = (a.expect("claim A errored"), b.expect("claim B errored"));
+
+            let proceeds = [&a, &b].iter().filter(|c| ***c == Claim::Proceed).count();
+            assert_eq!(
+                proceeds, 1,
+                "round {round}: expected exactly one Proceed, got {a:?} and {b:?}. \
+                 Two Proceeds means the row lock is not serialising the claim and the document \
+                 would be indexed twice; zero means neither worker took it and it stalls forever."
+            );
+
+            // The loser must skip for the right reason — it saw the winner's `processing`, not
+            // some other branch that happens to also skip.
+            let loser = if a == Claim::Proceed { &b } else { &a };
+            assert_eq!(
+                *loser,
+                Claim::Skip("another worker is processing it"),
+                "round {round}: the losing worker skipped for the wrong reason"
+            );
+
+            assert_eq!(
+                status_of(&db, &tenant, doc).await.as_deref(),
+                Some("processing"),
+                "round {round}: the winner did not leave the row in processing"
+            );
+        }
+    }
+
+    /// The phase-8 fence (invariant 10): a worker that finishes late must not resurrect a row it no
+    /// longer owns. `mark_ready` fires only `WHERE status = 'processing'`.
+    ///
+    /// Without the guard an unguarded `mark_ready` flips `deleting` back to `ready` — and the delete
+    /// sweep, which looks for `deleting`, would then never find it again. The document is erased from
+    /// the tenant's listing but answers searches forever.
+    #[tokio::test]
+    #[ignore = "needs docker compose services + the bot_flow_test database"]
+    async fn a_late_worker_cannot_resurrect_a_tombstoned_document() {
+        let db = test_pool().await;
+        let tenant = seed_tenant(&db).await;
+
+        // A delete landed mid-index: the row is tombstoned while our worker was still writing.
+        let doc = seed_document(&db, &tenant, "deleting", Some("1 minute")).await;
+
+        let finished = mark_ready(&db, &tenant, doc)
+            .await
+            .expect("mark_ready errored");
+
+        assert!(
+            !finished,
+            "mark_ready reported it finished a row it no longer owns — the \
+             `WHERE status = 'processing'` fence is gone"
+        );
+        assert_eq!(
+            status_of(&db, &tenant, doc).await.as_deref(),
+            Some("deleting"),
+            "RESURRECTION: a late worker flipped a tombstoned row out of `deleting`. The delete \
+             sweep looks for `deleting` and will now never find it — the document is gone from the \
+             tenant's listing but still answers searches."
+        );
+
+        // Same fence on the failure path.
+        let doc2 = seed_document(&db, &tenant, "deleting", Some("1 minute")).await;
+        let finished = mark_failed(&db, &tenant, doc2, "boom")
+            .await
+            .expect("mark_failed errored");
+        assert!(!finished, "mark_failed is not guarded on `processing`");
+        assert_eq!(
+            status_of(&db, &tenant, doc2).await.as_deref(),
+            Some("deleting")
+        );
+    }
+
+    /// A document belonging to another tenant is invisible, not forbidden — RLS hides the row, so
+    /// `claim` takes its "no such document" branch rather than seeing someone else's work.
+    #[tokio::test]
+    #[ignore = "needs docker compose services + the bot_flow_test database"]
+    async fn a_foreign_document_is_invisible_to_the_claim() {
+        let db = test_pool().await;
+        let owner = seed_tenant(&db).await;
+        let stranger = seed_tenant(&db).await;
+        let doc = seed_document(&db, &owner, "uploading", None).await;
+
+        let claimed = claim(&db, &stranger, doc, 1, "etag")
+            .await
+            .expect("claim errored");
+
+        assert_eq!(
+            claimed,
+            Claim::Skip("no such document for this tenant"),
+            "TENANCY LEAK: a worker running as one tenant could see another tenant's document row"
+        );
+        // And the owner's row is untouched by the stranger's attempt.
+        assert_eq!(
+            status_of(&db, &owner, doc).await.as_deref(),
+            Some("uploading")
+        );
+    }
+}

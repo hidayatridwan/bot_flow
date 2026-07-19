@@ -3,6 +3,8 @@ mod event;
 mod lifecycle;
 mod parser;
 mod reaper;
+#[cfg(test)]
+mod testsupport;
 
 use anyhow::Context;
 use common::embedding::{EmbedError, EmbeddingClient};
