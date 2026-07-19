@@ -1,8 +1,13 @@
 # Feature: An integration harness for the guarantees unit tests cannot reach (phase 9)
 
-> Status: **design for review. No code.** CLAUDE.md asks for exactly this conversation before any of
-> it is built — *"Anything needing Postgres or Qdrant belongs in `crates/<crate>/tests/`, which does
-> not exist yet — **discuss before introducing one**."* This document is that discussion.
+> Status: **built, for the API half.** Tests 1 and 2 ship with CI; tests 3 and 4 are worker-side and
+> deferred to phase 9b. What was actually built, and the three places this design was wrong, are
+> recorded in [Outcome](#outcome) at the foot of this document. CLAUDE.md and README.md are the
+> current source of truth; this file is kept as the reasoning that produced them.
+>
+> Originally: **design for review, no code.** CLAUDE.md asks for exactly this conversation before any
+> of it is built — *"Anything needing Postgres or Qdrant belongs in `crates/<crate>/tests/`, which
+> does not exist yet — **discuss before introducing one**."* This document is that discussion.
 >
 > **The fork, stated up front:** the other candidate for phase 9 is retrieval quality (chunking +
 > hybrid search), which is the bigger *product* win. This is proposed first because retrieval work
@@ -168,3 +173,53 @@ reminder that it is waiting.
 3. **Does the worker get integration coverage in this phase**, or only the API? The concurrent-claim
    and deletion-sweep tests are worker behaviour and need its binary or its functions driven directly;
    that is a meaningfully larger harness than testing the API's `Router`.
+
+*Settled: (1) harness first, as argued. (2) report only, for now. (3) API only — see below.*
+
+## Outcome
+
+Built: the `crates/api` lib split, the harness, the fake gateway, tests 1 and 2, CI, and
+`scripts/test-setup.sh`. Deferred to **9b**: tests 3 and 4, both worker-side.
+
+**Three things this design got wrong, recorded because the reasoning above still reads persuasive:**
+
+1. **It never mentions the LLM or embedding gateways, and its own priority-1 test needs both.**
+   `/search` calls `embed_one` — a *billed* call, per test, per CI run. As written, this phase would
+   have spent money nondeterministically and needed CI secrets. The fix (an in-process stub reached
+   through the existing base-URL seam, so zero production change) turned out to buy more than cost
+   avoidance: a **content-addressed** fake embedder scores an exact match at ~1.0 and unrelated text
+   at ~0.0, which is what makes "tenant B retrieved nothing" mean *the filter worked* rather than
+   *nothing cleared the floor*. Verified live: 0.9999992 vs -0.024.
+2. **It treats `crates/api/tests/` as creating a directory. It was a crate restructure.** `api` was
+   binary-only — no `lib.rs`, no `[lib]`, no dev-dependencies, and the router built inline in
+   `main()`. Nothing in `tests/` could import it. This was the largest single piece of the work.
+3. **D5's GitHub Actions `services:` cannot run this stack.** MinIO needs `command:` and `minio-init`
+   needs `entrypoint:`; `services:` supports neither. CI uses `docker compose up -d` with a readiness
+   loop. Related: D2 says "Postgres and Qdrant", but `AppState` cannot be constructed without all
+   five services, whatever a given test asserts.
+
+**One improvement over the design.** The break table listed "connect as `bot_flow`" as a one-time
+manual check. It is now a permanent runtime assertion (`guard_not_superuser`), because verifying it
+once leaves it re-breakable forever by anyone editing `.env`. This was the cheapest high-value change
+in the phase.
+
+**The break table was executed, and every row behaved.** Two findings worth keeping:
+
+- Swapping `tenant_tx` for the plain pool in `list_documents` is caught **only by the control**
+  assertion — RLS then denies tenant A too, so "B sees nothing" still holds. Exactly the half the
+  design says a naive test forgets, demonstrated rather than argued.
+- Adding `require_management()` to `/ask` — the trap CLAUDE.md says would be "discovered by tenants,
+  not by tests" — now fails CI in under a second. That is arguably the single highest-value assertion
+  in the suite.
+
+**One bug the break table found in the harness itself.** D4 prescribes per-test cleanup, and that is
+what was built — but `cleanup()` only runs when a test *passes*. Every deliberate break left its
+tenants' vectors stranded in the shared collection, permanently, because `/ingest` points carry
+random ids and no `document_id`. Four had accumulated before a post-run audit caught it (`7 → 7`
+points on the happy path looked fine; scrolling the payloads did not). The fix is a startup sweep of
+test tenants older than an hour — by age rather than by truncation, so it cannot corrupt a concurrent
+run. Worth recording as the phase's own small lesson: *the audit that found this was checking
+tenant ids, not counts.*
+
+**The design's claim that CLAUDE.md's "fatal-versus-retryable classification" entry is stale: verified
+true** (`common/src/embedding.rs:305-331`) and struck.

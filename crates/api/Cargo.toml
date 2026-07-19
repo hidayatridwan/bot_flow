@@ -29,3 +29,8 @@ eventsource-stream = "0.2"
 async-stream = "0.3"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 tower-http = { version = "0.6", features = ["cors"] }
+
+# The integration suite (`crates/api/tests/`). It is #[ignore]d — `cargo test` stays offline and
+# honest; `cargo test -- --ignored` needs `docker compose up -d` plus the bot_flow_test database.
+[dev-dependencies]
+tower = { workspace = true }

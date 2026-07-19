@@ -50,6 +50,10 @@ lets a client render them as it likes — or, like today's widget, not at all.
 
 Three independent layers, so a single mistake doesn't leak data:
 
+Layers 2 and 3 are no longer claims: `crates/api/tests/tenant_isolation.rs` asserts that one tenant
+can neither list, delete, nor *retrieve* another's data, and that the victim tenant still can — see
+[Running the integration suite](#running-the-integration-suite).
+
 1. **API key → tenant.** Keys are never stored raw, only as a SHA-256 hash.
 2. **Postgres RLS.** `documents` has `FORCE ROW LEVEL SECURITY`. The app connects as the
    non-superuser `app_user` (superusers bypass RLS), and each transaction sets
@@ -169,6 +173,12 @@ PARSER_SCRIPT=sidecar/parser.py
 ADMIN_API_KEY=<pick any long random string>
 SESSION_TTL_SECS=2592000         # login session lifetime; default 30 days
 RUST_LOG=info,api=debug
+
+# Optional. The integration suite derives both from the two URLs above by swapping the database
+# name for `bot_flow_test`; set them only to point somewhere else. The second MUST be app_user —
+# a superuser bypasses RLS and every isolation test would pass without testing anything.
+# TEST_DATABASE_URL=postgres://bot_flow:bot_flow@localhost:5432/bot_flow_test
+# TEST_APP_DATABASE_URL=postgres://app_user:app_user@localhost:5432/bot_flow_test
 ```
 
 Only `BIND_ADDR`, `RATE_LIMIT_PER_MINUTE`, `RAG_SCORE_THRESHOLD`, `SESSION_TTL_SECS`, `LLM_MODEL`,
@@ -279,6 +289,39 @@ Then start `cargo run -p api` and confirm it logs `dim=1536`. It recreates the c
 `tenant_id` keyword index *before* any ingest can happen — that ordering is load-bearing, because
 adding the index after data exists does not retroactively restructure Qdrant's HNSW graph. Re-upload
 your documents afterwards.
+
+### Running the integration suite
+
+Unit tests run offline; the integration suite needs the stack. Both are `cargo test`:
+
+```bash
+cargo test                      # unit tests — no services, no config, always works
+docker compose up -d            # all five: Postgres, Qdrant, MinIO, RabbitMQ, Redis
+./scripts/test-setup.sh         # creates the bot_flow_test database (idempotent)
+cargo test -- --ignored         # the integration suite
+```
+
+The suite is `#[ignore]`d so a bare `cargo test` stays honest for anyone without Docker — and CI runs
+that bare command *before* it starts any service, which is what actually keeps the promise true.
+A test that skipped itself when its service was missing would be worse than no test: it would turn
+"untested" into "green".
+
+**It needs no LLM or embedding key.** Both gateways are stubbed in-process, so the suite is free,
+deterministic and makes no billed call. The stub's embedder is content-addressed — the same string
+always yields the same vector — so an exact match scores ~1.0 and unrelated text ~0.0. That margin is
+the point: when a tenant retrieves nothing, it can only be the tenant filter, never a threshold.
+
+Two things it refuses to do, both deliberate:
+
+- **It will not run against `bot_flow`.** The database name must end in `_test`. These tests create
+  and delete tenants.
+- **It will not run as a superuser.** It asserts `NOT rolsuper` and aborts otherwise. Postgres
+  superusers bypass RLS entirely, so a suite on the migration role would assert cross-tenant denial,
+  pass, and have tested nothing at all. `TEST_DATABASE_URL` and `TEST_APP_DATABASE_URL` override the
+  derived URLs if you need them elsewhere; the second one must point at `app_user`.
+
+What it covers, and what it does not, is inventoried in CLAUDE.md — including one gap that is
+structural rather than merely deferred.
 
 ### Resetting the data
 

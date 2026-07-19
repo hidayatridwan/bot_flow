@@ -1,0 +1,123 @@
+name: CI
+
+# Report-only for now: no branch protection. Gating a workflow that has never passed on main is how
+# people learn to click "merge anyway" — turn on required checks once it has been green a few times.
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Honours rust-toolchain.toml (1.95.0) and caches the registry + target dir.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # DELIBERATELY BEFORE the services start. CLAUDE.md promises `cargo test` passes with no
+      # backing services running, so that a contributor without Docker is never punished. Running it
+      # here, on a machine where nothing is listening, is what actually enforces that promise —
+      # move this below `docker compose up` and the guarantee silently stops being checked.
+      - name: Unit tests (no services running)
+        run: cargo test --workspace
+
+      # `docker compose up`, NOT GitHub Actions `services:` — MinIO needs `command: server /data ...`
+      # and minio-init needs an `entrypoint:` to create the bucket and the AMQP event binding, and
+      # `services:` supports neither.
+      - name: Start backing services
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          set -euo pipefail
+          echo "==> postgres"
+          for i in $(seq 1 60); do
+            docker compose exec -T postgres pg_isready -U bot_flow -d bot_flow && break
+            sleep 2
+          done
+          echo "==> qdrant"
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:6333/readyz && break || true
+            sleep 2
+          done
+          echo "==> minio"
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:9000/minio/health/live && break || true
+            sleep 2
+          done
+          echo "==> rabbitmq"
+          for i in $(seq 1 60); do
+            docker compose exec -T rabbitmq rabbitmq-diagnostics -q ping && break || true
+            sleep 2
+          done
+          # minio-init is one-shot: it creates the bucket and binds the AMQP event target. Uploads
+          # notify nothing until it has exited, so waiting on the other five is not enough.
+          echo "==> minio-init"
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Status}}' bot_flow-minio-init 2>/dev/null || echo missing)
+            [ "$status" = "exited" ] && break
+            sleep 2
+          done
+          docker compose ps
+
+      - name: Create the test database
+        run: ./scripts/test-setup.sh
+
+      # No secrets. Both gateways are stubbed in-process (tests/common/gateway.rs), so the suite
+      # makes no billed /embeddings or /chat/completions call and needs no LLM key to run.
+      - name: Integration tests
+        env:
+          DATABASE_URL: postgres://bot_flow:bot_flow@localhost:5432/bot_flow
+          APP_DATABASE_URL: postgres://app_user:app_user@localhost:5432/bot_flow
+          TEST_DATABASE_URL: postgres://bot_flow:bot_flow@localhost:5432/bot_flow_test
+          # app_user is created by migration 0005. Connecting as anything superuser-ish here would
+          # bypass RLS and quietly make every isolation assertion meaningless — the harness asserts
+          # NOT rolsuper and aborts, but do not rely on that to catch a careless edit to this line.
+          TEST_APP_DATABASE_URL: postgres://app_user:app_user@localhost:5432/bot_flow_test
+          QDRANT_URL: http://localhost:6334
+          RABBITMQ_URL: amqp://bot_flow:bot_flow@localhost:5672/%2f
+          REDIS_URL: redis://localhost:6379
+          S3_ENDPOINT: http://localhost:9000
+          S3_ACCESS_KEY: minio
+          S3_SECRET_KEY: minio12345
+          S3_BUCKET: documents
+          S3_REGION: us-east-1
+        run: cargo test --workspace -- --ignored
+
+      - name: Service logs on failure
+        if: failure()
+        run: docker compose logs --tail=100
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run test
+
+      - run: bun run check
+
+      # NOT `bun run lint`. It is `prettier --check . && eslint .`, and prettier fails on ~208
+      # vendored lib/components/ui/ files that predate the config — so the command exits non-zero on
+      # a clean checkout and eslint never runs behind it. Gating every PR on that backlog would
+      # teach everyone to ignore a red CI. Add it here once the vendored files are dealt with
+      # separately; do not "fix" this by deleting the comment.

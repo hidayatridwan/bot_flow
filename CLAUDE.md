@@ -26,7 +26,8 @@ gateway. The LLM is any OpenAI-compatible `/chat/completions` endpoint.
 docker compose up -d      # five backing services (the binaries run on the host)
 cargo run -p api          # http://localhost:3000 — also runs DB migrations on boot
 cargo run -p worker       # ingestion consumer
-cargo test                # inline #[cfg(test)] unit tests; no integration suite
+cargo test                # inline #[cfg(test)] unit tests — offline, no services needed
+cargo test -- --ignored   # the integration suite: needs `docker compose up -d` (phase 9)
 cargo clippy && cargo fmt # stock defaults, no config files
 ```
 
@@ -331,6 +332,14 @@ zero rows, not everything. It fails closed.
 runtime connects as `app_user`. The admin pool exists to run migrations at API startup and is closed
 immediately afterwards, so it cannot be reached for by a well-meaning refactor.
 
+**The integration harness connects as `app_user` and *proves* it, on every run.** This belongs here
+rather than in the invariant list because it is a property of the tests, not of the product — but it
+is what makes the tests of everything above worth anything. `guard_not_superuser` asserts
+`NOT rolsuper` and aborts before the first assertion. Without it, a harness pointed at the migration
+role would assert "tenant B cannot see tenant A's document", pass, and have tested **nothing**,
+because the query it ran was never subject to the policy. Verified once by hand, that stays
+re-breakable forever by anyone editing `.env`; asserted every run, it does not.
+
 **The corollary trap:** a cross-tenant `UPDATE` under RLS **does not error — it matches zero rows and
 reports success.** Any maintenance operation iterates tenant by tenant, as `reaper.rs` does. Silence
 is not confirmation. When a query mysteriously affects nothing, suspect RLS before your `WHERE`.
@@ -370,6 +379,12 @@ Each of these exists in, or nearly slipped into, this codebase.
 | `.timeout()` a client whose response body is a **stream** | `read_timeout` for the stall; a per-request total only on the non-streaming calls | reqwest's client `timeout` is a *total deadline including the body*, and `answer_stream` **is** a body. It therefore caps answer length, not gateway hangs — and the truncated turn is then dropped from history by invariant 7, so the user loses the answer *and* the record of asking. Exactly the `client.ts`-vs-`stream.ts` trap two rows down, one layer lower and in Rust (invariant 28) |
 | Reuse `ASK_TIMEOUT_MS` for the API's gateway bounds | Named constants in `llm.rs` / `embedding.rs` | It is a **`web/` env var, in milliseconds**, bounding the BFF's own browser — `Duration::from_secs` on it is 33 hours. The API's client is the `pk_` widget, which has no BFF in front of it. Different bound, different client, different file |
 | Put one timeout on `EmbeddingClient` and call it done | Size it for a full `EMBED_BATCH`, not for a question | It is shared by the **api and the worker**. A bound tight enough for a one-input question embed fails a 96-input ingest, and a failed ingest is `Transport` → retryable → five redeliveries → dead-lettered. The tight bound belongs to `read_timeout`, which fires on silence regardless of batch size |
+| Point an integration test at `bot_flow` because it is already in `.env` | `bot_flow_test`; the harness refuses any name not ending `_test` | The suite creates and deletes tenants and documents. Sharing the dev database is one truncation away from a bad afternoon, and nothing would warn you first |
+| Connect the harness as `bot_flow` because it is the URL that works | `app_user` — and the harness asserts `NOT rolsuper` | Superusers bypass RLS **entirely**, so every isolation assertion passes without testing anything. Green, meaningless, permanently reassuring. This is the single reason the guard exists |
+| Assert only that tenant B sees nothing | Also assert tenant A still does | A broken embedding stub, a mis-set score floor, or a missing tenant context makes *everyone* see nothing — and the denial assertion passes on it. Verified: swapping `tenant_tx` for the plain pool in `list_documents` is caught **only** by the control, because RLS then denies A too |
+| Drop the `lapin::Connection` returned by `build_state` | Bind it (`let (state, _amqp) = ..`) for the state's whole life | It closes the `Channel` inside `AppState`, and the only symptom anywhere is `/health` reporting rabbitmq down. `build_state` returns it rather than hiding it in `main` so the compiler carries half of this |
+| Let a test skip itself when its service is missing | Fail, or do not run it at all | A silent skip turns "untested" into "green" — the same lie as the superuser trap, and worse than a visible gap |
+| Rely on a test's own `cleanup()` to keep the Qdrant collection clean | Also sweep stale test tenants at startup | `cleanup()` runs only when a test **passes**. A panicking test — i.e. every failing one, and every break-verification — strands its points forever, because `/ingest` writes them with random ids and no `document_id` and nothing in the product can remove them. Observed: this suite's own break table leaked four tenants |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
 The worker classifies these into fatal-vs-retryable. It is a cross-language contract and neither side
@@ -423,7 +438,11 @@ writing the code.
 | --- | --- |
 | Object-key contract (the upload boundary) — densest tests in the repo | `crates/common/src/key.rs` |
 | Embedding client, `EMBEDDING_DIM`, batching, `EmbedError` — shared by both binaries | `crates/common/src/embedding.rs` |
-| Routes, CORS layer, RabbitMQ connect | `crates/api/src/main.rs` |
+| Composition root — `app()` (routes + CORS), `build_state()` (every dependency; returns the amqp `Connection` so it cannot be dropped), `run_migrations()`. `main.rs` is a ~25-line shell over it | `crates/api/src/lib.rs` |
+| The integration harness — test-database bring-up, the two guards (`_test` name, `NOT rolsuper`), the `TestApp` fixture and its Qdrant teardown | `crates/api/tests/common/mod.rs` |
+| The fake LLM/embedding gateway, and the deterministic content-addressed embedder that makes a denial assertion unambiguous | `crates/api/tests/common/gateway.rs` |
+| Cross-tenant denial (both mechanisms, each with its control) and the auth matrix | `crates/api/tests/{tenant_isolation,auth_matrix}.rs` |
+| CI — and why `cargo test` runs *before* the services start, and why `bun run lint` is absent | `.github/workflows/ci.yml` |
 | Handlers, Qdrant search, SSE stream | `crates/api/src/handlers.rs` |
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
 | `AuthTenant` / `AdminAuth` / `SessionAuth` / `Actor`, `hash_key`, `require_secret` vs `require_management`, the `sess_` prefix dispatch, `normalize_origin` (next to the `Origin` check it must agree with), key + session token gen | `crates/api/src/auth.rs` |
@@ -507,11 +526,20 @@ Honest inventory. Each entry states the impact, not merely the fact.
 - **`/auth/keys` is unmetered** — a logged-in session can mint unbounded keys. It is session-gated and
   does not multiply LLM spend (`rate_limit::check` buckets on `tenant_id`), so this is an audit and
   revocation-surface problem rather than a cost one. The last unmetered route that creates state.
-- **The isolation guarantee is untested.** No automated test asserts that RLS actually denies a
-  cross-tenant read. Invariant 1 is the system's most important promise and it rests on code review
-  alone. There is no CI and no integration suite; tests are unit tests over pure functions. Highest-
-  value missing tests, in order: cross-tenant denial; concurrent claim of one document by two workers;
-  origin rejection for `pk_` keys; correct fatal-versus-retryable classification.
+- **The isolation guarantee is tested now — here is exactly how far that goes.** Phase 9 added
+  `crates/api/tests/` and `.github/workflows/ci.yml`. **Covered:** cross-tenant denial on both
+  mechanisms (RLS row reads/deletes, *and* the Qdrant tenant filter, each with the control assertion
+  that the victim tenant still sees its own data); the full auth matrix — `pk_` refused by
+  `require_management()`, `pk_` admitted to `/ask`, origin rejection including an absent `Origin`,
+  `sess_` where invariant 23 says it belongs, and 401-vs-403 kept distinct. Each was verified to go
+  **red** against a deliberate break before being trusted.
+  **Not covered, and worth knowing precisely:** concurrent claim of one document by two workers and
+  the deletion sweep (both worker-side — phase 9b); `/ask/stream`; retrieval *quality*, which this
+  phase says nothing about. And one gap that is structural rather than deferred — removing the
+  `tenant_id` leg of `delete_document_stores`' Qdrant filter turns **nothing** red, because
+  `document_id` is a globally-unique UUID and no test can construct a collision. That filter is
+  layered defence, and the suite cannot prove it; a test that *could* would be asserting on internals.
+  CI is **report-only** — no branch protection yet.
 - **Vector storage has no migration path.** Changing the embedding model, its dimension, or the
   chunking parameters invalidates every stored vector, and there is no rollback — only recreating the
   collection and re-indexing every document of every tenant. A **partially** re-indexed collection
@@ -545,10 +573,28 @@ Honest inventory. Each entry states the impact, not merely the fact.
 - **Do not restate values this file does not own.** Chunk size and overlap, the relevance floor, the
   presign TTL, the upload cap, history depth, ports and the full `.env` block live in `README.md` and
   in the code. Duplicating them is how they drift. Point at the constant; don't copy it.
-- Tests must pass with **no backing services running** — inline `#[cfg(test)]` in Rust, `*.test.ts`
-  beside the source in `web/`. Anything needing Postgres or Qdrant belongs in `crates/<crate>/tests/`,
-  which does not exist yet — discuss before introducing one. Do not widen visibility just to test
-  something.
+- **`cargo test` must pass with no backing services running** — inline `#[cfg(test)]` in Rust,
+  `*.test.ts` beside the source in `web/`. That promise is intact and is now *enforced*: CI runs
+  `cargo test --workspace` **before** it starts docker compose, deliberately, so a contributor
+  without Docker is never punished. Move that step below the services and the guarantee silently
+  stops being checked.
+  The integration suite (phase 9) lives in `crates/api/tests/`, is `#[ignore]`d, and runs under
+  `cargo test -- --ignored` with `docker compose up -d` plus `./scripts/test-setup.sh`. It needs all
+  five services but **no LLM or embedding key**: both gateways are stubbed in-process.
+  **A test that skips when its service is absent is forbidden.** Fail, or do not run at all. A silent
+  skip turns "untested" into "green", which is the same lie as the superuser trap below — and worse
+  than a visible gap, because it is permanently reassuring.
+- **Where the seam is real API, split the lib; where it would exist only for the test, test
+  in-crate.** One rule, applied twice, and the asymmetry is deliberate rather than untidy.
+  `crates/api` has a `lib.rs` because `app` / `build_state` / `run_migrations` / `Config` /
+  `AppState` are the composition root and **`main` is the first consumer of each** — the binary and
+  the tests want the same seam. `crates/worker` has none: its reaper's seams (`sweep_one`,
+  `finish_deletions`, `PROCESSING_LEASE`) are private, and making them `pub` would buy nothing but
+  the test. So worker integration tests (phase 9b) go in-crate under `#[cfg(test)]`.
+  **Do not widen visibility just to test something.** No handler, gate or query is `pub` — the tests
+  reach them through HTTP, which is the point of `tests/` over an in-crate module. If a *sixth* item
+  in `api` needs widening, the lib split has stopped paying: fall back to an in-crate module rather
+  than widening further.
 - **Verify against the running system, not against this file.** Every claim here was true once; the
   ones that quietly stopped being true are the expensive ones, and they do not announce themselves.
   Recent examples, all found by looking rather than reasoning: the API was streaming the LLM
