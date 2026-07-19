@@ -330,6 +330,62 @@ the product, and one that fails silently and in the tenant's favour exactly neve
 is absent there, like `document_id` — the same debt surfacing in the same place, and one more reason
 that path is not a supported one.
 
+### D13 — does every chunk carry its document's title, injected into the embedded text?
+
+A chunk today is a naked 800-character window. *"Led the payments migration"* embeds identically
+whether it came from a CV or an incident report, and the "fragmented identity" that follows is real:
+the passage cannot tell the embedding model, or the LLM, what it is part of.
+
+**Recommendation: prepend the document title to each chunk's embedded text — and *only* the title.**
+
+**What is actually available, checked rather than assumed.** `filename_hint` is already threaded into
+the worker's `ingest()`, so the title costs nothing to obtain. Section and heading context is a
+different story: `.md` and `.txt` are read verbatim so markdown headers survive as literal text, but
+**`sidecar/parser.py` runs pypdf's `extract_text()` per page and joins with `"\n"` — for a PDF there
+are no headings, no sections and no page markers to inject.** A `[Section: Work Experience]` prefix is
+therefore unavailable for exactly the document type that most wants it. Heading-aware chunking is a
+sidecar change, it is the same prerequisite page citations need, and it stays deferred.
+
+**Two objections that must be answered before this is called free.**
+
+*It is not zero-cost in the sense that matters.* It is zero **migration** cost — the re-index is
+already being paid for. It is not zero **measurement** cost: shipping it in the same re-index as the
+new chunker makes the delta unattributable, which is precisely the failure D7's write-now/query-later
+split exists to prevent. One re-index may carry two changes only if the eval can separate them
+beforehand.
+
+*Which it can, and this reframes what the meter is for.* The eval of D1 builds its own index over a
+committed fixture corpus, so **variants can compete on the bench before any production re-index
+happens** — chunker alone, chunker + title, title alone. The instrument is not merely a before/after
+gate on production; it is where an irreversible decision gets made reversibly. **So D13 ships only if
+it earns its place on the bench**, and if it does not, the re-index carries the chunker alone.
+
+*It works against D14, by construction.* Prefixing every chunk of a document with the same string
+raises the similarity of those chunks **to each other**, which makes "all three results came from one
+document" more likely, not less — the failure D14 exists to bound. The two decisions are coupled and
+should be measured together, not separately.
+
+**Risk:** the title is baked into the vector, so it can never be corrected without a re-embed — a
+harder form of the staleness that made me reject storing `filename` as a payload field in D5. A
+filename is also frequently junk (`scan_0012.pdf`), and injecting junk into every chunk of a document
+is a uniform bias with no upside. If titles turn out to be mostly noise in practice, this is the
+decision to drop.
+
+### D14 — is the number of chunks from any one document capped?
+
+With `limit = 3` and no constraint, a single verbose document can occupy every slot — and the answer
+may live in the one that was crowded out. The user never learns a second source existed.
+
+**Recommendation: cap chunks per `document_id` (two, at `limit = 3`) applied during the over-fetch of
+D6, and measure it rather than assume it.** It is query-side, needs no migration, and rides on the
+`document_id` that is already in the payload.
+
+The tension is real in both directions and the eval settles it: a document that genuinely answers a
+question three times over is *correctly* dominant, and capping it discards a true passage for a
+diverse but worse one. Recall@3 on the fixture corpus tells us which effect is larger. Note this is
+the cheap half of the family — MMR and full diversity re-ranking are deferred (D10), and this bounds
+the specific pathology without adopting a scoring scheme.
+
 ## Verification
 
 Phase 9's principle was *"a passing test proves nothing until you have watched it fail."* The analogue
@@ -353,16 +409,23 @@ baseline is believed:
 If a sabotage leaves a number unmoved, that metric is decoration and the eval is wrong before the
 chunker is touched.
 
-**Then the baseline, recorded here before any change ships**, and re-measured after:
+**Then the bench.** This is the part worth stating plainly, because it changes what the eval is *for*:
+it builds its own index over the committed fixture corpus, so **a variant can be measured without
+touching production at all.** The irreversible decision is which recipe the migration carries, and the
+bench is where that decision gets made reversibly — every row below is a candidate, not a plan.
 
 | Measurement | recall@3 | recall@10 | MRR | Notes |
 | --- | --- | --- | --- | --- |
-| Baseline — 800/100 fixed window, dense only | *TBD* | *TBD* | *TBD* | pre-change, on the fixture corpus |
-| Phase 10 — boundary-aware chunking + metadata | *TBD* | *TBD* | *TBD* | one variable |
+| Baseline — 800/100 fixed window, dense only | *TBD* | *TBD* | *TBD* | pre-change, the number everything is judged against |
+| Boundary-aware chunking (D3) | *TBD* | *TBD* | *TBD* | the phase's primary variable |
+| …+ title injection (D13) | *TBD* | *TBD* | *TBD* | earns its place or is dropped |
+| …+ per-document cap (D14) | *TBD* | *TBD* | *TBD* | measured with D13, since they pull against each other |
+| **Shipped recipe → phase 10 re-index** | *TBD* | *TBD* | *TBD* | whichever of the above won |
 | Phase 10b — hybrid + RRF | *TBD* | *TBD* | *TBD* | same index, query-side only |
 
 **"Better" is defined before the numbers exist, so it cannot be defined by them:** phase 10 ships only
-if recall@3 improves and neither other metric regresses. **A wash is a legitimate outcome and must be
+if recall@3 improves and neither other metric regresses. A variant that does not clear that bar is not
+carried by the migration merely because it was already written. **A wash is a legitimate outcome and must be
 reported as one** — an irreversible migration that bought nothing is worth knowing about, and it is
 exactly the result a motivated reader will be tempted to round up.
 
@@ -384,11 +447,39 @@ change that quietly degrades retrieval fails a command rather than a customer. I
 | Assume the re-index covered everything | Audit point counts per tenant, per collection | A partially re-indexed collection degrades quietly with no error — and `/ingest` points cannot be covered at all |
 | Leave `created_at` out because nothing reads it yet | Write it in this re-index anyway (D12) | Adding a payload field later is a *second* full migration. The field is what makes recency expressible at all — without it, superseded-policy arbitration cannot even be prototyped |
 | Assume uploading a correction supersedes the original | Delete the stale document | Nothing in the system relates two documents. A correction is an additional voice, not a replacement, and the older one can outrank it — see the worked example |
+| Boost a score by a constant for recency, freshness or any metadata | Act on rank or filter, never on the similarity | `RAG_SCORE_THRESHOLD` reads that number. A `+0.1` boost silently moves the grounding floor, and invariant 4 quietly starts meaning something else — D8's error in a new costume |
+| Call a payload or text change "free" because the re-index is already happening | Free of *migration* cost; not free of *measurement* cost | Two changes in one re-index make the delta unattributable. Let variants compete on the fixture bench first, then ship the winner |
+| Inject section or page headings into chunks | Title only, for now | `sidecar/parser.py` flattens a PDF to page text joined by `"\n"` — for the document type that most needs sections, there are none to inject. Markdown keeps its headers; PDFs do not |
 
-**Left standing, deliberately:** page-aware PDF parsing (a sidecar change, and the true prerequisite for
-page citations); adjacent-chunk merging and MMR de-duplication (both become *possible* once
-`chunk_index` and offsets exist, neither is built here); reranking (D10); LLM-judge answer scoring (D1);
-query expansion, and the serial rewrite round-trip on every follow-up turn; per-tenant threshold tuning.
+**Considered for this phase and deliberately deferred — four techniques worth naming, because three of
+them get *cheaper* as a result of decisions taken here, and one is a trap:**
+
+- **Small-to-big / contextual retrieval** (embed the small chunk, hand the LLM its surrounding
+  context). The strongest of the four, and D5 all but delivers it: with `chunk_index` and
+  `document_id` in the payload, a hit's neighbours are one filtered fetch away, so expansion becomes a
+  **query-side change needing no migration**. That is the argument for deferring it rather than
+  cramming it in — it costs nothing to wait, and waiting keeps the measurement clean.
+- **Document-summary / multi-vector indexing** (a summary vector per document, searched first). Real
+  architecture, not a tweak: an LLM call per document at ingest, a second index, and a two-stage
+  query. It adds a per-document billed call to a pipeline that is already billed per chunk, and the
+  summaries are nondeterministic. Revisit if the eval shows cross-document noise dominating.
+- **HyDE / query expansion** (embed a hypothetical answer rather than the question). Plausible here —
+  our queries are short and our corpora formal — but it puts an LLM round-trip in front of **every**
+  query, where today's rewrite at least skips the first turn. Query-side, so no migration: it can be
+  measured on the bench whenever we like, and should be, before it is believed.
+- **Recency boosting by adding to the score** — *the trap.* `+0.1` to a cosine is D8's error in a new
+  costume: `RAG_SCORE_THRESHOLD` reads that number, so boosting silently moves the grounding floor and
+  invariant 4 starts meaning something else. It also needs intent detection to know that "latest"
+  was asked for. If recency is ever used it must act on **rank or filter, never on the similarity
+  score** — which is why D12 stores the field and rules on nothing.
+
+**Also left standing, deliberately:** page-aware PDF parsing (a sidecar change, and the true
+prerequisite for both page citations and D13's section context); adjacent-chunk merging and MMR
+de-duplication (both become *possible* once `chunk_index` and offsets exist, neither is built here);
+reranking (D10); LLM-judge answer scoring (D1); the serial rewrite round-trip on every follow-up turn;
+per-tenant threshold tuning; and heterogeneous-content chunking — one strategy is applied to a PDF
+report and an email alike, which the fixture corpus should at least *expose* even though this phase
+does not fix it.
 **And every use of `created_at`** — D12 stores it and reads it nowhere. Temporal tie-breaking, recency
 boosting, a sources-disagree signal and document supersession are all deliberately unbuilt; the field
 exists so that none of them costs a migration, not because any of them is decided.
@@ -441,3 +532,12 @@ same commit."*
    says yes; an old FAQ entry versus a recently uploaded invoice says no. The honest answer may be that
    recency should surface a *conflict* to the user rather than silently resolve one — which is a
    product decision, not a retrieval one, and is why D12 stores the field and rules on nothing.
+7. **Are filenames good enough to be worth injecting (D13)?** The technique assumes titles carry
+   signal. Real uploads are `scan_0012.pdf` and `Document (3).pdf` as often as `refund-policy.md`, and
+   a uniform junk prefix on every chunk of a document is bias with no upside. The bench answers it for
+   the fixture corpus; whether that generalises to what tenants actually name their files is a
+   question the fixture corpus is, by construction, the wrong instrument for.
+8. **How much can one re-index reasonably carry?** D3, D5, D12 and possibly D13 all ride the same
+   migration because the migration is the expensive part. That logic has no natural stopping point,
+   and "while we're in there" is how an irreversible change acquires four unmeasured passengers. The
+   bench is the discipline that answers this — but it only works if the answer is allowed to be *no*.
