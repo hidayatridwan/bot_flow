@@ -24,6 +24,9 @@ pub async fn check(state: &AppState, tenant_id: &str) -> Result<(), AppError> {
     }
 
     if count > state.rate_limit_per_minute {
+        // Counted, not labelled by tenant (invariant 30). Rising alongside `ask_total` is the shape
+        // of a tenant pinning their own bucket; `GET /admin/ops/tenants` says which one, live.
+        crate::metrics::Metrics::incr(&state.metrics.rate_limited_total);
         return Err(AppError::client(
             StatusCode::TOO_MANY_REQUESTS,
             "rate limit exceeded, slow down",

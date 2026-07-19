@@ -23,5 +23,14 @@ pub struct AppState {
     pub redis: redis::aio::ConnectionManager,
     pub rate_limit_per_minute: u64,
     pub admin_api_key: String,
+    pub metrics_token: Option<String>,
+    /// One field, not eleven: `AppState` is already large enough.
+    pub metrics: std::sync::Arc<crate::metrics::Metrics>,
+    /// The connection, alongside the channel, because reading queue depth needs a **throwaway**
+    /// channel. A passive declare of a queue that does not exist is a channel-level NOT_FOUND and
+    /// the broker closes the channel — so doing it on `amqp` would kill the publishing channel, and
+    /// the only symptom anywhere would be /health reporting rabbitmq down. That is the
+    /// `lapin::Connection` trap one layer up.
+    pub amqp_conn: std::sync::Arc<lapin::Connection>,
     pub session_ttl_secs: i64,
 }

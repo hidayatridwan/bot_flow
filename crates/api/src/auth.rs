@@ -196,6 +196,43 @@ impl FromRequestParts<AppState> for AdminAuth {
     }
 }
 
+/// Guards `GET /metrics`. Mirrors [`AdminAuth`] deliberately — a second comparison style here would
+/// be a divergence introduced by accident; if constant-time comparison is ever wanted, it applies to
+/// both or neither.
+///
+/// The route is only registered when `METRICS_TOKEN` is set, so reaching this extractor at all means
+/// a token is configured; `unwrap_or_default` is the belt to that braces and refuses an empty one.
+pub struct MetricsAuth;
+
+impl FromRequestParts<AppState> for MetricsAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let configured = state.metrics_token.as_deref().unwrap_or_default();
+        let token = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::trim)
+            .ok_or_else(|| {
+                AppError::client(StatusCode::UNAUTHORIZED, "missing authorization header")
+            })?;
+
+        if !configured.is_empty() && token == configured {
+            Ok(MetricsAuth)
+        } else {
+            Err(AppError::client(
+                StatusCode::UNAUTHORIZED,
+                "invalid metrics token",
+            ))
+        }
+    }
+}
+
 /// Authenticates a logged-in human via a session token, for the `/auth/*` dashboard routes.
 /// Resolves the token to its account and tenant. Because it yields a `tenant_id`, a session-authed
 /// handler can drive `db::tenant_tx()` exactly like `AuthTenant` — RLS applies unchanged.

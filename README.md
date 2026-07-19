@@ -90,6 +90,8 @@ weakest one already reaches, which is why the chat routes admit all three.
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/health` | none | Reachability of all five dependencies; `degraded` if any is down |
+| `GET` | `/metrics` | metrics token | Prometheus exposition. **Not registered at all unless `METRICS_TOKEN` is set.** Aggregate only — no metric carries a tenant id (invariant 30) |
+| `GET` | `/admin/ops/tenants` | admin key | Per-tenant activity, read live from Postgres. This is the "which tenant" answer that `/metrics` deliberately cannot give |
 | `GET` | `/widget.js` | none | The embeddable widget, served from the binary. `Cache-Control: no-cache` + a strong `ETag`, so a fix reaches every visitor on the next restart |
 | `POST` | `/admin/tenants` | admin key | Creates a tenant, returns its first `sk_` key |
 | `POST` | `/admin/tenants/{tenant_id}/keys` | admin key | Mints a `secret` or `publishable` key |
@@ -176,6 +178,9 @@ PARSER_PYTHON=sidecar/.venv/bin/python
 PARSER_SCRIPT=sidecar/parser.py
 
 ADMIN_API_KEY=<pick any long random string>
+# Optional. Guards GET /metrics; UNSET means the route is not registered at all (a 404, not a 401).
+# Must NOT be ADMIN_API_KEY — that key can erase a tenant, and a scrape config is a widely-read file.
+# METRICS_TOKEN=<a different long random string>
 SESSION_TTL_SECS=2592000         # login session lifetime; default 30 days
 RUST_LOG=info,api=debug
 
@@ -381,6 +386,29 @@ collection 'documents' created (dim=1536, cosine) + tenant_id index
 
 A full wipe also invalidates your `sk_`/`pk_` keys; re-create a tenant to mint new ones (the script
 prints the exact curl).
+
+### Backups, and getting back
+
+```bash
+./scripts/backup.sh                 # Postgres + MinIO -> ./backups/<UTC timestamp>/
+./scripts/restore.sh backups/<ts>   # destroys current state and replaces it
+```
+
+**Qdrant is deliberately not backed up.** It is derived data — `cargo run -p worker -- reindex`
+rebuilds it from MinIO objects and Postgres rows. That halves the backup surface, and the cost is
+stated plainly: recovery means a full, billed re-embed of every chunk, and pre-phase-11 `/ingest`
+points cannot be rebuilt at all.
+
+So a restore is **not finished when the script exits**. Restart the API (it recreates the collection
+at startup — a running process will not notice its collection vanished), stop the worker, run
+`reindex`, then restart the worker. The script prints this.
+
+**Then prove it by asking a real question.** Row counts do not prove a restore: one with perfect
+counts and an empty collection refuses everything while looking healthy. That end-to-end check is
+the whole difference between a backup and a hope — see
+[`doc/feature/phase-13-observability.md`](doc/feature/phase-13-observability.md) for the drill as run.
+
+Not a backup *strategy*: manual, local, unencrypted, unrotated, no PITR, no offsite copy.
 
 ### Local dashboards
 

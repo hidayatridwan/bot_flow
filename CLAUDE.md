@@ -30,6 +30,8 @@ cargo run -p worker       # ingestion consumer
 cargo test                # inline #[cfg(test)] unit tests — offline, no services needed
 cargo test -- --ignored   # the integration suite: needs `docker compose up -d` (phase 9)
 cargo run -p eval         # the retrieval bench: real, billed embeddings; own collection (phase 10)
+./scripts/backup.sh       # Postgres + MinIO. Qdrant is derived — `worker reindex` rebuilds it
+./scripts/restore.sh DIR  # destroys current state; restart the api, then reindex (phase 13)
 cargo clippy && cargo fmt # stock defaults, no config files
 ```
 
@@ -321,10 +323,39 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     **`erasures` has no foreign key to `tenants` and no RLS, deliberately.** Every neighbouring table
     cascades on tenant deletion; an audit row that did the same would be destroyed by the erasure it
     records, in the same statement, and the destruction would look like diligence.
+    **Any new store that retains tenant identity is inside this invariant's scope** and must either
+    be erasable or must not hold the identity. Invariant 30 is that rule applied to the first such
+    candidate — a metrics backend — and it chose the second option.
     Still not promised: turns written before phase 12 carry no provenance and cannot be found; there
     is no retention policy; the audit is a table an operator can edit, not a tamper-evident log; and
     `purge-unattributed` writes no audit row. Calling this "GDPR compliant" would be the kind of
     claim this file exists to prevent.
+
+30. **No metric carries a tenant identifier.** A Prometheus series labelled `tenant="acme"` is a
+    **fourth store**, outside every erasure guarantee invariant 29 makes — and it is the one store
+    that cannot be fixed later. Prometheus is *designed* not to be deleted from: the admin delete
+    API is off by default, a delete is a tombstone until compaction, and a remote-write copy
+    (Thanos, Mimir, a vendor) may have no delete path you control at all. `DELETE /admin/tenants/{id}`
+    returns counts as evidence of what it removed; with a tenant label it would be returning evidence
+    for three stores while silently omitting a fourth. That is invariant 29's own failure mode —
+    a partial erasure that looks like diligence.
+    Three lesser reasons, each sufficient on its own: a tenant slug is customer-authored, and metrics
+    are routinely shipped to a monitoring vendor and read by a wider audience than the database ever
+    is; series are never garbage-collected on tenant deletion, so cardinality grows with the customer
+    list forever; and `/metrics` would become an enumerable tenant registry for anyone with scrape
+    access.
+    **The rule that enforces this mechanically: every label value is a variant of a closed enum or a
+    `const`, never a runtime string.** That single rule also keeps invariant 16 out of the label
+    space — an error body as a label value is invariant 16 inverted *and* a cardinality bomb in one
+    move — and it is checkable by reading the code rather than the data.
+    **"Which tenant?" is `GET /admin/ops/tenants`**, read live from Postgres. It is safe precisely
+    because it *retains nothing*: the answer is always current, needs no retention policy, and a
+    tenant erased by invariant 29 vanishes from it in the same statement, with no extra code. Time
+    series answer *"is something wrong"*; the live query answers *"who"*. The cost, accepted
+    knowingly: you cannot ask who caused last Tuesday's spike, only who is causing this one.
+    Hashing or pseudonymising the tenant id does **not** satisfy this. A stable pseudonym still
+    survives erasure and still correlates with the live database; it is the same store wearing a
+    smaller hat.
 
 **Gateways**
 
@@ -434,6 +465,18 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Pick `RAG_SCORE_THRESHOLD` by reasoning about it | Sweep it on the bench | Every value in this repo's history was wrong: 0.70 (E5-era) refuses everything, 0.35 silently drops 4.5% of answers. 0.25 is the highest floor that costs no recall — and it was only knowable by measuring |
 | Change the chunker, the model or the payload in place | Bump `common::COLLECTION` | `ensure_collection` early-returns when the collection exists, so an in-place change **silently does not happen**. The version is also this system's only rollback: the old collection stays queryable while the new one fills |
 | Trust `sqlx::migrate!` to notice a new migration file | Rebuild the crate that embeds it (touch a source file, or `cargo clean -p worker`) | It is a **compile-time** read of a directory, exactly like `include_str!` for `widget.js`. The worker embeds `../api/migrations`; adding `0013` and running `cargo test --workspace` failed with `VersionMissing(13)` because the worker binary still held the old set. The database was ahead of the binary, and the error names the version rather than the cause |
+| Label a metric with `tenant` | Aggregate only; `GET /admin/ops/tenants` for attribution | Invariant 30. A TSDB is a fourth store the erasure saga cannot reach, is designed not to be deleted from, and its series outlive the tenant. Hashing the id does not help — a stable pseudonym survives erasure too |
+| Scrape `/metrics` with `ADMIN_API_KEY` | A separate `METRICS_TOKEN`; no token means no route | The admin key can **erase a tenant** (phase 12), and a scrape config is a low-trust, widely-readable artifact. Unset means the route is not registered at all — an endpoint that refuses still confirms it exists |
+| Read gauges with `SELECT count(*) FROM documents` on the app pool | `metrics_document_counts()` (`SECURITY DEFINER`, aggregates only) | `documents` is RLS-FORCED and the API is `app_user`: it matches zero rows and *reports success*. Every gauge reads 0 and the dashboard is permanently, beautifully green — in the one endpoint whose job is to say something is wrong |
+| Add a `tenant_id` column to `metrics_document_counts()` | Keep the return type identity-free | It bypasses RLS, and the absence of identity in its **signature** is the only thing that makes that safe. Adding a column turns a metrics helper into a cross-tenant read path, and every caller still looks correct |
+| Passive-declare a queue on `state.amqp` | Open a throwaway channel from `amqp_conn` | A `NOT_FOUND` closes the channel, and the only symptom is `/health` reporting rabbitmq down — the `lapin::Connection` trap one layer up. One scrape of a fresh deployment would break publishing |
+| Report `0` for a queue you could not read | Emit no series at all | A `0` that means "I could not ask" is indistinguishable from a dead worker, and pages someone on a broker hiccup. `absent()` handles the missing case |
+| Add a latency histogram to `metrics.rs` | Take the `metrics` crate instead | Hand-rolled `_bucket`/`le` semantics is where 30 lines becomes 150, and where being subtly wrong yields plausible numbers — this system's characteristic failure mode |
+| Back up MinIO before Postgres | Postgres first, always | Reverse it and a document uploaded mid-backup restores as a **row with no object** — a `ready` document whose bytes are gone, which fails `worker reindex`. The stated order yields a harmless orphan object instead |
+| `pg_dump` and call the backup complete | `pg_dumpall --roles-only` beside it | Roles are cluster-level. Without `app_user`, restoring into a fresh cluster fails on the RLS grants that name it |
+| `docker cp` MinIO's `/data` | `mc mirror` the objects via the S3 API | `/data` is the erasure-coded backend (`xl.meta`), which round-trips only into a byte-identical MinIO and is useless against real S3. Also: the first version of `backup.sh` did this with a `\|\| echo` fallback and produced a backup containing **zero objects while reporting success** |
+| Count a backup's contents from the store's inventory | Count what was actually written | "What the store says it holds" and "what this archive contains" are different numbers, and only the second can be restored. The manifest reported `objects: 1` on an empty archive |
+| Leave the api running through a restore | Restart it | `ensure_collection` runs at **startup**, so a running process never notices its collection was dropped, and the reindex then fails with "Collection doesn't exist" |
 | Give an audit table the foreign key its neighbours have | `erasures` references nothing | It would cascade away in the same statement as the erasure it documents. Postgres will even refuse to add the constraint once real rows exist — the schema disagreeing with itself *is* the property |
 | Query an RLS table from a test on the app pool | Set `app.current_tenant` first | `documents`, `conversations` and `messages` are RLS-forced. A direct read returns zero rows and *reports success* — the corollary trap, arriving in a test and reading as a missing feature. `TestApp::count_as_tenant` exists for this |
 | Add a second way to write vectors | Write the bytes and let the worker index them | Invariant 29 breaks exactly one way: a path that skips the `documents` row. `/ingest` was that path for eight phases, and its points were unerasable the whole time. If a new route needs to index text, it should produce an object, not a point |
@@ -536,6 +579,10 @@ writing the code.
 | Status → user-facing copy; where invariant 16 is enforced *in the UI* | `web/src/lib/features/documents/status.ts` |
 | The two BFF routes a browser fetches directly — the shared origin / content-type / `locals.session` guard chain, and why it is not `requireUser` | `web/src/routes/(authenticated)/documents/upload-url/+server.ts` (mint + re-mint) and `.../playground/ask/+server.ts` (the SSE proxy) |
 | Migrations — forward-only, run at API startup on the admin pool, which is then closed | `crates/api/migrations/` |
+| Counters, the exposition format, and why there is no metrics dependency (plus the stated stopping point: no histograms) | `crates/api/src/metrics.rs` |
+| The `SECURITY DEFINER` gauge functions, and why bypassing RLS is safe only because their return type has no identity | `crates/api/migrations/0014_metrics_functions.sql` |
+| Backup/restore, what is deliberately not backed up, and the order that is a correctness decision | `scripts/backup.sh`, `scripts/restore.sh` |
+| Alert rules, and an explicit note on which of them have ever been fired | `doc/ops/alerts.yml` |
 | Clean-slate wipe of all five stores, plus `bot_flow_test` and `eval_bench`. Names `accounts`/`sessions` in its prompt because `CASCADE` reaches them either way | `scripts/reset.sh` |
 
 ## Known state & debt

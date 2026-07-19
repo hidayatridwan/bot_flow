@@ -168,6 +168,94 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// `GET /metrics` — Prometheus exposition. Registered only when `METRICS_TOKEN` is set.
+///
+/// Counters come from the process; gauges are read fresh, because a cached gauge is a number that
+/// can be wrong in a way nobody notices.
+pub async fn metrics(
+    _auth: crate::auth::MetricsAuth,
+    State(state): State<AppState>,
+) -> Result<([(axum::http::header::HeaderName, &'static str); 1], String), AppError> {
+    use sqlx::Row;
+
+    // Fleet-wide counts via the SECURITY DEFINER functions. A plain aggregate here would be scoped
+    // by RLS to a tenant that is never set, return zero rows, and report success — see 0014.
+    let mut gauges = crate::metrics::Gauges::default();
+    for row in sqlx::query("SELECT status, n FROM metrics_document_counts()")
+        .fetch_all(&state.db)
+        .await?
+    {
+        gauges
+            .documents
+            .push((row.get::<String, _>("status"), row.get::<i64, _>("n")));
+    }
+    for row in sqlx::query("SELECT kind, n FROM metrics_overdue_counts()")
+        .fetch_all(&state.db)
+        .await?
+    {
+        gauges
+            .overdue
+            .push((row.get::<String, _>("kind"), row.get::<i64, _>("n")));
+    }
+    gauges.tenants = sqlx::query("SELECT count(*) AS n FROM tenants")
+        .fetch_one(&state.db)
+        .await?
+        .get::<i64, _>("n");
+
+    gauges.queues = queue_gauges(&state).await;
+
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        crate::metrics::render(&state.metrics, &gauges),
+    ))
+}
+
+/// Queue depth and consumer count, via a **throwaway channel**.
+///
+/// A passive declare of a queue that does not exist is a channel-level `NOT_FOUND`, and the broker
+/// closes the channel. Doing this on `state.amqp` would kill the publishing channel on the first
+/// scrape of a fresh deployment, and the only symptom anywhere would be `/health` reporting
+/// rabbitmq down — the `lapin::Connection` trap, one layer up.
+///
+/// Returns **nothing** on failure rather than zeros: a `0` that means "I could not ask" is
+/// indistinguishable from a dead worker, and would page someone on a broker hiccup. The alert rule
+/// handles the missing case with `absent()`.
+async fn queue_gauges(state: &AppState) -> Vec<(String, u64, u64)> {
+    use lapin::options::QueueDeclareOptions;
+
+    let Ok(channel) = state.amqp_conn.create_channel().await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in ["document_events", "document_events.dlq"] {
+        let declared = channel
+            .queue_declare(
+                name,
+                QueueDeclareOptions {
+                    passive: true,
+                    ..Default::default()
+                },
+                lapin::types::FieldTable::default(),
+            )
+            .await;
+        match declared {
+            Ok(q) => out.push((
+                name.to_string(),
+                q.message_count() as u64,
+                q.consumer_count() as u64,
+            )),
+            // The channel is now closed by the broker; nothing further can be asked on it. That is
+            // exactly why it is a throwaway.
+            Err(_) => break,
+        }
+    }
+    let _ = channel.close(200, "metrics scrape complete").await;
+    out
+}
+
 #[derive(Deserialize)]
 pub struct IngestRequest {
     /// Required: this creates a *document*, and a document has a name. The extension also decides
@@ -369,6 +457,20 @@ pub async fn search(
     })))
 }
 
+/// Record the outcome of one question.
+///
+/// **One helper, two call sites, deliberately.** `ask` and `ask_stream` each implement invariant 4's
+/// refusal branch independently; two bare `fetch_add`s would be exactly the drift this repo keeps
+/// warning about, and the symptom would be a refusal rate that is quietly half the real one.
+fn record_ask(state: &AppState, sources: usize) {
+    crate::metrics::Metrics::incr(&state.metrics.ask_total);
+    if sources == 0 {
+        crate::metrics::Metrics::incr(&state.metrics.ask_refused_total);
+    } else {
+        crate::metrics::Metrics::add(&state.metrics.ask_sources_total, sources as u64);
+    }
+}
+
 const NO_ANSWER: &str = "Sorry, I couldn't find any relevant information.";
 
 /// What an LLM failure looks like to whoever is chatting.
@@ -457,6 +559,7 @@ pub async fn ask(
     let (conversation_id, standalone) = prepare(&state, &actor.tenant_id, &req).await?;
 
     let relevant = retrieve(&state, &actor.tenant_id, &standalone, limit).await?;
+    record_ask(&state, relevant.len());
 
     if relevant.is_empty() {
         conversation::append_turn(
@@ -483,7 +586,16 @@ pub async fn ask(
         .join("\n");
     let user = format!("CONTEXT:\n{context}\n\nQUESTION: {standalone}");
 
-    let answer = state.llm.answer(RAG_SYSTEM_PROMPT, &user).await?;
+    let answer = match state.llm.answer(RAG_SYSTEM_PROMPT, &user).await {
+        Ok(a) => {
+            crate::metrics::Metrics::incr(&state.metrics.llm_ok);
+            a
+        }
+        Err(e) => {
+            crate::metrics::Metrics::incr(&state.metrics.llm_error);
+            return Err(e.into());
+        }
+    };
 
     conversation::append_turn(
         &state.db,
@@ -651,7 +763,23 @@ async fn retrieve(
     query: &str,
     limit: u64,
 ) -> Result<Vec<Hit>, AppError> {
-    let vector = state.embedder.embed_one(query).await?;
+    // The ask/search path's own embedding calls. A DIFFERENT signal from the worker's: this is the
+    // gateway hurting questions, not ingestion. `is_fatal` is the worker's own retry classification,
+    // reused so the two cannot disagree about what "fatal" means.
+    let vector = match state.embedder.embed_one(query).await {
+        Ok(v) => {
+            crate::metrics::Metrics::incr(&state.metrics.embed_ok);
+            v
+        }
+        Err(e) => {
+            crate::metrics::Metrics::incr(if e.is_fatal() {
+                &state.metrics.embed_fatal
+            } else {
+                &state.metrics.embed_retryable
+            });
+            return Err(e.into());
+        }
+    };
 
     let response = state
         .qdrant
@@ -724,6 +852,7 @@ pub async fn ask_stream(
 
     // Retrieval happens before streaming, so retrieval errors are normal HTTP errors (not mid-stream).
     let relevant = retrieve(&state, &actor.tenant_id, &standalone, limit).await?;
+    record_ask(&state, relevant.len());
 
     // Captured for the turn record: which documents the model was shown. Computed here because
     // `relevant` is consumed building the SSE payload below.
@@ -1111,6 +1240,68 @@ pub struct MintKeyRequest {
 }
 fn default_kind() -> String {
     "secret".to_string()
+}
+
+/// `GET /admin/ops/tenants` — which tenants are doing what, **right now**.
+///
+/// **This exists so `/metrics` never has to carry a tenant label** (invariant 30). The two questions
+/// look similar and are not: *"is something wrong?"* needs history and no identity, and belongs in a
+/// time series; *"which tenant?"* needs identity and no history, and belongs here.
+///
+/// Its defining property is what it does **not** do: it stores nothing. The answer is derived
+/// entirely from live tables, so it is always current, needs no retention policy, and a tenant
+/// erased by phase 12 disappears from it in the same statement — with no extra code and no new
+/// obligation. A labelled Prometheus series would have kept them for its whole retention window,
+/// outside every erasure guarantee this system makes.
+///
+/// Loops tenant by tenant through `tenant_tx`, exactly as `reaper.rs` does. Here that is *correct*
+/// rather than merely expensive: the result is per-tenant, and RLS is what keeps the loop honest.
+/// Do not reach for `metrics_document_counts()` — that function exists precisely because its result
+/// has no identity, and this one needs identity.
+///
+/// Human-triggered and capped. Nothing should poll it.
+pub async fn ops_tenants(
+    _admin: AdminAuth,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    // `tenants` has no RLS — it is the registry itself.
+    let tenants = sqlx::query("SELECT id, name FROM tenants ORDER BY id LIMIT 200")
+        .fetch_all(&state.db)
+        .await?;
+
+    let mut out = Vec::new();
+    for t in &tenants {
+        let tenant_id: String = t.get("id");
+        let mut tx = crate::db::tenant_tx(&state.db, &tenant_id).await?;
+
+        let docs = sqlx::query(
+            "SELECT status, count(*) AS n FROM documents GROUP BY status ORDER BY status",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let recent: i64 = sqlx::query(
+            "SELECT count(*) AS n FROM messages WHERE created_at > now() - interval \'1 hour\'",
+        )
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
+        tx.commit().await?;
+
+        out.push(json!({
+            "tenant_id": tenant_id,
+            "name": t.get::<String, _>("name"),
+            "documents": docs.iter().map(|d| json!({
+                "status": d.get::<String, _>("status"),
+                "count": d.get::<i64, _>("n"),
+            })).collect::<Vec<_>>(),
+            "messages_last_hour": recent,
+        }));
+    }
+
+    // Busiest first: in an incident the question is "who is causing this", and the answer is usually
+    // at the top.
+    out.sort_by_key(|t| -t["messages_last_hour"].as_i64().unwrap_or(0));
+    Ok(Json(json!({ "tenants": out })))
 }
 
 /// `DELETE /admin/tenants/{tenant_id}` — erase a tenant and everything it owns.

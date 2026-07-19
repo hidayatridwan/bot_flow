@@ -18,6 +18,7 @@ mod erasure;
 mod error;
 mod handlers;
 mod llm;
+mod metrics;
 mod queue;
 mod rate_limit;
 mod storage;
@@ -76,7 +77,7 @@ pub async fn run_migrations(database_url: &str) -> anyhow::Result<()> {
 /// down — nothing else fails loudly. Returning it rather than binding it in `main` makes that a
 /// type-level fact: `let (state, _) = build_state(..)` is visibly wrong, where a stray local was
 /// only wrong if you had read the comment.
-pub async fn build_state(config: &Config) -> anyhow::Result<(AppState, lapin::Connection)> {
+pub async fn build_state(config: &Config) -> anyhow::Result<(AppState, Arc<lapin::Connection>)> {
     // Runtime pool — non-superuser app_user, so RLS applies to every query.
     let db = PgPoolOptions::new()
         .max_connections(5)
@@ -120,6 +121,11 @@ pub async fn build_state(config: &Config) -> anyhow::Result<(AppState, lapin::Co
     let amqp = amqp_conn.create_channel().await?;
     tracing::info!("RabbitMQ channel ready");
 
+    // Shared so the metrics handler can open a throwaway channel per scrape. `build_state` still
+    // RETURNS the connection as well — that return value is what makes "dropping it kills the
+    // channel" a type-level fact, and removing it would undo the whole point.
+    let amqp_conn = Arc::new(amqp_conn);
+
     let state = AppState {
         db,
         qdrant: Arc::new(qdrant),
@@ -144,6 +150,9 @@ pub async fn build_state(config: &Config) -> anyhow::Result<(AppState, lapin::Co
         redis,
         rate_limit_per_minute: config.rate_limit_per_minute,
         admin_api_key: config.admin_api_key.clone(),
+        metrics_token: config.metrics_token.clone(),
+        metrics: Arc::new(crate::metrics::Metrics::default()),
+        amqp_conn: Arc::clone(&amqp_conn),
         session_ttl_secs: config.session_ttl_secs,
     };
 
@@ -160,7 +169,12 @@ pub fn app(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    Router::new()
+    // `/metrics` is registered ONLY when a token is configured. Not "registered and 401" — an
+    // endpoint that refuses still confirms it exists, and an unconfigured deployment should not
+    // advertise a surface carrying business data. Absent config, absent route.
+    let metrics_route = state.metrics_token.is_some();
+
+    let router = Router::new()
         .route("/health", get(handlers::health))
         // Public and unauthenticated, like /health: it is the file a visitor's browser loads before
         // it holds any credential. Served from the binary; cache-revalidated (phase 7).
@@ -203,6 +217,7 @@ pub fn app(state: AppState) -> Router {
             "/auth/keys/{key_hash}",
             patch(accounts::update_key).delete(accounts::revoke_key),
         )
+        .route("/admin/ops/tenants", get(handlers::ops_tenants))
         .route("/admin/tenants", post(handlers::create_tenant))
         .route("/admin/tenants/{tenant_id}/keys", post(handlers::mint_key))
         // Ends a tenant: vectors, objects, rows. Admin-gated like tenant creation — these are the
@@ -211,6 +226,13 @@ pub fn app(state: AppState) -> Router {
             "/admin/tenants/{tenant_id}",
             delete(handlers::delete_tenant),
         )
-        .layer(cors)
-        .with_state(state)
+        .layer(cors);
+
+    let router = if metrics_route {
+        router.route("/metrics", get(handlers::metrics))
+    } else {
+        router
+    };
+
+    router.with_state(state)
 }

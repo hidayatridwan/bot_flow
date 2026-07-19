@@ -195,13 +195,14 @@ pub struct TestApp {
     /// Connected as `app_user`, for setup and inspection. Subject to RLS, like the handlers.
     pub db: PgPool,
     pub admin_key: String,
+    pub metrics_token: String,
     pub gateway: FakeGateway,
     qdrant: Arc<Qdrant>,
     /// Tenant ids this fixture created, cleaned out of the shared Qdrant collection on teardown.
     tenants: std::sync::Mutex<Vec<String>>,
     /// **Must outlive `router`.** Dropping the Connection closes the Channel inside `AppState`, and
     /// the only symptom is /health reporting rabbitmq down — nothing else fails, loudly or at all.
-    _amqp: lapin::Connection,
+    _amqp: std::sync::Arc<lapin::Connection>,
 }
 
 impl TestApp {
@@ -246,6 +247,9 @@ impl TestApp {
             // A table-driven auth test fires many requests as one tenant and must not 429 itself.
             rate_limit_per_minute: 100_000,
             admin_api_key: format!("admin-{}", uuid::Uuid::new_v4().simple()),
+            // Set, so `/metrics` is registered and the auth test has something to authenticate
+            // against. A deployment that leaves it unset gets no route at all.
+            metrics_token: Some(format!("metrics-{}", uuid::Uuid::new_v4().simple())),
             session_ttl_secs: 3600,
         };
 
@@ -267,6 +271,7 @@ impl TestApp {
             router: api::app(state),
             db,
             admin_key: config.admin_api_key.clone(),
+            metrics_token: config.metrics_token.clone().unwrap_or_default(),
             gateway,
             qdrant,
             tenants: std::sync::Mutex::new(Vec::new()),
@@ -421,6 +426,36 @@ impl TestApp {
             .await
             .expect("failed to plant a chunk");
         document_id
+    }
+
+    /// Fetch a plain-text body (`/metrics` is not JSON, so `request` cannot read it).
+    pub async fn text(&self, uri: &str, token: &str) -> String {
+        let res = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router failed");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("failed to read body");
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    /// One counter's current value, scraped. Named metrics only — no labels.
+    pub async fn metric(&self, name: &str) -> u64 {
+        let body = self.text("/metrics", &self.metrics_token.clone()).await;
+        body.lines()
+            .find(|l| l.starts_with(name) && !l.starts_with('#'))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("metric {name} not found in:\n{body}"))
     }
 
     /// Run a read against a tenant-scoped (RLS) table.

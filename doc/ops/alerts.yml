@@ -1,0 +1,120 @@
+# Prometheus alerting rules for bot_flow.
+#
+# **What has and has not been tested, because a rules file nobody fired is a claim.**
+#
+#   Verified by hand (phase 13): every metric these rules read *moves* in the direction the rule
+#   assumes. Killing the worker took `botflow_queue_consumers{queue="document_events"}` from 1 to 0;
+#   seeding a row past its lease took `botflow_documents_overdue{kind="stuck_processing"}` from 0 to
+#   1 and back; a refused question moved `botflow_ask_refused_total` while an answered one did not.
+#   Verified by `promtool check rules`: that these expressions parse.
+#   NOT verified: that any alert here has ever reached a human. There is no Alertmanager in this
+#   repo and nothing to send to. Wiring that up is the reader's job.
+#
+# Scrape config, and the one line that matters:
+#
+#   scrape_configs:
+#     - job_name: botflow-api
+#       bearer_token: "<METRICS_TOKEN>"     # NEVER ADMIN_API_KEY — it can erase a tenant
+#       static_configs: [{targets: ["api:3000"]}]
+#
+# `/metrics` is not registered at all when METRICS_TOKEN is unset, so an unconfigured deployment
+# 404s rather than serving business data.
+
+groups:
+  - name: botflow
+    rules:
+      # ---- the two the production-readiness blocker names by name ----
+
+      # The worker registers a consumer on `document_events`; the BROKER reports it. That is
+      # stronger evidence than a heartbeat, which stays green while a wedged worker fails every
+      # message — and it needs no code in the worker at all.
+      - alert: WorkerDown
+        expr: botflow_queue_consumers{queue="document_events"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "No worker is consuming document_events"
+          description: >-
+            Uploads will sit at `uploading` forever; nothing else in the system moves them.
+            Check the worker process and its RabbitMQ connection.
+
+      # `> 0`, not `> 10`. One dead-lettered message is one tenant's document permanently
+      # unindexed, with no automatic recovery — the queue gives up after 5 deliveries and the
+      # document simply never becomes searchable. `for: 15m` absorbs a transient redelivery.
+      - alert: DeadLetterBacklog
+        expr: botflow_queue_messages{queue="document_events.dlq"} > 0
+        for: 15m
+        labels: {severity: page}
+        annotations:
+          summary: "Documents have dead-lettered"
+          description: >-
+            A document exhausted its delivery limit and will never index on its own.
+            Recovery is re-upload. Check the worker logs for the classification.
+
+      # Without this, a dead API silences every other rule in this file — the classic gap where the
+      # monitoring goes quiet and quiet reads as healthy.
+      - alert: MetricsAbsent
+        expr: up{job="botflow-api"} == 0 or absent(botflow_ask_total)
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "The API is not being scraped"
+          description: "Every other alert here is now blind. Treat as an outage until proven otherwise."
+
+      # ---- the quiet failures ----
+
+      # THE CANARY. Invariant 4 refuses when nothing clears the relevance floor, and a refusal is a
+      # 200 with an answer — invisible to every status-code metric and every error rate. A system
+      # that knows nothing looks exactly like one that works; this ratio is the only thing that says
+      # otherwise in production.
+      #
+      # THE THRESHOLD IS PROVISIONAL AND MUST BE RETUNED from a week of real traffic. It ships as a
+      # warning, deliberately: a tenant with a thin corpus legitimately refuses a lot, and paging on
+      # an unbaselined ratio teaches people to ignore the page. When it fires, go run
+      # `cargo run -p eval` — the bench is the ground truth this only proxies.
+      - alert: RefusalRateHigh
+        expr: >-
+          rate(botflow_ask_refused_total[1h]) / rate(botflow_ask_total[1h]) > 0.5
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Over half of questions are being refused"
+          description: >-
+            Retrieval may have degraded — a corpus grown past the floor, a bad re-index, or a
+            threshold that no longer fits. Run `cargo run -p eval` to measure rather than guess.
+
+      # The reaper's whole job is to drive these to zero within 60s of a threshold elapsing. A
+      # persistently non-zero value means it is dead or its sweep is erroring — learned from the
+      # outcome it exists to produce, not from a liveness ping.
+      - alert: ReaperStalled
+        expr: botflow_documents_overdue{kind="stuck_processing"} > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Rows are overdue past their lease and the reaper has not settled them"
+
+      - alert: IngestBacklog
+        expr: botflow_queue_messages{queue="document_events"} > 50
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "The worker is alive but not keeping up"
+
+      # Fatal embed errors mean documents are being DISCARDED rather than retried
+      # (`EmbedError::is_fatal`), which is the gateway rejecting content rather than being busy.
+      - alert: EmbeddingErrors
+        expr: rate(botflow_embed_requests_total{outcome!="ok"}[10m]) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "The embedding gateway is failing on the ask path"
+
+# ---- deliberately absent ----
+#
+# There is no per-tenant spend alert, and there cannot be one here: invariant 30 keeps tenant
+# identity out of the time series entirely, because a Prometheus label is a store the erasure saga
+# cannot reach. The aggregate signals are `botflow_ask_total` and `botflow_rate_limited_total`;
+# WHICH tenant is answered by `GET /admin/ops/tenants`, live from Postgres, at incident time.
+#
+# There are also no latency alerts: phase 13 ships no histograms. See `crates/api/src/metrics.rs`
+# for why, and for the instruction to take the `metrics` crate rather than extend that module.

@@ -11,26 +11,30 @@
 | --- | --- | --- | --- |
 | 1 | ~~`/ingest` vectors cannot be attributed to a document~~ | ~~blocking~~ | **CLOSED** — [phase 11](feature/phase-11-ingest-gdpr.md), invariant 29 |
 | 2 | ~~No tenant-level erasure, no audit trail, history unredacted~~ | ~~blocking~~ | **CLOSED** — [phase 12](feature/phase-12-tenant-erasure.md); one window left open, stated below |
-| 3 | No metrics, no alerting, no backups | **blocking** | not designed |
+| 3 | ~~No metrics, no alerting, no backups~~ | ~~blocking~~ | **CLOSED** — [phase 13](feature/phase-13-observability.md), invariant 30; alert *delivery* and error reporting remain |
 | 4 | `failed` cannot tell a tenant whether to re-upload or wait | high | not designed |
 | 5 | `GET /documents` unpaginated; `/auth/keys` unmetered; `/ask/stream` unbounded | high | not designed |
 
-Blockers 1 and 2 were closed by phases 11 and 12 and are struck through above, with what remains
-stated in each. **Blocker 3 is now the one that matters most**: the system can erase data correctly
-and cannot tell you when it is failing.
+Blockers 1, 2 and 3 were closed by phases 11, 12 and 13 and are struck through above, with what
+remains stated in each. **Blockers 4 and 5 are what is left**, and neither loses data or hides a
+failure — they are a UX gap and a scaling gap.
 
-Re-verified 2026-07-19 after phase 12: there is still **no** metrics endpoint, **no** endpoint
-exposing `documents.error`, and **no** `LIMIT`/`OFFSET` in `list_documents`.
+Re-verified 2026-07-19 after phase 13: there is still **no** endpoint exposing `documents.error`, and
+**no** `LIMIT`/`OFFSET` in `list_documents`.
 
 ## Verdict
 
 **Ready for a design-partner or internal pilot. Not ready for self-serve signups from strangers
 handling real customer policy.**
 
-Unchanged by phases 11 and 12, and worth being clear about why: those closed the two *correctness*
-blockers — the system can now erase a document and erase a tenant, and prove it. What still argues
-against self-serve is **operational**: nothing here tells you when it is going wrong, and there are
-no backups. A pilot has a named operator watching; self-serve does not.
+**Closer than it was, and the remaining distance is narrower and more concrete.** Phases 11 and 12
+closed the correctness blockers — the system can erase a document and erase a tenant, and prove it.
+Phase 13 closed the operational one: it now has instruments that move, backups that have actually
+been restored, and alert rules ready to wire.
+
+What still stands between this and self-serve is smaller and no longer structural: **alerts that
+nobody has wired to a human**, a `failed` status a tenant cannot act on, and an unpaginated document
+list. None of those loses data. All of them are worth fixing before strangers arrive.
 
 The distinction is not polish. Most of what goes wrong in this system goes wrong *quietly* — a
 plausible answer, a silent refusal, a partially re-indexed collection. That is the specific reason
@@ -116,22 +120,32 @@ it (redacts, not deletes — removing the row would leave a question answering i
   append-only is a different phase with a different threat model.
 - **No retention policy**, and **`purge-unattributed` writes no audit row**.
 
-### 3. Operational blindness
+### 3. ~~Operational blindness~~ — CLOSED (phase 13)
 
-There is **no metrics endpoint, no structured error reporting, and no alerting**. `/health` reports
-reachability of five dependencies and nothing about correctness. Concretely, none of these would be
-noticed today without someone reading logs:
+**Closed.** A token-gated `/metrics` measures the four failures this section named, `GET
+/admin/ops/tenants` answers "which tenant" live, `scripts/backup.sh` + `restore.sh` cover the two
+stores that cannot be rebuilt, and `doc/ops/alerts.yml` carries rules for worker death and DLQ depth.
 
-- retrieval quality degrading after a corpus grows;
-- the embedding gateway returning 429s and documents dead-lettering;
-- a tenant's spend running away inside their own rate limit;
-- the reaper failing every sweep.
+**The restore was tested, not assumed** — that was the section's own bar. Seed → back up →
+`reset.sh -y` → restore → reindex → **ask a real question and get the same grounded answer**. Row
+counts alone would not have proved it: a restore with perfect counts and an empty collection refuses
+everything while looking healthy. The drill also caught a backup that silently contained **zero
+objects** while reporting success, which review had not.
 
-There are also **no backups** and no restore procedure for Postgres, MinIO or Qdrant. Qdrant is
-rebuildable from MinIO + Postgres via `worker reindex`; Postgres is not rebuildable from anything.
+**Worker death** is `botflow_queue_consumers{queue="document_events"} == 0` — the broker reporting
+the consumer's absence, which beats a heartbeat and needed no worker code. Verified 1 → 0 on kill.
 
-*Closes when:* backups exist and are restore-tested, and there is at least one alert that fires on
-worker death and on dead-letter depth.
+**What remains open, and why it is no longer blocking:**
+
+- **Alert delivery.** The rules file exists; there is no Prometheus in this repo and nothing to send
+  to. Wiring it up is a deployment task of maybe fifteen minutes, and the file states plainly that no
+  rule here has ever fired.
+- **No structured error reporting** (Sentry or equivalent) — this section mentioned it and phase 13
+  does not close it. `tracing` is already structured; shipping it elsewhere is deployment.
+- **Backups are manual, local, unencrypted, unrotated, no PITR**, and the drill is manual and billed
+  so it is not in CI. Its last-run date going stale is itself a signal.
+- **No per-tenant metric history**, deliberately: invariant 30 keeps tenant identity out of any store
+  the erasure saga cannot reach.
 
 ### 4. `failed` cannot tell a tenant what to do
 
