@@ -26,7 +26,8 @@ fn body_for(path: &str) -> Body {
     match path {
         "/search" => Body::from(r#"{"query":"anything","limit":3}"#),
         "/ask" => Body::from(r#"{"query":"anything"}"#),
-        "/ingest" => Body::from(r#"{"texts":["anything"]}"#),
+        // Phase 11 contract: a document, not an array of strings.
+        "/ingest" => Body::from(r#"{"filename":"anything.md","text":"anything"}"#),
         "/documents/upload-url" => Body::from(r#"{"filename":"anything.txt"}"#),
         _ => Body::empty(),
     }
@@ -109,7 +110,8 @@ async fn every_credential_reaches_exactly_the_routes_it_should() {
         // Origin is not the browser it was minted for.
         ("pk_ with no Origin", &pk, "POST", "/ask", None, 403),
         // --- Secret-only routes: not being extended, so no session (require_secret) ---
-        ("sk_ on /ingest", &sk, "POST", "/ingest", None, 200),
+        // 202: indexing is asynchronous as of phase 11 — the worker does it.
+        ("sk_ on /ingest", &sk, "POST", "/ingest", None, 202),
         // 401, not 403: /ingest takes `AuthTenant`, which resolves bearer tokens against `api_keys`
         // only. A `sess_` is not in that table, so it misses and is simply an unknown key. The two
         // tables are disjoint by prefix (invariant 17) — this is that dispatch observed from outside.

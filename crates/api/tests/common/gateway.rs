@@ -79,7 +79,7 @@ impl FakeGateway {
 /// for tenant A's text and gets nothing, that emptiness can *only* be the tenant filter. With a
 /// random or constant embedder it would be indistinguishable from "nothing cleared the threshold",
 /// and the denial assertion would pass for the wrong reason.
-fn fake_embedding(text: &str) -> Vec<f32> {
+pub fn fake_embedding(text: &str) -> Vec<f32> {
     use sha2::{Digest, Sha256};
 
     // A tiny SplitMix64 seeded from the text's digest — reproducible without an rng dependency.

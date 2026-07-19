@@ -8,8 +8,7 @@ use axum::Json;
 use qdrant_client::qdrant::{
     value::Kind, Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
     DeletePointsBuilder, Distance, FieldType, Filter, KeywordIndexParamsBuilder, Modifier,
-    PointStruct, QueryPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder,
-    UpsertPointsBuilder, VectorParamsBuilder,
+    QueryPointsBuilder, SparseVectorParamsBuilder, SparseVectorsConfigBuilder, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use serde::Deserialize;
@@ -20,6 +19,7 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::upload;
 use common::embedding::EMBEDDING_DIM;
+use common::key;
 use sqlx::{PgConnection, PgExecutor, Row};
 
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -59,7 +59,10 @@ pub async fn ensure_collection(qdrant: &Qdrant) -> anyhow::Result<()> {
         tracing::info!("collection '{COLLECTION}' already exists");
         return Ok(());
     }
-    qdrant
+    // `collection_exists` above and `create_collection` here are two calls, so two processes
+    // starting together both see "absent" and both create. One wins; the loser must not die.
+    // Two API instances booting simultaneously is normal, and so is a parallel test suite.
+    let created = qdrant
         .create_collection(
             CreateCollectionBuilder::new(COLLECTION)
                 .vectors_config(VectorParamsBuilder::new(EMBEDDING_DIM, Distance::Cosine))
@@ -71,8 +74,14 @@ pub async fn ensure_collection(qdrant: &Qdrant) -> anyhow::Result<()> {
                 // statistics that change on every ingest and would silently drift.
                 .sparse_vectors_config(sparse_config()),
         )
-        .await
-        .context("failed to create collection")?;
+        .await;
+    if let Err(e) = created {
+        if qdrant.collection_exists(COLLECTION).await? {
+            tracing::info!("collection '{COLLECTION}' was created concurrently; continuing");
+            return Ok(());
+        }
+        return Err(anyhow::Error::new(e).context("failed to create collection"));
+    }
 
     // Index the tenant_id payload with the multitenancy optimization (is_tenant=true).
     // Created BEFORE ingest (here, when the collection is first born) so HNSW becomes filter-aware.
@@ -147,47 +156,100 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
 
 #[derive(Deserialize)]
 pub struct IngestRequest {
-    texts: Vec<String>,
+    /// Required: this creates a *document*, and a document has a name. The extension also decides
+    /// how the sidecar will parse it, so it is not decoration.
+    filename: String,
+    text: String,
+    /// The caller's own id for this content — a CMS page id, a row key. Optional; absent means
+    /// "always create a new document", which is what uploading twice does.
+    external_id: Option<String>,
 }
 
+/// `POST /ingest` — index text the caller hands us inline, as a real document.
+///
+/// **This used to write vectors and nothing else**: random point ids, a payload of `text` +
+/// `tenant_id`, and no `documents` row anywhere. Those points could never be listed, re-indexed or
+/// removed — CLAUDE.md called it the largest single piece of debt in the system, and a processor
+/// that cannot erase a named document has a compliance problem, not a backlog item.
+///
+/// **The fix is not a second ingestion path — it is the absence of one.** The bytes are written to
+/// MinIO under a normal object key, and everything downstream is the machinery uploads already use:
+/// storage announces the object, the worker claims it, chunks it with `common::chunk`, and writes
+/// full provenance. So this route inherits the lifecycle, the deletion saga, the reaper and the
+/// re-index driver for free, and there is exactly one recipe for turning text into vectors.
+///
+/// That last part is why the obvious design — embed and upsert right here, synchronously — is
+/// wrong. It would store the text *only* as vectors, and `worker reindex` walks `documents` rows
+/// reading `object_key`: on the next collection version bump every inline document would silently
+/// vanish. Unaccountable data is the thing this route is being fixed for.
+///
+/// The cost is that it is now **asynchronous**: `202`, then poll `GET /documents` until `ready`.
 pub async fn ingest(
     State(state): State<AppState>,
     tenant: AuthTenant,             // FromRequestParts — reads headers, no body
     Json(req): Json<IngestRequest>, // FromRequest — consumes body, MUST be last
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     tenant.require_secret()?;
-    // `sk_` only, so this is not the stolen-key exposure `/search` was — but it is still a billed
-    // `/embeddings` call per request, and an unmetered one was the other half of the pair.
+    // Still a billed pipeline per call, exactly as before — the embedding just happens in the
+    // worker now rather than here.
     rate_limit::check(&state, &tenant.tenant_id).await?;
 
-    let vectors = state.embedder.embed_batch(&req.texts).await?;
+    // Same validator as the presigned path, so the two cannot disagree about what a document is.
+    let ext = upload::checked_extension(&req.filename)?;
 
-    // Global UUID IDs: required since going multi-tenant, otherwise points across tenants
-    // overwrite each other. tenant_id goes into the payload → becomes the mandatory filter on reads (Step 3).
-    let points: Vec<PointStruct> = req
-        .texts
-        .iter()
-        .zip(vectors)
-        .map(|(text, vector)| {
-            let id = uuid::Uuid::new_v4().to_string();
-            PointStruct::new(
-                id,
-                vector,
-                [
-                    ("text", text.clone().into()),
-                    ("tenant_id", tenant.tenant_id.clone().into()),
-                ],
-            )
-        })
-        .collect();
+    if req.text.trim().is_empty() {
+        return Err(AppError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "text must not be empty",
+        ));
+    }
+    // **The one place invariant 11 does not bind.** "Upload size cannot be enforced at upload time"
+    // is a fact about presigned signatures, which cover method, key and expiry but never body
+    // length. Here the bytes are in the request, so there *is* an earlier — and refusing now beats
+    // storing them and quarantining later.
+    if req.text.len() > state.max_upload_bytes {
+        return Err(AppError::client(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("text exceeds the {}-byte limit", state.max_upload_bytes),
+        ));
+    }
 
-    let count = points.len();
+    // Row first, object second — the same order as the presigned path, for the same reason. A row
+    // with no object is the abandoned case the reaper settles; an object with no row is an orphan
+    // nothing in the system can find, which is the bug being fixed.
+    let (document_id, object_key) = upload::inline_document(
+        &state.db,
+        &tenant.tenant_id,
+        &req.filename,
+        &ext,
+        req.external_id.as_deref(),
+    )
+    .await?;
+
+    // Content type from the extension we validated, never from the client (see Security).
     state
-        .qdrant
-        .upsert_points(UpsertPointsBuilder::new(COLLECTION, points).wait(true))
-        .await?;
+        .s3
+        .put_object_with_content_type(
+            &object_key,
+            req.text.as_bytes(),
+            key::content_type_for(&ext),
+        )
+        .await
+        .map_err(|e| {
+            AppError::Internal(anyhow::Error::new(e).context("failed to store inline document"))
+        })?;
 
-    Ok(Json(json!({ "ingested": count })))
+    // 202, not 201: the document exists, but it is not searchable until the worker has indexed it.
+    // Saying `ready` here would be a lie a caller would act on.
+    Ok((
+        StatusCode::ACCEPTED,
+        json!({
+            "document_id": document_id.to_string(),
+            "status": "uploading",
+            "note": "indexing is asynchronous; poll GET /documents until status is `ready`",
+        })
+        .into(),
+    ))
 }
 
 #[derive(Deserialize)]

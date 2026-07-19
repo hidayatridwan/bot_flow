@@ -123,7 +123,7 @@
             "widget.js"
           ]
         },
-        "description": "The embeddable chat widget, served from the API binary (include_str!). No auth — it is the file a visitor's browser loads before it holds any credential, and it makes no gateway call, so it is not metered.\n\nCACHING IS THE POINT: `Cache-Control: no-cache` plus a strong ETag means \"revalidate before use\", not \"do not cache\". A browser keeps its copy and asks with If-None-Match; unchanged it gets a ~200-byte 304 and reuses what it holds. That is what lets a widget fix reach every visitor on the next API restart, instead of being frozen in whatever copy a tenant self-hosted. Run once to capture the ETag, then enable the If-None-Match header to see the 304."
+        "description": "The embeddable chat widget, served from the API binary (include_str!). No auth \u2014 it is the file a visitor's browser loads before it holds any credential, and it makes no gateway call, so it is not metered.\n\nCACHING IS THE POINT: `Cache-Control: no-cache` plus a strong ETag means \"revalidate before use\", not \"do not cache\". A browser keeps its copy and asks with If-None-Match; unchanged it gets a ~200-byte 304 and reuses what it holds. That is what lets a widget fix reach every visitor on the next API restart, instead of being frozen in whatever copy a tenant self-hosted. Run once to capture the ETag, then enable the If-None-Match header to see the 304."
       }
     },
     {
@@ -168,7 +168,7 @@
                 "tenants"
               ]
             },
-            "description": "Create a tenant and mint its first SECRET key (returned once). Requires adminKey. Its test script captures api_key into {{apiKey}} and tenant_id into {{tenantId}} — the key is shown only here, so if you skip this you cannot get it back."
+            "description": "Create a tenant and mint its first SECRET key (returned once). Requires adminKey. Its test script captures api_key into {{apiKey}} and tenant_id into {{tenantId}} \u2014 the key is shown only here, so if you skip this you cannot get it back."
           },
           "event": [
             {
@@ -394,7 +394,7 @@
                 "keys"
               ]
             },
-            "description": "This tenant's API keys as METADATA only (kind, label, allowed_origins, created_at, key_hash) — never the raw key. The test script captures the newest key's key_hash into {{keyHash}} so Revoke Key can target it."
+            "description": "This tenant's API keys as METADATA only (kind, label, allowed_origins, created_at, key_hash) \u2014 never the raw key. The test script captures the newest key's key_hash into {{keyHash}} so Revoke Key can target it."
           },
           "event": [
             {
@@ -453,7 +453,7 @@
                 "keys"
               ]
             },
-            "description": "Mint a key for your own tenant with a session instead of the admin key — the dashboard equivalent of Admin > Mint API Key. kind = 'secret' or 'publishable'. Raw key returned once."
+            "description": "Mint a key for your own tenant with a session instead of the admin key \u2014 the dashboard equivalent of Admin > Mint API Key. kind = 'secret' or 'publishable'. Raw key returned once."
           }
         },
         {
@@ -496,7 +496,7 @@
                 "{{keyHash}}"
               ]
             },
-            "description": "Change a key's allowed_origins. Its `kind` and its hash are immutable (invariant 26). Run List Keys first to populate {{keyHash}}.\n\nAdding a domain must not mean minting a new key: a pk_ is public and expected to be stolen, so rotating it to add 'www.' buys nothing, while forcing a site-wide <script> edit for a one-word change is how tenants end up asking for a wildcard — which would delete the containment entirely. `kind` stays immutable because flipping it would silently turn a published key secret, or a secret key public, under an unchanged snippet.\n\nBehaviour worth knowing (each verified against a live API):\n- allowed_origins is REQUIRED. Omitting it is a 422, not a no-op — there is no serde default.\n- Origins are canonicalised, not stored as typed: [\"HTTPS://Acme.com:443/\", \"https://acme.com\"] both become \"https://acme.com\", and the duplicate collapses. They are matched against the browser's Origin header by STRING EQUALITY, so a value in a non-canonical shape is not lax — it is dead, and the key 403s forever with nothing in any log to say why.\n- A publishable key with an empty list is refused (422). That is not a permissive key, it is one that can answer from nowhere.\n- 'null' is never allow-listable — it is what every file:// page and sandboxed iframe sends.\n- A hash that is not yours 404s exactly like one that never existed, so this is not an oracle for which keys exist (same rule as invariants 8 and 18).\n\nReturns {key_hash, kind, allowed_origins} — the list echoed back is the CANONICALISED one, which is what GET /auth/keys will show. (Note POST /auth/keys echoes the raw request value instead, so the two responses can disagree for the same input.)"
+            "description": "Change a key's allowed_origins. Its `kind` and its hash are immutable (invariant 26). Run List Keys first to populate {{keyHash}}.\n\nAdding a domain must not mean minting a new key: a pk_ is public and expected to be stolen, so rotating it to add 'www.' buys nothing, while forcing a site-wide <script> edit for a one-word change is how tenants end up asking for a wildcard \u2014 which would delete the containment entirely. `kind` stays immutable because flipping it would silently turn a published key secret, or a secret key public, under an unchanged snippet.\n\nBehaviour worth knowing (each verified against a live API):\n- allowed_origins is REQUIRED. Omitting it is a 422, not a no-op \u2014 there is no serde default.\n- Origins are canonicalised, not stored as typed: [\"HTTPS://Acme.com:443/\", \"https://acme.com\"] both become \"https://acme.com\", and the duplicate collapses. They are matched against the browser's Origin header by STRING EQUALITY, so a value in a non-canonical shape is not lax \u2014 it is dead, and the key 403s forever with nothing in any log to say why.\n- A publishable key with an empty list is refused (422). That is not a permissive key, it is one that can answer from nowhere.\n- 'null' is never allow-listable \u2014 it is what every file:// page and sandboxed iframe sends.\n- A hash that is not yours 404s exactly like one that never existed, so this is not an oracle for which keys exist (same rule as invariants 8 and 18).\n\nReturns {key_hash, kind, allowed_origins} \u2014 the list echoed back is the CANONICALISED one, which is what GET /auth/keys will show. (Note POST /auth/keys echoes the raw request value instead, so the two responses can disagree for the same input.)"
           }
         },
         {
@@ -600,7 +600,7 @@
                 "upload-url"
               ]
             },
-            "description": "Mint a presigned PUT. The API never sees the file bytes. Returns 201 {document_id, upload_url, method, expires_at}. Then PUT the file straight at upload_url (no auth header on that request — the signature IS the authorisation). Only .pdf, .txt and .md are accepted. Requires a SECRET key. Its test script stores upload_url and document_id as collection variables, so 'Upload File to MinIO' can run straight after it."
+            "description": "Mint a presigned PUT. The API never sees the file bytes. Returns 201 {document_id, upload_url, method, expires_at}. Then PUT the file straight at upload_url (no auth header on that request \u2014 the signature IS the authorisation). Only .pdf, .txt and .md are accepted. Requires a SECRET key. Its test script stores upload_url and document_id as collection variables, so 'Upload File to MinIO' can run straight after it."
           },
           "event": [
             {
@@ -652,7 +652,7 @@
                 "{{uploadUrl}}"
               ]
             },
-            "description": "STEP 2 of the upload. Equivalent to:\n    curl -X PUT --upload-file cv-ridwan.pdf \"<upload_url>\"\n\nThis request goes to MinIO on :9000, NOT to the API on :3000. The API never sees the bytes.\n\nBefore sending: open the Body tab (it is set to 'binary') and choose your file. Postman does not save the file path in the collection, so you must pick it once per machine.\n\n{{uploadUrl}} is set automatically by the 'Create Upload URL' request's test script — run that first and this URL fills itself in.\n\nThree things that will break it:\n  * Body must be 'binary', NOT 'form-data'. form-data wraps your file in a MIME envelope and MinIO stores the envelope, so the worker cannot parse it.\n  * Auth must stay 'No Auth'. The presigned signature lives in the query string; an Authorization header on top of it is rejected.\n  * The URL expires (PRESIGN_TTL_SECS, default 900s). If you get 403 AccessDenied, run 'Refresh Upload URL' rather than minting a new session.\n\nExpect 200 + an ETag. Then poll 'List Documents' until status goes uploading -> processing -> ready."
+            "description": "STEP 2 of the upload. Equivalent to:\n    curl -X PUT --upload-file cv-ridwan.pdf \"<upload_url>\"\n\nThis request goes to MinIO on :9000, NOT to the API on :3000. The API never sees the bytes.\n\nBefore sending: open the Body tab (it is set to 'binary') and choose your file. Postman does not save the file path in the collection, so you must pick it once per machine.\n\n{{uploadUrl}} is set automatically by the 'Create Upload URL' request's test script \u2014 run that first and this URL fills itself in.\n\nThree things that will break it:\n  * Body must be 'binary', NOT 'form-data'. form-data wraps your file in a MIME envelope and MinIO stores the envelope, so the worker cannot parse it.\n  * Auth must stay 'No Auth'. The presigned signature lives in the query string; an Authorization header on top of it is rejected.\n  * The URL expires (PRESIGN_TTL_SECS, default 900s). If you get 403 AccessDenied, run 'Refresh Upload URL' rather than minting a new session.\n\nExpect 200 + an ETag. Then poll 'List Documents' until status goes uploading -> processing -> ready."
           }
         },
         {
@@ -681,7 +681,7 @@
                 "upload-url"
               ]
             },
-            "description": "Re-mint a presigned URL for a document still 'uploading' or 'expired'. 404 if it already uploaded, or belongs to another tenant — the same response either way, so it cannot be used to probe for existence. Requires a SECRET key."
+            "description": "Re-mint a presigned URL for a document still 'uploading' or 'expired'. 404 if it already uploaded, or belongs to another tenant \u2014 the same response either way, so it cannot be used to probe for existence. Requires a SECRET key."
           }
         },
         {
@@ -774,8 +774,69 @@
                 "{{documentId}}"
               ]
             },
-            "description": "Erase a document across ALL THREE stores: its Qdrant vectors, its MinIO object, and its Postgres row. Takes a secret key OR a session — never a publishable one.\n\n204 = done inline. 202 = a worker was mid-index, so the row is tombstoned (`deleting`, already gone from List Documents) and the reaper finishes the store-cleanup once the worker provably releases.\n\n404 for an unknown id AND for another tenant's id — identical, so the endpoint is not an oracle for which ids exist. Deleting an already-gone document is therefore a 404, not an error to worry about.\n\nOrder is vectors -> object -> row, the order that fails toward the least-bad orphan: surviving vectors would still answer questions, whereas a surviving row is an inert ghost."
+            "description": "Erase a document across ALL THREE stores: its Qdrant vectors, its MinIO object, and its Postgres row. Takes a secret key OR a session \u2014 never a publishable one.\n\n204 = done inline. 202 = a worker was mid-index, so the row is tombstoned (`deleting`, already gone from List Documents) and the reaper finishes the store-cleanup once the worker provably releases.\n\n404 for an unknown id AND for another tenant's id \u2014 identical, so the endpoint is not an oracle for which ids exist. Deleting an already-gone document is therefore a 404, not an error to worry about.\n\nOrder is vectors -> object -> row, the order that fails toward the least-bad orphan: surviving vectors would still answer questions, whereas a surviving row is an inert ghost."
           }
+        },
+        {
+          "name": "Ingest (inline text)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"filename\": \"refunds.md\",\n  \"text\": \"Refunds are accepted within 30 days of delivery. Unopened goods may be returned up to 60 days.\",\n  \"external_id\": \"cms-42\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/ingest",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ingest"
+              ]
+            },
+            "description": "Index text inline, without uploading a file. It creates a REAL document: the API stores the text as an object and the worker indexes it, so it is listable, re-indexable and erasable exactly like an upload.\n\nReturns 202, not 200 \u2014 indexing happens in the worker, so poll `List Documents` until status is `ready`. **The worker must be running.**\n\n`external_id` is your own key for the source (a CMS page id, a row key). Re-sync the same one and it overwrites the same document instead of piling up duplicates; omit it and every call creates a new document.\n\nBefore phase 11 this wrote vectors with random ids and no document_id \u2014 they could never be listed, re-indexed or removed. That is closed; see invariant 29 in CLAUDE.md."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted \u2014 indexing is asynchronous', function () {",
+                  "    pm.response.to.have.status(202);",
+                  "});",
+                  "pm.test('returns a document_id, which is what makes it erasable', function () {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b).to.have.property('document_id');",
+                  "    pm.collectionVariables.set('documentId', b.document_id);",
+                  "});",
+                  "// Poll `List Documents` until status is `ready`, then Ask. Deleting this documentId erases it",
+                  "// from Postgres, Qdrant and MinIO \u2014 the property this route did not have before phase 11."
+                ]
+              }
+            }
+          ]
         }
       ]
     },
@@ -820,7 +881,7 @@
                 "search"
               ]
             },
-            "description": "Raw vector search (debug): returns hits with score/text/document_id. No LLM, and no relevance floor — unlike /ask, it does not refuse when nothing scores well.\n\nAUTH: a secret key OR a session. NOT a publishable key — this route takes `Actor` and calls require_management(), so a pk_ gets 403 (phase 6). Raw retrieval is not \"asking a question\", and invariant 15 says a pk_ may only ask questions: the gate is what makes that sentence true, rather than a claim the code quietly contradicted.\n\nNote what the gate does NOT buy: /ask already hands sources[].text to a pk_, so this was never a confidentiality boundary. It bounds SPEND — every query is a billed /embeddings call against EMBEDDING_API_KEY — and the route is now rate limited on the tenant's bucket, the same one /ask draws from."
+            "description": "Raw vector search (debug): returns hits with score/text/document_id. No LLM, and no relevance floor \u2014 unlike /ask, it does not refuse when nothing scores well.\n\nAUTH: a secret key OR a session. NOT a publishable key \u2014 this route takes `Actor` and calls require_management(), so a pk_ gets 403 (phase 6). Raw retrieval is not \"asking a question\", and invariant 15 says a pk_ may only ask questions: the gate is what makes that sentence true, rather than a claim the code quietly contradicted.\n\nNote what the gate does NOT buy: /ask already hands sources[].text to a pk_, so this was never a confidentiality boundary. It bounds SPEND \u2014 every query is a billed /embeddings call against EMBEDDING_API_KEY \u2014 and the route is now rate limited on the tenant's bucket, the same one /ask draws from."
           }
         },
         {
@@ -861,7 +922,7 @@
                 "ask"
               ]
             },
-            "description": "Turn 1 of a conversation. Send NO conversation_id and the server mints one, returning it as `conversation_id`. The test script captures it into {{conversationId}}.\n\nAn empty string or null is treated the same as omitting the field.\n\nGrounded RAG answer as a single JSON blob: `answer` is plain prose and carries NO [n] markers — the model is forbidden from writing them — and `sources[]` is the structured citation list. `sources[].index` is 1-based and is the only way to map the answer back to a passage, so never renumber it (invariant 5).\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) — no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket."
+            "description": "Turn 1 of a conversation. Send NO conversation_id and the server mints one, returning it as `conversation_id`. The test script captures it into {{conversationId}}.\n\nAn empty string or null is treated the same as omitting the field.\n\nGrounded RAG answer as a single JSON blob: `answer` is plain prose and carries NO [n] markers \u2014 the model is forbidden from writing them \u2014 and `sources[]` is the structured citation list. `sources[].index` is 1-based and is the only way to map the answer back to a passage, so never renumber it (invariant 5).\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) \u2014 no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket."
           },
           "event": [
             {
@@ -917,7 +978,7 @@
                 "ask"
               ]
             },
-            "description": "Turn 2+. Passes {{conversationId}}, captured by the 'Ask' request above, so the server rewrites a context-dependent question into a standalone one before retrieval.\n\nRun 'Ask' first (e.g. \"who is ridwan?\"), then this. Without the conversation_id the pronoun \"his\" retrieves nothing and you get 'Sorry, I couldn't find any relevant information.'\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) — no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket."
+            "description": "Turn 2+. Passes {{conversationId}}, captured by the 'Ask' request above, so the server rewrites a context-dependent question into a standalone one before retrieval.\n\nRun 'Ask' first (e.g. \"who is ridwan?\"), then this. Without the conversation_id the pronoun \"his\" retrieves nothing and you get 'Sorry, I couldn't find any relevant information.'\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) \u2014 no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket."
           }
         },
         {
@@ -959,57 +1020,11 @@
                 "stream"
               ]
             },
-            "description": "Server-Sent Events: a 'conversation' event first (the conversation_id), then 'sources', then incremental 'token' events, then 'done'.\n\nSend no conversation_id to start a new conversation. Postman cannot run a test script against a stream, so copy the id from the first `conversation` event and paste it into the {{conversationId}} collection variable to continue.\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) — no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket.\n\nTwo things about the frames that are easy to get wrong. An LLM failure yields a single 'error' event carrying a FIXED string — the gateway's own error body goes to the API log and never to a client (invariant 16), because for a pk_ widget this frame reaches a stranger's browser. And 'done' carries no `data:` field at all, so a browser EventSource — which drops any event with an empty data buffer, per the WHATWG spec — would never fire it. Read the stream with fetch, not EventSource."
+            "description": "Server-Sent Events: a 'conversation' event first (the conversation_id), then 'sources', then incremental 'token' events, then 'done'.\n\nSend no conversation_id to start a new conversation. Postman cannot run a test script against a stream, so copy the id from the first `conversation` event and paste it into the {{conversationId}} collection variable to continue.\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) \u2014 no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket.\n\nTwo things about the frames that are easy to get wrong. An LLM failure yields a single 'error' event carrying a FIXED string \u2014 the gateway's own error body goes to the API log and never to a client (invariant 16), because for a pk_ widget this frame reaches a stranger's browser. And 'done' carries no `data:` field at all, so a browser EventSource \u2014 which drops any event with an empty data buffer, per the WHATWG spec \u2014 would never fire it. Read the stream with fetch, not EventSource."
           }
         }
       ],
-      "description": "Who may call these, and why it differs per route.\n\n/ask and /ask/stream take the `Actor` extractor and gate NOTHING: a secret key, a publishable key, or a login session all work (invariant 27). That is not a widening. A pk_ is printed in public page source and is expected to be stolen — 'it can only ask questions' is precisely the containment that makes it safe to print — so these are, by design, the routes the weakest credential in the system may reach. Admitting the stronger ones adds no exposure.\n\n/search is the exception, and in the opposite direction to the one you might guess: it also takes `Actor`, but it CALLS require_management(), so a secret key or a session pass and a publishable key gets 403. Raw retrieval is not asking a question. So the three chat routes do not share an auth model — /ask admits everything, /search refuses the weakest.\n\nFor any publishable key, send an Origin header that exactly matches one of the key's allowed_origins, or you get a 403. Rate limiting is keyed on the tenant, not on the credential, so the dashboard, the widget and /search all draw on one bucket."
-    },
-    {
-      "name": "Dev",
-      "item": [
-        {
-          "name": "Ingest (raw text)",
-          "request": {
-            "auth": {
-              "type": "bearer",
-              "bearer": [
-                {
-                  "key": "token",
-                  "value": "{{apiKey}}",
-                  "type": "string"
-                }
-              ]
-            },
-            "method": "POST",
-            "header": [
-              {
-                "key": "Content-Type",
-                "value": "application/json"
-              }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"texts\": [\n    \"The warranty on electronic products is valid for 12 months from the date of purchase.\"\n  ]\n}",
-              "options": {
-                "raw": {
-                  "language": "json"
-                }
-              }
-            },
-            "url": {
-              "raw": "{{baseUrl}}/ingest",
-              "host": [
-                "{{baseUrl}}"
-              ],
-              "path": [
-                "ingest"
-              ]
-            },
-            "description": "Dev shortcut: synchronously embed + index short raw texts (no file/parse/chunk). Requires a SECRET key, and rate limited on the tenant's bucket (phase 6) — it is a billed /embeddings call like any other.\n\nNot a supported path: it writes vectors with random ids and no document_id, so re-ingesting the same text duplicates them and they can never be listed, re-indexed or removed. See 'Known state & debt' in CLAUDE.md."
-          }
-        }
-      ]
+      "description": "Who may call these, and why it differs per route.\n\n/ask and /ask/stream take the `Actor` extractor and gate NOTHING: a secret key, a publishable key, or a login session all work (invariant 27). That is not a widening. A pk_ is printed in public page source and is expected to be stolen \u2014 'it can only ask questions' is precisely the containment that makes it safe to print \u2014 so these are, by design, the routes the weakest credential in the system may reach. Admitting the stronger ones adds no exposure.\n\n/search is the exception, and in the opposite direction to the one you might guess: it also takes `Actor`, but it CALLS require_management(), so a secret key or a session pass and a publishable key gets 403. Raw retrieval is not asking a question. So the three chat routes do not share an auth model \u2014 /ask admits everything, /search refuses the weakest.\n\nFor any publishable key, send an Origin header that exactly matches one of the key's allowed_origins, or you get a 403. Rate limiting is keyed on the tenant, not on the credential, so the dashboard, the widget and /search all draw on one bucket."
     }
   ]
 }

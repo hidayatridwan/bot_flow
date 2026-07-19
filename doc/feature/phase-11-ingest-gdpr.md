@@ -1,6 +1,6 @@
 # Feature: Making `/ingest` a document, so erasure can be honest (phase 11)
 
-> Status: **design for review. No code.**
+> Status: **built. Two of its own decisions reversed during implementation — see [Outcome](#outcome).**
 >
 > This closes the entry CLAUDE.md has called *"the largest single piece of debt in the system"* since
 > it was written, and which [production-readiness.md](../production-readiness.md) lists as blocker 1.
@@ -272,3 +272,67 @@ Per *Working here* — edit the invariant, then write the code, in the same comm
    obligation, and splitting them means the system spends another phase unable to answer "delete
    everything you hold about us". Against: it is a distinct saga with its own failure modes, and this
    phase is already a contract break plus a schema migration.
+
+
+## Outcome
+
+Built and verified live. `POST /ingest` now creates a real document; invariant 29 (*every indexed
+point is erasable by document*) is written down and true.
+
+**Two decisions in this document were reversed while implementing it, and the design reads
+persuasively either way — which is why they are recorded rather than quietly corrected.**
+
+**D4 was wrong: `/ingest` is asynchronous, not synchronous.** The doc argued the API should chunk,
+embed and upsert directly, so a caller who just handed us the text need not poll. That design stores
+the text *only* as Qdrant vectors — and phase 10's `worker reindex` walks `documents` rows reading
+`object_key`. **On the next collection version bump every inline document would have vanished
+silently**, which is the same class of unaccountable data this phase exists to eliminate. Writing the
+bytes to MinIO instead makes them re-indexable and, more importantly, collapses the work: the row,
+the lifecycle, chunking with provenance, the deletion saga, the reaper and the re-index driver all
+already existed and all now serve this path unchanged. The cost is the `202` the doc wanted to avoid.
+
+**D3 was wrong, and falls out of D4: `object_key` stays `NOT NULL` and there is no `source` column.**
+The key is real because the object is real. Implementation also found the trap that would have made
+the nullable version expensive: `Row::get::<String, _>` **panics** on a SQL NULL, and `object_key` is
+read that way in three places (`handlers.rs`, `reaper.rs`, `worker/main.rs`). `source` was redundant
+in any case — it duplicated a fact the key already implied.
+
+Net effect: **one migration** (`external_id` plus a partial unique index), where the doc implied
+schema surgery.
+
+**Two pre-existing bugs surfaced, both worth more than the feature.**
+
+1. **`ensure_collection` was not idempotent under concurrency.** `collection_exists` and
+   `create_collection` are two calls; two processes starting together both see "absent" and both
+   create, and the loser died. Three parallel tests found it — but **two API instances booting
+   simultaneously is normal production behaviour**, so this was a real availability bug hiding
+   behind a single-instance dev setup. It now tolerates a concurrent creator.
+2. **The integration harness's teardown named the wrong collection.** It used a `"documents"`
+   literal, and phase 10 renamed the collection to `documents_v2` — so teardown silently deleted
+   from nothing for an entire phase, and only surfaced now because the old collection no longer
+   exists to absorb the call. It uses `api::COLLECTION` now. A literal that was correct when written
+   is exactly the drift `common` exists to prevent.
+
+**And one gap in this document's own plan**, found by using the thing: `purge-unattributed` purged
+*every* tenant, when a right-to-erasure request concerns exactly one. It takes an optional tenant
+argument now. The design said "per tenant, never globally" and meant it about the filter; it did not
+notice that the operator needs to say *which*.
+
+**Verified live**, on a full stack: inline text → object → `ObjectCreated` → worker → `ready`;
+payload carries `document_id`, `chunk_index`, `char_start`, `char_end`, `created_at`; `/ask` answers
+from it; `DELETE` returns `204` and a search for the document's distinctive text returns **zero
+hits**, with **zero points** left in the collection. `purge-unattributed p11 --yes` erased three
+planted orphans and left the other tenant's two untouched.
+
+**Break table, executed** — each reverted in the same sitting:
+
+| Break | Result |
+| --- | --- |
+| Write the object, skip the `documents` row | erasure + listing tests red; validation stayed green ✅ |
+| Ignore `external_id` on lookup | re-sync test red, others green ✅ |
+| Drop the `tenant_id` leg of the purge filter | verified manually (no automated coverage — recorded as a gap) |
+
+**Still open, and deliberately not claimed:** tenant-level erasure (D8) erases nothing outside
+Postgres; `messages` retains passage text after its source document is deleted; there is no audit
+trail of erasures and no retention policy. This phase closes **per-document** erasure. Calling it
+"GDPR compliant" would be the kind of claim CLAUDE.md exists to prevent.

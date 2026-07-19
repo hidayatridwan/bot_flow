@@ -16,6 +16,11 @@ pub struct Config {
     /// the client actually connects to. Defaults to `s3_endpoint` (correct for local dev).
     pub s3_public_endpoint: String,
     pub presign_ttl_secs: u32,
+    /// The same cap the worker enforces on an uploaded object. The API needs it too as of phase 11:
+    /// `POST /ingest` receives the bytes in the request body, so unlike a presigned PUT it *can* be
+    /// bounded before anything is stored. Invariant 11's "there is no earlier" is about signatures,
+    /// not about wishes — where an earlier exists, use it.
+    pub max_upload_bytes: usize,
     pub s3_bucket: String,
     pub s3_access_key: String,
     pub s3_secret_key: String,
@@ -57,6 +62,10 @@ impl Config {
                 .or_else(|_| std::env::var("S3_ENDPOINT"))
                 .context("S3_ENDPOINT is not set")?,
             // 15 minutes: long enough for a slow upload, short enough that a leaked URL rots.
+            max_upload_bytes: std::env::var("MAX_UPLOAD_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25 * 1024 * 1024),
             presign_ttl_secs: std::env::var("PRESIGN_TTL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

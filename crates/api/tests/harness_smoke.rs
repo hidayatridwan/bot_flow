@@ -43,17 +43,20 @@ async fn the_fake_gateway_satisfies_the_real_embedding_client() {
     let app = TestApp::new().await;
     let (_tenant, sk) = app.create_tenant().await;
 
+    // `/search`, not `/ingest`: as of phase 11 the API does not embed on the ingest path at all —
+    // it stores the text and the worker embeds it. `/search` is the shortest route from an HTTP
+    // request to a real call against the stub.
     let (status, body) = app
         .request(
-            common::json_request("POST", "/ingest", &sk)
+            common::json_request("POST", "/search", &sk)
                 .body(Body::from(
-                    serde_json::json!({"texts": ["hello from the harness"]}).to_string(),
+                    serde_json::json!({"query": "hello from the harness", "limit": 3}).to_string(),
                 ))
                 .unwrap(),
         )
         .await;
 
-    assert_eq!(status, 200, "ingest failed: {body}");
+    assert_eq!(status, 200, "search failed: {body}");
     assert!(
         app.gateway.counts.embeddings() > 0,
         "the embedding call did not reach the stub — is the base URL seam still wired?"

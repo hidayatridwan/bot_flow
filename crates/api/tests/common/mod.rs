@@ -24,7 +24,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tower::ServiceExt; // for `oneshot`
 
 mod gateway;
-pub use gateway::FakeGateway;
+pub use gateway::{fake_embedding, FakeGateway};
 
 /// Name of the database these tests are allowed to touch. Never the dev database: this harness
 /// creates and deletes tenants, and a stray truncation against real dev data is a bad afternoon.
@@ -176,7 +176,9 @@ async fn delete_tenant_points(
 ) -> Result<(), qdrant_client::QdrantError> {
     qdrant
         .delete_points(
-            DeletePointsBuilder::new("documents")
+            // `common::COLLECTION`, never a literal: this said "documents" and kept saying it after
+            // phase 10 renamed the collection, so teardown silently deleted from nothing.
+            DeletePointsBuilder::new(api::COLLECTION)
                 .points(Filter::must([Condition::matches(
                     "tenant_id",
                     tenant_id.to_string(),
@@ -231,6 +233,7 @@ impl TestApp {
             s3_public_endpoint: std::env::var("S3_PUBLIC_ENDPOINT")
                 .unwrap_or_else(|_| env("S3_ENDPOINT")),
             presign_ttl_secs: 900,
+            max_upload_bytes: 25 * 1024 * 1024,
             s3_bucket: std::env::var("S3_BUCKET").unwrap_or_else(|_| "documents".to_string()),
             s3_access_key: env("S3_ACCESS_KEY"),
             s3_secret_key: env("S3_SECRET_KEY"),
@@ -374,6 +377,40 @@ impl TestApp {
             .expect("no session_token")
             .to_string();
         (tenant_id, token)
+    }
+
+    /// Plant an indexed chunk directly, as the worker would have written it.
+    ///
+    /// **Deliberately not via `POST /ingest`.** Since phase 11 that route stores an object and lets
+    /// the worker index it, and the harness runs no worker — but more importantly, a test of the
+    /// *search filter* should not depend on the *ingestion path* at all. Writing the point here is
+    /// both what makes the test work and what makes it test one thing.
+    ///
+    /// The vector comes from the same content-addressed function the fake gateway uses, so a query
+    /// for this exact text scores ~1.0 and anything else ~0.0 — which is what makes a denial
+    /// unambiguous rather than merely empty.
+    pub async fn plant_chunk(&self, tenant_id: &str, text: &str) -> String {
+        let document_id = uuid::Uuid::new_v4().to_string();
+        self.qdrant
+            .upsert_points(
+                qdrant_client::qdrant::UpsertPointsBuilder::new(
+                    api::COLLECTION,
+                    vec![qdrant_client::qdrant::PointStruct::new(
+                        uuid::Uuid::new_v4().to_string(),
+                        fake_embedding(text),
+                        [
+                            ("text", text.into()),
+                            ("tenant_id", tenant_id.into()),
+                            ("document_id", document_id.clone().into()),
+                            ("chunk_index", 0i64.into()),
+                        ],
+                    )],
+                )
+                .wait(true),
+            )
+            .await
+            .expect("failed to plant a chunk");
+        document_id
     }
 
     /// `POST /search` with the given credential.

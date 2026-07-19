@@ -18,7 +18,8 @@ use lapin::{
     Channel, Connection, ConnectionProperties, ExchangeKind,
 };
 use qdrant_client::qdrant::{
-    Condition, DeletePointsBuilder, Filter, NamedVectors, PointStruct, UpsertPointsBuilder, Vector,
+    Condition, CountPointsBuilder, DeletePointsBuilder, Filter, NamedVectors, PointStruct,
+    UpsertPointsBuilder, Vector,
 };
 use qdrant_client::Qdrant;
 use s3::{creds::Credentials, Bucket, Region};
@@ -58,9 +59,11 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // `worker reindex` re-embeds every document of every tenant from its stored object. It is the
-    // migration driver for a collection version bump (phase 10), not a routine command.
-    let reindex = std::env::args().nth(1).as_deref() == Some("reindex");
+    // Subcommands. Deliberately a plain match on argv rather than a CLI framework — there are two,
+    // both are operator tools, and neither takes options beyond a confirmation flag.
+    let args: Vec<String> = std::env::args().collect();
+    let subcommand = args.get(1).map(String::as_str);
+    let confirmed = args.iter().any(|a| a == "--yes");
 
     let addr = std::env::var("RABBITMQ_URL").context("RABBITMQ_URL not set")?;
 
@@ -102,8 +105,22 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(25 * 1024 * 1024),
     });
 
-    if reindex {
-        return reindex_all(&ctx).await;
+    match subcommand {
+        // Migration driver for a collection version bump (phase 10).
+        Some("reindex") => return reindex_all(&ctx).await,
+        // Erase vectors that predate phase 11 and belong to no document (GDPR).
+        Some("purge-unattributed") => {
+            // An optional tenant argument, because a right-to-erasure request concerns ONE tenant.
+            // Absent means every tenant, which is the migration-cleanup case.
+            let only = args.get(2).filter(|a| !a.starts_with("--")).cloned();
+            return purge_unattributed(&ctx, only.as_deref(), confirmed).await;
+        }
+        Some(other) if !other.starts_with("--") => {
+            anyhow::bail!(
+                "unknown subcommand '{other}'; expected `reindex` or `purge-unattributed`"
+            )
+        }
+        _ => {}
     }
 
     // The reaper shares the Qdrant client and a clone of the bucket so its delete-sweep can finish
@@ -638,6 +655,9 @@ async fn reindex_all(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
         // Only documents whose bytes are actually in MinIO. `uploading` and `expired` never got an
         // object; `deleting` is mid-erasure and must not be resurrected (invariant 10).
         let rows = sqlx::query(
+            // Every document has a real object, including inline ones (phase 11 writes them to
+            // MinIO rather than holding the text only as vectors — which is exactly what would
+            // make them invisible to this query and silently lost on a version bump).
             "SELECT id, object_key, filename FROM documents
               WHERE status IN ('ready', 'failed', 'quarantined')
               ORDER BY created_at",
@@ -672,6 +692,95 @@ async fn reindex_all(ctx: &Arc<Ctx>) -> anyhow::Result<()> {
     );
     if failed > 0 {
         anyhow::bail!("{failed} document(s) failed to reindex — the collection is PARTIAL");
+    }
+    Ok(())
+}
+
+/// Delete vectors that belong to no document — the ones `POST /ingest` wrote before phase 11.
+///
+/// **The gap those points represent is attribution, not deletion.** They carry `tenant_id`, so
+/// erasing them in bulk has always been possible; what was never possible is saying *which* ingest
+/// call produced which point, because the only thing that ever knew was the caller. So there is no
+/// migration that rescues them — only this, and only per tenant.
+///
+/// **Dry run by default.** It is someone's working corpus, and a tenant who used `/ingest` as their
+/// real path loses retrieval entirely. Automatic-and-silent is precisely how this debt was created;
+/// requiring `--yes` after seeing the counts is the whole design of the command.
+async fn purge_unattributed(
+    ctx: &Arc<Ctx>,
+    only_tenant: Option<&str>,
+    confirmed: bool,
+) -> anyhow::Result<()> {
+    use sqlx::Row;
+
+    let tenants: Vec<String> = match only_tenant {
+        // Scoped to one tenant: what an erasure request actually asks for.
+        Some(t) => vec![t.to_string()],
+        None => sqlx::query("SELECT id FROM tenants ORDER BY id")
+            .fetch_all(&ctx.db)
+            .await
+            .context("failed to list tenants")?
+            .iter()
+            .map(|r| r.get("id"))
+            .collect(),
+    };
+
+    if !confirmed {
+        tracing::warn!("DRY RUN — nothing will be deleted. Re-run with --yes to erase.");
+    }
+
+    let mut total = 0u64;
+    for tenant_id in &tenants {
+        let tenant_id = tenant_id.clone();
+
+        // Per tenant, never one global filter. Same reason the reaper loops: a cross-tenant
+        // operation here erases a stranger's data, and there is no undo.
+        let filter = Filter::must([
+            Condition::matches("tenant_id", tenant_id.clone()),
+            // The whole definition of "unattributed": no document_id in the payload. Points written
+            // by the worker always carry one, so this can only ever match pre-phase-11 `/ingest`.
+            Condition::is_empty("document_id"),
+        ]);
+
+        let found = ctx
+            .qdrant
+            .count(
+                CountPointsBuilder::new(COLLECTION)
+                    .filter(filter.clone())
+                    .exact(true),
+            )
+            .await
+            .context("failed to count unattributed points")?
+            .result
+            .map(|r| r.count)
+            .unwrap_or(0);
+
+        if found == 0 {
+            continue;
+        }
+        total += found;
+
+        if confirmed {
+            ctx.qdrant
+                .delete_points(
+                    DeletePointsBuilder::new(COLLECTION)
+                        .points(filter)
+                        .wait(true),
+                )
+                .await
+                .context("failed to delete unattributed points")?;
+            tracing::warn!(tenant = %tenant_id, "purged {found} unattributed point(s)");
+        } else {
+            tracing::info!(tenant = %tenant_id, "would purge {found} unattributed point(s)");
+        }
+    }
+
+    if total == 0 {
+        tracing::info!("no unattributed points found — nothing predates phase 11 here");
+    } else if confirmed {
+        tracing::warn!("purge complete: {total} point(s) erased");
+    } else {
+        tracing::warn!("DRY RUN: {total} point(s) would be erased. Re-run with --yes.");
     }
     Ok(())
 }

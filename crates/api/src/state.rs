@@ -17,6 +17,7 @@ pub struct AppState {
     /// Bound to the endpoint the *client* reaches. Presigning only — see storage::build_public_bucket.
     pub s3_public: Box<Bucket>,
     pub presign_ttl_secs: u32,
+    pub max_upload_bytes: usize,
     pub amqp: Channel, // lapin Channel is cheaply cloneable (Arc inside)
     pub rag_score_threshold: f32,
     pub redis: redis::aio::ConnectionManager,

@@ -107,8 +107,10 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
    **A chunk carries its provenance**: every indexed point has `document_id`, `chunk_index`,
    `char_start`, `char_end` and `created_at`. None of the last four can be reconstructed — the point
    id is a UUIDv5 hash and does not invert — and adding one later is a *second* full re-index, which
-   is why they are written now and read by almost nothing yet. `POST /ingest` writes none of them,
-   which is that path's debt made visible rather than argued about.
+   is why they are written now and read by almost nothing yet. **As of phase 11 this holds on every
+   path**: `/ingest` no longer writes vectors directly — it writes the text to MinIO as an object and
+   lets the same worker index it, so there is exactly one recipe for turning text into vectors and
+   exactly one shape of point in the collection.
 7. **A conversation turn is recorded only once an answer exists.** Otherwise a failed request leaves a
    dangling question, and the next question's rewrite reasons over it.
 8. **An unknown conversation and another tenant's conversation are indistinguishable** — both 404.
@@ -117,7 +119,9 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
 **Ingestion**
 
 9. **Indexing the same document twice is a no-op, not a duplication.** The vector id is a
-   deterministic UUIDv5 of (document, chunk index), so re-indexing overwrites in place. The worker
+   deterministic UUIDv5 of (document, chunk index), so re-indexing overwrites in place. **This
+   sentence carried an unwritten exception for `/ingest` until phase 11** — that path wrote random
+   ids, so re-ingesting duplicated. It does not any more. The worker
    deletes every existing vector for the document first, because a re-parse yielding *fewer* chunks
    would otherwise strand the old tail as orphans that still match searches. This is what makes
    redelivery safe.
@@ -298,6 +302,21 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     session cannot draw a token more than that tenant's own `pk_` already could. That is what answers
     the spend question this change would otherwise raise: the limiter that was already there.
 
+**Erasure**
+
+29. **Every indexed point is erasable by document.** For every point in the collection there is a
+    `documents` row whose deletion removes it — no exceptions, no second write path. This is stated
+    as an invariant rather than left as a property because it is exactly what a compliance question
+    asks, and because the only way it breaks is by someone adding another way to write vectors that
+    skips the row. That is precisely how it broke the first time: `POST /ingest` wrote points with
+    random ids and no `document_id`, and CLAUDE.md carried them as *"permanent"* for eight phases.
+    The fix was not a second ingestion path but the **absence** of one — `/ingest` now writes its
+    text to MinIO and the ordinary pipeline indexes it.
+    Note precisely what this does and does not promise. It is **per-document** erasure. Deleting a
+    *tenant* still erases nothing outside Postgres, `messages` still retains the passage text a model
+    was shown, and there is no audit trail of erasures. Those are the next phase, and calling this
+    one "GDPR compliant" would be the kind of claim this file exists to prevent.
+
 **Gateways**
 
 28. **Every outgoing gateway call is bounded — and the bound on a streamed body is a *stall*, not a
@@ -405,6 +424,7 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Judge a chunking recipe on recall alone | Read context cost beside it | "Did a passage contain the answer" is trivially satisfied by returning the whole document. Measured: one-chunk-per-document scored a *perfect* recall and a *better* MRR while handing the model 1.8× the context. On recall alone the deliberately-broken variant wins |
 | Pick `RAG_SCORE_THRESHOLD` by reasoning about it | Sweep it on the bench | Every value in this repo's history was wrong: 0.70 (E5-era) refuses everything, 0.35 silently drops 4.5% of answers. 0.25 is the highest floor that costs no recall — and it was only knowable by measuring |
 | Change the chunker, the model or the payload in place | Bump `common::COLLECTION` | `ensure_collection` early-returns when the collection exists, so an in-place change **silently does not happen**. The version is also this system's only rollback: the old collection stays queryable while the new one fills |
+| Add a second way to write vectors | Write the bytes and let the worker index them | Invariant 29 breaks exactly one way: a path that skips the `documents` row. `/ingest` was that path for eight phases, and its points were unerasable the whole time. If a new route needs to index text, it should produce an object, not a point |
 | Republish ingest events to re-index everything | `cargo run -p worker -- reindex` | Invariant 10 skips a redelivered document whose fingerprint is unchanged — the very thing that makes redelivery safe makes a migration a silent no-op. The driver bypasses `claim` deliberately, which is also why the normal worker must be stopped first |
 | List only the tables you name in a `TRUNCATE … CASCADE` prompt | Name what CASCADE will reach as well | `accounts` and `sessions` hang off `tenants` by FK, so a wipe of "tenants, api_keys, documents" silently destroys every dashboard login too. Verified from the `NOTICE` output. A prompt that understates its blast radius is approved by someone who did not know what they were approving |
 
@@ -479,6 +499,9 @@ writing the code.
 | The lexical (sparse) encoder — written from phase 10, queried in 10b; FNV ids pinned by test because a changed hash orphans every dimension already written | `crates/common/src/sparse.rs` |
 | The versioned collection name, and why a version is the only rollback this system has | `crates/common/src/lib.rs` |
 | The migration driver (`worker reindex`) — why it bypasses `claim`, and why the worker must be stopped | `crates/worker/src/main.rs` |
+| `worker purge-unattributed` — erasing pre-phase-11 points that belong to no document; dry-run by default, optionally scoped to one tenant | `crates/worker/src/main.rs` |
+| Inline documents: `checked_extension` (shared with the presigned path) and `inline_document` (the row, and `external_id` reuse) | `crates/api/src/upload/mod.rs` |
+| That an ingested document is listable, deletable, and gone afterwards | `crates/api/tests/ingest_erasure.rs` |
 | Reaper — `UPLOAD_GRACE`/`PROCESSING_LEASE` constants; expired/reclaimed sweeps **and** the deferred-deletion sweep (phase 8) | `crates/worker/src/reaper.rs` |
 | `DELETE /documents/{id}` — the tombstone-guarded saga and `delete_document_stores` (its order/filters mirror the reaper sweep) | `crates/api/src/handlers.rs` |
 | PDF/text extraction, exit codes 2 and 3 | `sidecar/parser.py` |
@@ -508,17 +531,18 @@ Honest inventory. Each entry states the impact, not merely the fact.
 it asks only what stops real customers using the system, and orders by that. This section is the
 superset — everything known, whether or not it blocks.
 
-- **`POST /ingest` violates the document model.** It writes vectors with random ids and **no
-  `document_id` payload**. So: re-ingesting the same text *duplicates* the vectors (invariant 9 does
-  not hold on this path); the chunks surface in answers with an empty document reference, so a client
-  cannot attribute the citation; and they belong to no record, so they can never be listed,
-  re-indexed or removed. They are permanent. Isolation *is* preserved — the tenant tag is written and
-  the filter applies — so this is a data-lifecycle hole, not a leak. **The largest single piece of
-  debt in the system.** Demo and testing convenience; not a supported path. Do not build on it.
-  **The playground now makes it visible**: an `/ingest` chunk cites as "Unattributed passage", because
-  there is no document to name. It also means `/documents` reports zero ready while the bot answers
-  perfectly well — the playground's "no documents are ready" warning is wrong for an `/ingest`-only
-  tenant, and right for every supported one.
+- **`POST /ingest` is a supported path now, and the debt it carried is closed (phase 11).** It used
+  to write vectors with random ids and no `document_id`: unlistable, un-re-indexable, unremovable —
+  *"permanent"*, and the largest single piece of debt in the system. It now writes the caller's text
+  to MinIO as an ordinary object and lets the worker index it, so it inherits the document row, the
+  lifecycle, chunking with full provenance, the deletion saga, the reaper and the re-index driver.
+  The contract broke to get there: `{"texts": [...]}` became `{"filename", "text", "external_id?"}`
+  and it answers `202`, not `200` — indexing is asynchronous now, because the worker does it.
+  Two residues worth knowing. **Vectors written by the old path are still unattributed**, and no
+  migration can fix that (nothing ever recorded which ingest produced which point) —
+  `cargo run -p worker -- purge-unattributed [tenant] [--yes]` erases them, dry-run by default,
+  because it is someone's working corpus. And the playground's *"no documents are ready"* warning is
+  correct for every path again, since an `/ingest` document is now a document.
 - **The playground cannot reproduce the most likely go-live failure.** It authenticates with a
   `sess_`; the tenant's real widget uses a `pk_` bound to an `Origin`. So an `allowed_origins`
   mismatch — invariant 15's "403s forever with nothing in any log to say why" — is invisible here: the

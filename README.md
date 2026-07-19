@@ -106,7 +106,7 @@ weakest one already reaches, which is why the chat routes admit all three.
 | `POST` | `/documents` | secret | **Deprecated** multipart proxy — buffers the file in the API's memory |
 | `GET` | `/documents` | secret **or** session | Lists this tenant's documents and their status |
 | `DELETE` | `/documents/{id}` | secret **or** session | Erases the document across Postgres, Qdrant and MinIO. `204` when done inline, `202` when a worker is mid-index and the reaper finishes it. Unknown/other-tenant id → `404` |
-| `POST` | `/ingest` | secret | `{"texts": [...]}` — indexes raw strings, skipping the upload pipeline. Rate-limited |
+| `POST` | `/ingest` | secret | `{"filename","text","external_id?"}` — index text inline, without a file. Creates a real document: the API stores the text as an object and the worker indexes it, so it is listable and erasable like any upload. Returns `202`; poll until `ready`. Rate-limited |
 | `POST` | `/search` | secret **or** session | `{"query": "…", "limit": 3}` — returns raw scored chunks, no LLM. Rate-limited. **Not** open to `pk_`: raw retrieval is not asking a question |
 | `POST` | `/ask` | any key **or** session | Retrieval + LLM answer as one JSON blob. Rate-limited |
 | `POST` | `/ask/stream` | any key **or** session | Same, as SSE: a `conversation` event, a `sources` event, then `token` events, then `done`. An LLM failure yields one `error` event carrying a fixed string — the detail goes to the log, never the client |
@@ -490,10 +490,17 @@ curl -s localhost:3000/documents -H "authorization: Bearer $SK"
 # `original.pdf`; the parser dispatches on that suffix, and a perfectly good file fails.
 curl -sX POST localhost:3000/documents/$document_id/upload-url -H "authorization: Bearer $SK"
 
-# Or skip files entirely and index raw strings:
+# Or skip the file entirely and hand us the text — it still becomes a real document,
+# with a row, a status, and an id you can delete. `external_id` is your own key for the
+# source: re-sync the same one and it OVERWRITES rather than piling up duplicates.
 curl -sX POST localhost:3000/ingest \
   -H "authorization: Bearer $SK" -H 'content-type: application/json' \
-  -d '{"texts":["Refunds are accepted within 30 days of purchase."]}'
+  -d '{"filename":"refunds.md","text":"Refunds are accepted within 30 days of purchase.","external_id":"cms-42"}'
+# {"document_id":"…","status":"uploading","note":"indexing is asynchronous; poll GET /documents…"}
+#
+# Indexing happens in the WORKER, so this returns 202 and not an answer. That is deliberate:
+# it means there is exactly one path from text to vectors, and therefore one chunking recipe,
+# one payload shape, and one thing to delete.
 ```
 
 Both `cargo run -p api` and `cargo run -p worker` must be running, or the document sits at

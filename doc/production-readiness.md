@@ -9,7 +9,7 @@
 
 | # | Blocker | Severity | Closed by |
 | --- | --- | --- | --- |
-| 1 | `/ingest` vectors cannot be attributed to a document — no per-document erasure | **blocking** | [phase 11](feature/phase-11-ingest-gdpr.md) — designed |
+| 1 | ~~`/ingest` vectors cannot be attributed to a document~~ | ~~blocking~~ | **CLOSED** — [phase 11](feature/phase-11-ingest-gdpr.md), invariant 29 |
 | 2 | No tenant-level erasure, no erasure audit trail, history retains passage text | **blocking** | phase 12 (D8 of phase 11) — not designed |
 | 3 | No metrics, no alerting, no backups | **blocking** | not designed |
 | 4 | `failed` cannot tell a tenant whether to re-upload or wait | high | not designed |
@@ -48,9 +48,21 @@ Worth stating, because the list below is otherwise unbalanced and would misrepre
 
 ## Blockers
 
-### 1. `POST /ingest` writes vectors that cannot be attributed to a document — GDPR
+### 1. ~~`POST /ingest` writes vectors that cannot be attributed to a document~~ — CLOSED (phase 11)
 
-**Severity: blocking. This is the one to fix first.**
+**Closed.** `/ingest` now writes the caller's text to MinIO as an ordinary object and lets the worker
+index it, so it produces a real `documents` row and inherits the deletion saga. Verified live: after
+`DELETE /documents/{id}`, a search for the document's distinctive text returns zero hits and the
+collection holds zero points. Invariant 29 states the property; `crates/api/tests/ingest_erasure.rs`
+pins it, and the assertions were watched failing first.
+
+**One residue, and it is not fixable by code:** vectors written by the *old* path remain
+unattributed, because nothing ever recorded which call produced which point.
+`cargo run -p worker -- purge-unattributed [tenant] [--yes]` erases them — dry-run by default,
+scoped to one tenant, reporting counts before it deletes. Until an operator runs it, per-document
+erasure is impossible for that data specifically.
+
+The original assessment follows, for the record.
 
 `ingest` writes points with a random v4 id and a payload of exactly `text` + `tenant_id`
 (`crates/api/src/handlers.rs`). No `document_id`, no `chunk_index`, no `created_at`, and **no

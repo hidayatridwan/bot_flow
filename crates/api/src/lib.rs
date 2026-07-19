@@ -26,6 +26,11 @@ mod widget;
 pub mod config;
 pub mod state;
 
+/// Re-exported so the integration harness names the same collection the code does. It used a
+/// string literal until phase 11, and kept using the pre-phase-10 name after the rename — teardown
+/// deleted from a collection that no longer existed, silently, for a whole phase.
+pub use common::COLLECTION;
+
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -132,6 +137,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<(AppState, lapin::Co
         s3,
         s3_public,
         presign_ttl_secs: config.presign_ttl_secs,
+        max_upload_bytes: config.max_upload_bytes,
         amqp,
         rag_score_threshold: config.rag_score_threshold,
         redis,

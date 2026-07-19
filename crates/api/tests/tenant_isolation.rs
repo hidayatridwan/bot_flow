@@ -113,23 +113,18 @@ async fn one_tenant_cannot_read_or_delete_anothers_document() {
 #[ignore = "needs docker compose services + the bot_flow_test database"]
 async fn one_tenant_cannot_search_anothers_vectors() {
     let app = TestApp::new().await;
-    let (_a_id, a_key) = app.create_tenant().await;
+    let (a_id, a_key) = app.create_tenant().await;
     let (_b_id, b_key) = app.create_tenant().await;
 
     // A nonce, so this assertion cannot be satisfied by leftover data in the shared collection.
     let nonce = format!("nonce-{}", uuid::Uuid::new_v4().simple());
     let passage = format!("{nonce} refunds are accepted within thirty days of purchase");
 
-    let (status, body) = app
-        .request(
-            json_request("POST", "/ingest", &a_key)
-                .body(Body::from(
-                    serde_json::json!({"texts": [passage]}).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(status, 200, "ingest failed: {body}");
+    // Planted directly rather than through `/ingest`. Since phase 11 that route stores an object
+    // and lets the worker index it, and the harness runs no worker — but the better reason is that
+    // this test is about the **Qdrant tenant filter**, and it should fail for that reason or not at
+    // all. Depending on the ingestion path made it a test of two things.
+    app.plant_chunk(&a_id, &passage).await;
 
     // THE CONTROL, FIRST. If A cannot find its own passage, the denial assertion below is
     // worthless — a broken stub or a mis-set score floor makes *everyone* see nothing, and the test
