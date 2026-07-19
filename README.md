@@ -224,7 +224,8 @@ bun run dev             # http://localhost:5173
 
 Its own `.env` is separate from the root one and holds **no secrets** — just where to find the API.
 Sign up at `/signup`; you land on a page that shows your `sk_` exactly once. Then `/documents` lists
-your library and uploads to it. See [`doc/feature/`](doc/feature/) for the design of each phase.
+your library and uploads to it. See [`doc/feature/`](doc/feature/) for the design of each phase, and
+[`doc/production-readiness.md`](doc/production-readiness.md) for what currently blocks going live.
 
 ```bash
 bun run test            # unit tests: the validation mirrors, the error maps, the api client, the SSE decoder

@@ -504,6 +504,9 @@ writing the code.
 ## Known state & debt
 
 Honest inventory. Each entry states the impact, not merely the fact.
+**[`doc/production-readiness.md`](doc/production-readiness.md) is the narrower filter over this list**:
+it asks only what stops real customers using the system, and orders by that. This section is the
+superset — everything known, whether or not it blocks.
 
 - **`POST /ingest` violates the document model.** It writes vectors with random ids and **no
   `document_id` payload**. So: re-ingesting the same text *duplicates* the vectors (invariant 9 does
