@@ -387,6 +387,7 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Drop the `lapin::Connection` returned by `build_state` | Bind it (`let (state, _amqp) = ..`) for the state's whole life | It closes the `Channel` inside `AppState`, and the only symptom anywhere is `/health` reporting rabbitmq down. `build_state` returns it rather than hiding it in `main` so the compiler carries half of this |
 | Let a test skip itself when its service is missing | Fail, or do not run it at all | A silent skip turns "untested" into "green" — the same lie as the superuser trap, and worse than a visible gap |
 | Rely on a test's own `cleanup()` to keep the Qdrant collection clean | Also sweep stale test tenants at startup | `cleanup()` runs only when a test **passes**. A panicking test — i.e. every failing one, and every break-verification — strands its points forever, because `/ingest` writes them with random ids and no `document_id` and nothing in the product can remove them. Observed: this suite's own break table leaked four tenants |
+| List only the tables you name in a `TRUNCATE … CASCADE` prompt | Name what CASCADE will reach as well | `accounts` and `sessions` hang off `tenants` by FK, so a wipe of "tenants, api_keys, documents" silently destroys every dashboard login too. Verified from the `NOTICE` output. A prompt that understates its blast radius is approved by someone who did not know what they were approving |
 
 The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
 The worker classifies these into fatal-vs-retryable. It is a cross-language contract and neither side
@@ -476,6 +477,7 @@ writing the code.
 | Status → user-facing copy; where invariant 16 is enforced *in the UI* | `web/src/lib/features/documents/status.ts` |
 | The two BFF routes a browser fetches directly — the shared origin / content-type / `locals.session` guard chain, and why it is not `requireUser` | `web/src/routes/(authenticated)/documents/upload-url/+server.ts` (mint + re-mint) and `.../playground/ask/+server.ts` (the SSE proxy) |
 | Migrations — forward-only, run at API startup on the admin pool, which is then closed | `crates/api/migrations/` |
+| Clean-slate wipe of all five stores, plus `bot_flow_test` and `eval_bench`. Names `accounts`/`sessions` in its prompt because `CASCADE` reaches them either way | `scripts/reset.sh` |
 
 ## Known state & debt
 

@@ -351,14 +351,32 @@ Redis — for a clean-slate dev run. It leaves `_sqlx_migrations` and the MinIO 
 intact, so the API still boots and uploads still notify the worker.
 
 ```bash
-./scripts/reset.sh              # full wipe (incl. tenants + api_keys); prompts for confirmation
-./scripts/reset.sh -y           # same, no prompt
-./scripts/reset.sh --keep-auth  # keep tenants + api_keys, wipe only documents/conversations/messages
+./scripts/reset.sh                 # full wipe; prompts for confirmation
+./scripts/reset.sh -y              # same, no prompt
+./scripts/reset.sh --keep-auth     # keep tenants, api_keys, accounts and sessions
+./scripts/reset.sh --keep-test-db  # leave the integration suite's bot_flow_test alone
 ```
 
+**A full wipe destroys your dashboard logins, not just your documents.** `accounts` and `sessions`
+have a foreign key to `tenants`, so `TRUNCATE … CASCADE` reaches them — the script names them in the
+prompt rather than letting you discover it at the login screen. `--keep-auth` keeps all four and wipes
+only `documents` / `conversations` / `messages`, which is usually what you want mid-development.
+
+It also clears two things that are easy to forget: the integration suite's `bot_flow_test` database
+(which accumulates a tenant per test and only self-sweeps debris older than an hour), and the retrieval
+bench's `eval_bench` collection. Both are recreated on demand, so there is nothing to restore.
+
 It drops the Qdrant collection rather than recreating it, so **restart `cargo run -p api` afterwards**
-(watch for the `dim=1536` log) — the collection is reborn correctly, with its tenant index, only at
-startup. A full wipe also invalidates your `sk_`/`pk_` keys; re-create a tenant to mint new ones.
+— the collection is reborn only at startup, and only then does its `tenant_id` index get created
+*before* any ingest, which is load-bearing rather than cosmetic. The script prints what it left behind
+so you can see the reset worked; verify the restart with:
+
+```
+collection 'documents' created (dim=1536, cosine) + tenant_id index
+```
+
+A full wipe also invalidates your `sk_`/`pk_` keys; re-create a tenant to mint new ones (the script
+prints the exact curl).
 
 ### Local dashboards
 
