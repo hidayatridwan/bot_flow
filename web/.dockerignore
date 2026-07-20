@@ -1,0 +1,16 @@
+# The build context is `web/`, so the repo-root .dockerignore does not apply here.
+#
+# `.env` first and explicitly: it holds no secrets today (just where to find the API), but it is the
+# file most likely to acquire one, and a build context is copied into a layer that outlives it.
+.env
+.env.*
+!.env.example
+
+node_modules/
+build/
+.svelte-kit/
+.git/
+
+# Test and tooling artefacts — nothing the build needs, and every megabyte here is a slower `COPY .`.
+coverage/
+*.log

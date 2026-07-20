@@ -1,8 +1,21 @@
 target/
 .git/
-.env
 sidecar/.venv/
 **/__pycache__/
 reqres/
 widget/
 *.md
+
+# `.env` alone was **root-anchored** — Docker matches patterns against the whole path relative to the
+# context root, so it never covered `web/.env`. That file was being copied into the Rust builder
+# layer on every image build. It does not reach the final api/worker images (those copy only the
+# binaries out of the builder), but it sat in the build cache, and it is the file most likely to
+# acquire a secret later.
+.env
+**/.env
+**/.env.*
+!**/.env.example
+
+# The web app builds from its own context (`web/Dockerfile`), so none of it belongs in the Rust
+# builder. `web/node_modules` alone is hundreds of megabytes of `COPY .` this image never reads.
+web/

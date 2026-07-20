@@ -489,6 +489,10 @@ Each of these exists in, or nearly slipped into, this codebase.
 | `ORDER BY created_at` when the SELECT has `created_at::text AS created_at` | Qualify it: `ORDER BY documents.created_at` | Postgres resolves a **bare** name in ORDER BY against the *output* list first, so the alias wins and the sort runs on the text rendering. Measured on 5k rows: `Seq Scan` + `Sort Key: ((created_at)::text)` at cost 371, versus an index scan with **no sort node** at cost 0.29 once qualified. The 0016 index exists for this one query and the bare form never touches it. It reads like a correctness bug too — the keyset `WHERE` compares `timestamptz` — but is not: `timestamptz` normalises to UTC and renders in one session zone, so text order agrees with chronological order. The bug is the plan, not the result |
 | Paginate a polled list with `LIMIT/OFFSET` | Keyset on `(created_at, id)` | A row inserted between two polls shifts every later row by one, so the reader sees a row twice or skips one — and neither is an error. The `id` half is not optional either: `created_at` defaults to `transaction_timestamp()`, so same-transaction rows are byte-identical, and a cursor without a tiebreaker loses exactly the rows on a boundary. Verified by deleting the tiebreaker: **5 of 9 documents vanished** and the listing still looked fine |
 | Build the cursor query string by concatenation | `URLSearchParams` / `encodeURIComponent` | The cursor carries `+00`, and a bare `+` in a query string decodes to a **space** — corrupting the offset, not merely the separator. It fails only at a page boundary, never on page one, which is where anyone would look |
+| Deploy `web/` without `ORIGIN` | Set it, or set both `PROTOCOL_HEADER` and `HOST_HEADER` | adapter-node infers the origin from the connection, so behind TLS termination the app sees `http://` while the browser sends `https://`. That mismatch fails SvelteKit's CSRF check **and** both hand-rolled `Origin` guards — every form post, upload and playground question 403s, with nothing in any log naming the cause. `env.ts` now refuses to boot without it |
+| Read a required env var lazily and call it validated | Check it at startup (`assertRuntimeEnv`) | A lazily-read `API_BASE_URL` let the process **start, bind, pass a TCP healthcheck, and then 500 every page**. An orchestrator calls that healthy. A process that refuses to start is a deploy that visibly fails |
+| Set `ASK_TIMEOUT_MS` below the API's `STREAM_DEADLINE` | Keep it strictly above (330s vs 300s) | The API's ceiling is *graceful* — it ends the stream with `done` and persists what arrived. The BFF's just aborts the fetch. If the BFF fires first the user loses the answer **and** the turn, which is the exact outcome `STREAM_DEADLINE` was designed to avoid. Two codebases, no compiler between them |
+| Assume `web/build/` needs `node_modules` at runtime | It does not | `adapter-node` emits a self-contained bundle — verified by running `node build/index.js` in an empty directory with no `node_modules` at all. The runtime image therefore copies only `build/`, and carries no package manager or dependency tree |
 | Return `404`/`422` from `/auth/password/forgot` for an unknown or malformed address | Always `202` | It is the same oracle `/auth/login` refuses to be, rebuilt on a new endpoint. Validating the *shape* leaks too: a 422 for a malformed address tells an attacker which shapes are accepted, and the two paths then differ. Garbage simply matches no row |
 | `await` the reset email before responding | Spawn it | A known address would then cost an SMTP round trip and an unknown one nothing, making the response *time* the oracle the status code is not. Measured after spawning: 2.3–3.3ms vs 1.5–2.5ms, overlapping |
 | Log the reset link "just while debugging" | Log that a send failed, and to whom | The link **is** the credential, and redeeming one takes the account outright. A link in a log file is invariant 14 broken by the newest secret in the system |
@@ -633,6 +637,8 @@ the code.
 | Browser-side ask: the relative-path/no-credential boundary, and where invariant 4's "a refusal is an answer" is decided by structure rather than by matching `NO_ANSWER` | `web/src/lib/features/chat/ask.ts` |
 | Citations in the UI — the only surface that renders them, and why `sources[].index` is never renumbered | `web/src/lib/features/chat/sources.ts` |
 | Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |
+| Startup config validation — why `ORIGIN` is refused-at-boot rather than discovered from a 403 | `web/src/lib/server/env.ts` (`assertRuntimeEnv`) |
+| The web image: bun builds, node runs, and only `build/` ships | `web/Dockerfile` |
 | Typed API client: `ApiResult`, the JSON-vs-`text/plain` split, timeouts | `web/src/lib/server/api/` |
 | The SSE proxy: why the JSON client cannot carry a stream, and the ceiling that replaces its 10s | `web/src/lib/server/api/stream.ts` |
 | Session + one-time-key cookies; `requireUser` vs `requireSession` | `web/src/lib/server/auth/` |
@@ -822,8 +828,22 @@ superset — everything known, whether or not it blocks.
   redemption query — but the table only grows). And **delivery has no automated test**: the harness
   points `SMTP_URL` at a dead port on purpose, so the mail path is covered by a manual Mailpit drill
   recorded in the phase doc, while the suite covers redemption, revocation and the non-oracle.
-- **No `.env.example`**, though `.gitignore` expects one. A new contributor reconstructs the required
-  configuration from `config.rs`. Names only, values blank; its absence is pure friction.
+- **`web/` is deployable now (phase 17), and `.env.example` exists.** The web app had no deployment
+  path at all: the root `Dockerfile` built only the Rust binaries, compose had no `web` service, and
+  `package.json` had no `start` script, so `bun run build` produced an artifact nothing ever ran.
+  There is now `web/Dockerfile` (bun builds, **node** runs — `adapter-node`'s tested target), a
+  `start` script, and an **opt-in** compose profile so `docker compose up -d` still starts only the
+  backing services. `docker compose --profile full up -d --build web` brings the image up locally,
+  which is what stops it rotting unnoticed.
+  **The `ORIGIN` half mattered more than the packaging.** Behind TLS termination adapter-node infers
+  `http://` while the browser sends `https://`, and every form post 403s — see the trap table.
+  `assertRuntimeEnv` now refuses to boot without it, and checks `API_BASE_URL` and the numeric vars
+  at startup rather than on the first request.
+  Two residues. **`ASK_TIMEOUT_MS` was below the API's `STREAM_DEADLINE`** (120s vs 300s) so the BFF
+  cut long answers before the API's graceful ceiling could — now 330s, but the ordering is a
+  cross-codebase invariant with nothing enforcing it. And CI now runs `bun run build`, which it
+  never did: the adapter lives in `vite.config.ts` (there is no `svelte.config.js`), so a
+  build-breaking change used to ship green.
 
 ## Working here
 

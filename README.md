@@ -149,7 +149,14 @@ sidecar/.venv/bin/pip install -r sidecar/requirements.txt
 
 ### 3. Configure the environment
 
-Create a `.env` in the repo root. These values line up with `docker-compose.yml`:
+Copy the template and fill in the three keys:
+
+```bash
+cp .env.example .env
+```
+
+`.env.example` is generated from `config.rs`, so it is the authoritative list of what the API reads;
+secrets are blank and everything else lines up with `docker-compose.yml`. The full block, annotated:
 
 ```ini
 DATABASE_URL=postgres://bot_flow:bot_flow@localhost:5432/bot_flow      # migrations only (superuser)
@@ -871,10 +878,50 @@ the `allowed_origins` you minted the key with.
 
 ## Building the container images
 
-The `Dockerfile` is multi-stage with two targets. `api` is a slim Debian image with just the
-binary; `worker` additionally carries Python 3 and the sidecar's dependencies.
+Two Dockerfiles, because the two halves have nothing in common. The root one is multi-stage with two
+targets: `api` is a slim Debian image with just the binary, `worker` additionally carries Python 3
+and the sidecar's dependencies.
 
 ```bash
 docker build --target api    -t bot_flow-api    .
 docker build --target worker -t bot_flow-worker .
+docker build -t bot_flow-web ./web            # note the context: web/, not the repo root
 ```
+
+`web/Dockerfile` builds with **bun** and runs on **node**. bun owns `bun.lock` and is what CI uses,
+so the dependency graph it resolves is the one that was tested; `adapter-node` targets Node
+specifically, so that is what runs it. The runtime stage copies **only `build/`** — verified: the
+adapter's output is self-contained and serves pages with no `node_modules` present at all, so the
+image carries no package manager and no dependency tree.
+
+### Running the web app
+
+```bash
+docker run --rm -p 5173:3000 \
+  -e API_BASE_URL=http://api.internal:3000 \
+  -e ORIGIN=https://app.example.com \
+  bot_flow-web
+```
+
+Or locally, against the host's API, via the opt-in compose profile — `docker compose up -d` still
+starts only the backing services:
+
+```bash
+docker compose --profile full up -d --build web   # http://localhost:5173
+```
+
+**`ORIGIN` is required and the server refuses to start without it.** This is the one variable whose
+absence breaks production hardest and least visibly: `adapter-node` infers the request origin from
+the connection, so behind a TLS-terminating proxy the app sees `http://` while the browser sends
+`Origin: https://`. That mismatch fails SvelteKit's CSRF check *and* both hand-rolled `Origin`
+guards, so every form post, every upload and every playground question returns `403` — an app that
+looks deployed and cannot be used, with nothing in any log naming the cause. Set `ORIGIN`, or set
+both `PROTOCOL_HEADER` and `HOST_HEADER` to trust your proxy's forwarding headers.
+
+`API_BASE_URL` is checked at startup too, for a related reason: read lazily, a missing value let the
+process **start, bind its port, pass a TCP healthcheck, and then 500 every page**. An orchestrator
+calls that healthy. A process that refuses to start is a deploy that visibly fails.
+
+Not solved here, and worth knowing before you ship: the app sets **no security response headers** —
+no `X-Frame-Options`, CSP, HSTS or `Referrer-Policy`. See
+[`doc/production-readiness.md`](doc/production-readiness.md).

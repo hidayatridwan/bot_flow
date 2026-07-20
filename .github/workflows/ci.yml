@@ -116,6 +116,11 @@ jobs:
 
       - run: bun run check
 
+      # The build was never run here, so a build-breaking change shipped green — and the adapter
+      # lives in `vite.config.ts` (there is no svelte.config.js), which is exactly the kind of
+      # config nothing else exercises. It is also the artifact `web/Dockerfile` ships.
+      - run: bun run build
+
       # NOT `bun run lint`. It is `prettier --check . && eslint .`, and prettier fails on ~208
       # vendored lib/components/ui/ files that predate the config — so the command exits non-zero on
       # a clean checkout and eslint never runs behind it. Gating every PR on that backlog would

@@ -21,24 +21,26 @@
 | 4 | ~~`failed` cannot tell a tenant whether to re-upload or wait~~ | ~~high~~ | **CLOSED** — [phase 14](feature/phase-14-failure-classification.md) |
 | 5 | ~~`GET /documents` unpaginated; `/auth/keys` unmetered; `/ask/stream` unbounded~~ | ~~high~~ | **CLOSED** — [phase 15](feature/phase-15-bounded-reads.md) |
 | 6 | ~~No account recovery — a forgotten password is unrecoverable, and no email is ever sent~~ | ~~blocking~~ | **CLOSED** — [phase 16](feature/phase-16-account-recovery.md) |
-| 7 | **`web/` has no deployment path, and 403s everything behind TLS as configured** | blocking | not designed |
+| 7 | ~~`web/` has no deployment path, and 403s everything behind TLS as configured~~ | ~~blocking~~ | **CLOSED** — [phase 17](feature/phase-17-web-deployment.md) |
 | 8 | **The dashboard advertises features that do not exist**, and has no error page | high | not designed |
 
-**Blockers 1–5 (the API) are closed** by phases 11–15. **Blocker 6 is closed** by phase 16.
-**Blockers 7 and 8 remain**, and both are in `web/` — they are not regressions, they were simply
-never assessed until 2026-07-20.
+**Blockers 1–7 are closed**, by phases 11–17. **Blocker 8 is what is left** — the dashboard
+advertising features that do not exist — and it is the only one on this list that has never lost
+data, hidden a failure, or stopped anyone deploying. It is a credibility problem, not a correctness
+one.
 
 Re-verified 2026-07-20 after phase 15: `GET /documents` bounds every caller — including one sending
 no parameters — and pages by keyset cursor; `POST /auth/keys` returns 429 past its own bucket's
 limit; and `/ask/stream` carries a 300s wall clock that ends the stream with `done` rather than
 discarding the answer. There is still **no** endpoint exposing `documents.error`.
 
-Also verified 2026-07-20, by reading the files rather than recalling them: the root `Dockerfile`
-never mentions `web`, `node` or `bun`; `docker-compose.yml` has no `web` service; `web/package.json`
-has no `start` script; `hooks.server.ts` sets **no** response headers; and
+Re-verified after phase 17: `web/Dockerfile` exists and its image boots, refuses to start without
+`ORIGIN`, runs as non-root and carries no `node_modules`; `docker compose --profile full up -d web`
+serves the app and a no-JS form post through it reaches the API and Mailpit; and
+`docker compose config --services` still omits `web` without the profile. What remains true from the
+original audit: `hooks.server.ts` sets **no** response headers, and
 `web/src/routes/(authenticated)/dashboard/+page.svelte` is one line containing the text
-`dashboard tenant`. (The mail grep that used to appear here now returns plenty — that is blocker 6
-closing, and the phase-16 doc records what it looked like before.)
+`dashboard tenant`.
 
 ## Verdict
 
@@ -60,10 +62,10 @@ rather than a query param (invariant 22), an API outage renders an alert rather 
 library, and both JSON endpoints hand-roll an `Origin` check because SvelteKit's CSRF guard never
 sees a JSON POST. Cookies are `httpOnly`, `secure: !dev`, `sameSite: 'lax'`.
 
-**Everything around that path is still missing**, and two pieces of it block going live — see
-blockers 7 and 8. The shortest statement of what is left: *the app cannot be deployed by any means in this repo, and
-the sidebar offers a fresh signup a Billing page that does not exist.* A forgotten password is no
-longer on that list.
+**What is left is blocker 8 alone**: the dashboard advertises features that do not exist. A fresh
+signup lands on a page reading `dashboard tenant`, is offered a Billing link that goes nowhere, and
+gets unstyled framework chrome on any 404. None of that loses data or stops a deploy — it costs
+trust, which is why it is filed high rather than blocking.
 
 Standing deployment gaps, unchanged and still not code blockers:
 
@@ -76,8 +78,10 @@ Standing deployment gaps, unchanged and still not code blockers:
   but **never `build`**, so a build-breaking change ships green.
 - **`app_user` ships the dev password** from migration 0005 unless the role is pre-created.
 
-A design-partner or internal pilot, with accounts created by an operator, is well served today.
-Self-serve signup is now blocked on 7 alone — the app has no deployment path.
+A design-partner or internal pilot is well served today, and self-serve signup is no longer blocked
+by anything on this list. Before opening it to strangers, the four deployment gaps above still want
+doing — **especially the alerts**, since nothing here pages a human — and blocker 8 is worth an hour
+so the product does not promise what it cannot deliver.
 
 The distinction is not polish. Most of what goes wrong in this system goes wrong *quietly* — a
 plausible answer, a silent refusal, a partially re-indexed collection. That is the specific reason
@@ -270,34 +274,33 @@ the harness points `SMTP_URL` at a dead port on purpose, and the mail path is a 
 recorded in the phase doc. Self-serve account deletion and renaming a tenant, which this entry also
 named, are not built.
 
-### 7. `web/` cannot be deployed, and would 403 everything if it were
+### 7. ~~`web/` cannot be deployed, and would 403 everything if it were~~ — CLOSED (phase 17)
 
-Two independent problems, both invisible in development.
+**Closed.** `web/Dockerfile` builds with bun and runs on node; `package.json` gained a `start`
+script; `docker-compose.yml` gained an **opt-in** `full` profile so the default `up` still starts
+only the backing services, while something routinely builds the image.
 
-**There is no deployment path.** The root `Dockerfile` builds only the Rust binaries — it never
-mentions `web`, `node` or `bun`. `docker-compose.yml` has no `web` service. `web/package.json` has no
-`start` script, so nothing invokes the `build/index.js` that `adapter-node` emits. The app builds
-locally (verified: `bun run build` succeeds and produces `handler.js`/`index.js`) and there is no
-artifact, process manager or documented command to run it anywhere.
+**The `ORIGIN` half is the part that mattered**, and it is now enforced rather than documented.
+`assertRuntimeEnv()` runs at server start — from `hooks.server.ts`, guarded by `!building` — and the
+process exits naming what is missing. Verified against the real build output: no `API_BASE_URL`
+exits 1, no `ORIGIN` exits 1 with the explanation, `SESSION_TTL_SECS=30d` exits 1, everything set
+serves `/login`.
 
-**And behind TLS termination it would refuse every write.** `adapter-node` derives `url.origin` from
-the request, so a proxy terminating TLS leaves the app seeing `http://…` while the browser sends
-`Origin: https://…`. That mismatch fails SvelteKit's `csrf.checkOrigin` **and** both hand-rolled
-guards in `documents/upload-url/+server.ts:26-31` and `playground/ask/+server.ts:28-36`. Every form
-post, every upload, every playground question: 403.
+That last one was a quieter bug of the same family: `Number('30d')` is `NaN`, which becomes a cookie
+`maxAge` of `NaN`, which browsers drop — sessions would simply stop persisting.
 
-The fix is the `ORIGIN` env var, and it appears in this repo exactly once — **commented out**, in
-`web/.env.example:26`. `web/src/lib/server/env.ts` never reads it, never requires it, never warns.
-The single variable whose absence breaks production hardest is the one with no enforcement, while
-`API_BASE_URL` — which does have `required()` — throws on the *first request* rather than at boot, so
-a port-open healthcheck reports a healthy server that 500s every page.
+**One thing the audit got wrong, corrected by measuring.** It flagged the empty `dependencies` as a
+deployment problem. It is not: `adapter-node` emits a self-contained bundle, verified by running
+`node build/index.js` in an empty directory with no `node_modules` at all. The runtime image copies
+only `build/` and carries no dependency tree.
 
-Adjacent, same area, cheap: `.dockerignore` excludes `widget/` but not `web/`, and its `.env` pattern
-is root-anchored — so `web/.env` and `web/node_modules` are copied into the Rust builder context.
-They do not reach the final images, which copy only the binaries, but they are in the build cache.
+**And one bug this phase found in phase 15's work:** `ASK_TIMEOUT_MS` defaulted to 120s while the
+API's `STREAM_DEADLINE` is 300s, so the BFF cut long answers *before* the API's graceful ceiling
+could persist the partial answer — defeating that design one layer up. Now 330s.
 
-*Closes when:* a `web` image (or documented run command) exists, `ORIGIN` is required at boot beside
-`API_BASE_URL`, and CI runs `bun run build`.
+**What is deliberately still open:** the image is not published and no CI job builds it; the
+`ASK_TIMEOUT_MS` > `STREAM_DEADLINE` ordering is a cross-codebase invariant with nothing enforcing
+it; and there is no filesystem hardening beyond `USER node`.
 
 ### 8. The dashboard advertises features that do not exist
 
@@ -401,8 +404,6 @@ The `web/` blockers are claims about absence, which is the kind that rots quietl
 does not make this document wrong loudly. Each is a one-line check:
 
 ```bash
-grep -n "web\|bun\|node" Dockerfile                            # blocker 7: expect no output
-grep -n "ORIGIN" web/src/lib/server/env.ts                     # blocker 7: expect no output
 grep -rn "url: '#'" web/src/lib/components/app-sidebar.svelte  # blocker 8: 3 left (the Config group)
 grep -n "Billing" web/src/lib/components/nav-user.svelte       # blocker 8: an inert menu item
 find web/src -name "+error.svelte"                             # blocker 8: expect no output
