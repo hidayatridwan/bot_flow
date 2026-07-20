@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { ApiError } from '$lib/types/api';
-import { mapLoginError, mapRegisterError, toFailStatus } from './error-map';
+import {
+	mapChangePasswordError,
+	mapForgotPasswordError,
+	mapLoginError,
+	mapRegisterError,
+	mapResetPasswordError,
+	toFailStatus
+} from './error-map';
 
 const error = (status: number, message: string, kind: ApiError['kind'] = 'client'): ApiError => ({
 	status,
@@ -81,5 +88,49 @@ describe('toFailStatus', () => {
 
 	it('turns a transport failure (status 0) into something fail() accepts', () => {
 		expect(toFailStatus(error(0, 'could not reach the api', 'transport'))).toBe(503);
+	});
+});
+
+describe('mapForgotPasswordError — the address must stay invisible', () => {
+	it('never attaches an error to a field', () => {
+		// The API answers 202 for a registered address, an unregistered one, and garbage. Any
+		// field-level message here would be a signal the API deliberately refused to send — the same
+		// oracle rebuild that mapLoginError exists to prevent.
+		for (const e of [
+			error(429, 'rate limit exceeded'),
+			error(500, 'boom', 'server'),
+			error(0, 'unreachable', 'transport')
+		]) {
+			expect(mapForgotPasswordError(e).field).toBeNull();
+		}
+	});
+});
+
+describe('mapResetPasswordError', () => {
+	it('gives a dead link one message and a way forward', () => {
+		// Expired, already used and never existed are one 400 by design — the API cannot tell them
+		// apart either. Guessing which would be inventing detail.
+		const { field, message } = mapResetPasswordError(
+			error(400, 'this reset link is invalid or has expired')
+		);
+		expect(field).toBeNull();
+		expect(message).toMatch(/invalid or has expired/i);
+		expect(message).toMatch(/new one/i);
+	});
+});
+
+describe('mapChangePasswordError — a wrong password is not an expired session', () => {
+	it('maps 403 to the current-password field, never to the form', () => {
+		// This is the one that matters. The API returns 403 rather than 401 precisely so the BFF does
+		// not read a typo as a dead session and sign the user out (invariant 21). Landing it anywhere
+		// other than the field they mistyped throws that away.
+		const { field, message } = mapChangePasswordError(error(403, 'current password is incorrect'));
+		expect(field).toBe('currentPassword');
+		expect(message).toMatch(/current password/i);
+	});
+
+	it('does not treat a 403 as a rate limit or an outage', () => {
+		expect(mapChangePasswordError(error(429, '')).field).toBeNull();
+		expect(mapChangePasswordError(error(0, '', 'transport')).field).toBeNull();
 	});
 });

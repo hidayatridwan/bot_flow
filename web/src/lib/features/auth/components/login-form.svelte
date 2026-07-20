@@ -15,9 +15,14 @@
 
 	let {
 		data,
+		justReset = false,
 		class: className,
 		...restProps
-	}: { data: SuperValidated<Infer<LoginSchema>> } & HTMLAttributes<HTMLDivElement> = $props();
+	}: {
+		data: SuperValidated<Infer<LoginSchema>>;
+		/** Arrived here from a completed password reset, which signs every session out. */
+		justReset?: boolean;
+	} & HTMLAttributes<HTMLDivElement> = $props();
 
 	// superForm takes the initial value and owns the state from there — the reactive read is the point.
 	// svelte-ignore state_referenced_locally
@@ -39,6 +44,16 @@
 			<!-- No `action`: a bare method="POST" posts to location.href, so ?redirectTo survives. -->
 			<form method="POST" use:enhance>
 				<FieldGroup>
+					{#if justReset}
+						<!-- Without this, a successful reset dumps the user back on a bare login form with no
+						     sign anything worked — indistinguishable from the link having failed. -->
+						<Alert.Root>
+							<Alert.Description>
+								Your password has been changed. Log in with your new password.
+							</Alert.Description>
+						</Alert.Root>
+					{/if}
+
 					{#if formErrors.length > 0}
 						<Alert.Root variant="destructive">
 							<Alert.Description>{formErrors[0]}</Alert.Description>
@@ -91,7 +106,10 @@
 							{#snippet children({ props })}
 								<div class="flex items-center">
 									<Form.Label>Password</Form.Label>
-									<a href="##" class="ms-auto text-sm underline-offset-4 hover:underline">
+									<a
+										href={resolve('/forgot-password')}
+										class="ms-auto text-sm underline-offset-4 hover:underline"
+									>
 										Forgot your password?
 									</a>
 								</div>

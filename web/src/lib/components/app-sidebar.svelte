@@ -61,24 +61,16 @@
 			},
 			{
 				title: 'Settings',
-				url: '#',
+				url: '/settings/password',
 				icon: Settings2Icon,
+				// One real entry, not four mock ones. General/Team/Billing/Limits used to sit here
+				// pointing at '#', which advertised billing and team management to a signup that has
+				// neither — a worse failure than an obviously short menu, because it is only
+				// discovered after someone clicks. Add entries here when the pages exist.
 				items: [
 					{
-						title: 'General',
-						url: '#'
-					},
-					{
-						title: 'Team',
-						url: '#'
-					},
-					{
-						title: 'Billing',
-						url: '#'
-					},
-					{
-						title: 'Limits',
-						url: '#'
+						title: 'Password',
+						url: '/settings/password'
 					}
 				]
 			}

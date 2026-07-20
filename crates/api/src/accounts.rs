@@ -243,6 +243,255 @@ pub async fn login(
     })))
 }
 
+/// How long a reset link stays usable.
+///
+/// One hour is the standard trade: long enough to survive a slow mail relay and a user who reads
+/// mail on their phone twenty minutes later, short enough that a link sitting in an inbox archive
+/// is not a permanent key to the account. Named here rather than in `.env` for the same reason as
+/// every other bound in this codebase — it is a security property, not a deployment preference.
+const RESET_TTL_SECS: i64 = 3600;
+
+#[derive(Deserialize)]
+pub struct ForgotPasswordRequest {
+    email: String,
+}
+
+/// `POST /auth/password/forgot` — public. Emails a reset link, and says nothing about whether it did.
+///
+/// **This endpoint always answers `202`.** Unknown address, known address, mail server on fire — the
+/// same status, the same empty body. That is invariant 18's non-oracle rule arriving at a third
+/// public endpoint: `/auth/login` refuses to reveal which emails exist, and an endpoint that
+/// answered `404 no such account` would hand back exactly what login withholds.
+///
+/// The rule has a second, less obvious half: **timing**. If a known address meant "insert a row and
+/// hold an SMTP conversation" while an unknown one returned immediately, the response *time* would
+/// be the oracle the status code is not. So delivery is spawned and never awaited.
+///
+/// Be precise about what that buys, because "constant time" would be an overclaim: it removes the
+/// SMTP conversation — tens to hundreds of milliseconds, and the only difference big enough to read
+/// over a network — but a known address still costs one extra `INSERT`. Measured locally over eight
+/// interleaved pairs: known 2.3–3.3ms, unknown 1.5–2.5ms, with the ranges overlapping. That residue
+/// is sub-millisecond and swamped by jitter on any real link; it is a difference, not an oracle.
+/// Closing it entirely would mean inserting a throwaway row for addresses that do not exist, which
+/// trades a measurable-in-a-lab signal for a table anyone can grow at will.
+pub async fn forgot_password(
+    State(state): State<AppState>,
+    Json(req): Json<ForgotPasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    let email = req.email.trim().to_string();
+    // Per-email, exactly like login: the thing being brute-forced is one account, and a global
+    // bucket would let one attacker lock every tenant out of their own recovery flow.
+    rate_limit::check(&state, &format!("auth:forgot:{}", email.to_lowercase())).await?;
+
+    // Deliberately *not* validated with `is_plausible_email`. A 422 for a malformed address is a
+    // free existence check for a well-formed one — the caller learns "this shape is accepted",
+    // and more importantly the two paths would diverge in shape. Garbage simply matches no row.
+    let row = sqlx::query("SELECT id FROM accounts WHERE lower(email) = lower($1)")
+        .bind(&email)
+        .fetch_optional(&state.db)
+        .await?;
+
+    if let Some(row) = row {
+        let account_id: uuid::Uuid = row.get("id");
+        let token = auth::generate_reset_token();
+
+        // Only the hash is stored (invariant 14, extended to the newest credential in the system).
+        // A dump of this table is a list of accounts that recently asked, not a set of live links.
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (token_hash, account_id, expires_at) \
+             VALUES ($1, $2, now() + ($3 * interval '1 second'))",
+        )
+        .bind(auth::hash_key(&token))
+        .bind(account_id)
+        .bind(RESET_TTL_SECS)
+        .execute(&state.db)
+        .await?;
+
+        // The link points at the **web app**, which is what a human opens. The token rides in the
+        // query string because that is the only place a link can carry it; it is single-use and
+        // hour-bounded precisely because a URL is the leakiest place a credential can sit (history,
+        // `Referer`, shoulder-surfing).
+        let link = format!(
+            "{}/reset-password?token={}",
+            state.app_base_url.trim_end_matches('/'),
+            token
+        );
+
+        // Spawned, not awaited — the timing half of the non-oracle rule above. It also means a dead
+        // relay cannot hang this request, and it is why the handler cannot report a send failure:
+        // by the time one is known, the caller has its 202. `mail.rs` logs it.
+        //
+        // The cost, stated because it is real: an email lost to a crash between here and delivery is
+        // lost silently, and the user must ask again. A durable outbox is the fix and is not built.
+        let mailer = state.mailer.clone();
+        let to = email.clone();
+        tokio::spawn(async move {
+            if let Err(e) = mailer.send_password_reset(&to, &link).await {
+                tracing::error!("password reset email failed: {e:#}");
+            }
+        });
+    }
+
+    // 202, not 204: something may be happening asynchronously, and this status says exactly that
+    // without saying whether it is.
+    Ok(StatusCode::ACCEPTED)
+}
+
+#[derive(Deserialize)]
+pub struct ResetPasswordRequest {
+    token: String,
+    password: String,
+}
+
+/// `POST /auth/password/reset` — public. Redeems a reset token and sets a new password.
+///
+/// Three properties worth stating, because each is a way this goes wrong quietly:
+///
+/// * **Single use, enforced by the database.** The `UPDATE … WHERE used_at IS NULL … RETURNING` is
+///   atomic, so two concurrent redemptions of one token cannot both win. A read-then-write would
+///   race, and the loser would be a second password change nobody asked for.
+/// * **Every session is revoked.** Whoever asked for this reset may be recovering *from* a
+///   compromise, and a password change that leaves the attacker's session alive is theatre.
+/// * **Every other outstanding token is burned.** Ask three times, use one, and the other two links
+///   are dead — otherwise the older emails stay live for an hour after the account is secured.
+pub async fn reset_password(
+    State(state): State<AppState>,
+    Json(req): Json<ResetPasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    // Bucketed on the token, so guessing is bounded without letting one attacker exhaust a shared
+    // window and block real resets. The token is high-entropy; this is depth, not the defence.
+    rate_limit::check(
+        &state,
+        &format!("auth:reset:{}", auth::hash_key(&req.token)),
+    )
+    .await?;
+
+    if req.password.len() < 8 {
+        return Err(AppError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "password must be at least 8 characters",
+        ));
+    }
+
+    // Hash the new password *before* opening the transaction: Argon2 is deliberately slow, and
+    // holding a row lock across it would serialise unrelated resets.
+    let phc = hash_password(&req.password)?;
+
+    let mut tx = state.db.begin().await?;
+
+    // Expired, already-used and never-existed all fail this one statement, and all produce the same
+    // error below — the same non-oracle discipline as the session lookup in `auth.rs`.
+    let redeemed = sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = now() \
+          WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() \
+      RETURNING account_id",
+    )
+    .bind(auth::hash_key(&req.token))
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(row) = redeemed else {
+        return Err(AppError::client(
+            StatusCode::BAD_REQUEST,
+            "this reset link is invalid or has expired",
+        ));
+    };
+    let account_id: uuid::Uuid = row.get("account_id");
+
+    sqlx::query("UPDATE accounts SET password_hash = $1 WHERE id = $2")
+        .bind(&phc)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Burn the rest of this account's outstanding links (see the doc comment).
+    sqlx::query(
+        "UPDATE password_reset_tokens SET used_at = now() \
+          WHERE account_id = $1 AND used_at IS NULL",
+    )
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Log everyone out, everywhere. The user re-authenticates with the password they just chose.
+    sqlx::query("DELETE FROM sessions WHERE account_id = $1")
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    // No session is issued. Redeeming a link proves control of the inbox, not of the password —
+    // and the user has just chosen one, so making them use it costs a form and closes the gap
+    // where a leaked link becomes a live session without the password ever being typed.
+    tracing::info!(account = %account_id, "password reset completed; all sessions revoked");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+/// `POST /auth/password` — session-authenticated. Change a password you still know.
+///
+/// The current password is required even though the caller already holds a valid session: a session
+/// is a bearer token, and one that has been stolen must not be enough to take the account. This is
+/// the check that keeps a stolen `sess_` a temporary problem.
+///
+/// Revokes every *other* session and keeps this one, which is the opposite of the reset path and
+/// deliberately so — the user is here, authenticated, and logging them out of the tab they are
+/// using would be punishing them for good hygiene.
+pub async fn change_password(
+    session: SessionAuth,
+    State(state): State<AppState>,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    rate_limit::check(&state, &format!("auth:change:{}", session.tenant_id)).await?;
+
+    if req.new_password.len() < 8 {
+        return Err(AppError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "password must be at least 8 characters",
+        ));
+    }
+
+    let row = sqlx::query("SELECT password_hash FROM accounts WHERE id = $1")
+        .bind(session.account_id)
+        .fetch_optional(&state.db)
+        .await?
+        // The session resolved, so the account exists; if it does not, something deleted it
+        // mid-request and that is ours, not the caller's.
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("session outlived its account")))?;
+
+    let stored: String = row.get("password_hash");
+    if !verify_password(&req.current_password, &stored) {
+        // 403, not 401: the caller *is* authenticated, and a 401 would tell the web app its session
+        // had expired — logging the user out because they mistyped a password.
+        return Err(AppError::client(
+            StatusCode::FORBIDDEN,
+            "current password is incorrect",
+        ));
+    }
+
+    let phc = hash_password(&req.new_password)?;
+    let mut tx = state.db.begin().await?;
+    sqlx::query("UPDATE accounts SET password_hash = $1 WHERE id = $2")
+        .bind(&phc)
+        .bind(session.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sessions WHERE account_id = $1 AND token_hash <> $2")
+        .bind(session.account_id)
+        .bind(&session.token_hash)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `POST /auth/logout` — deletes just the current session (identified by its token hash).
 pub async fn logout(
     session: SessionAuth,

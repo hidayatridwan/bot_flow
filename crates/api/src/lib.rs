@@ -18,6 +18,7 @@ mod erasure;
 mod error;
 mod handlers;
 mod llm;
+mod mail;
 mod metrics;
 mod queue;
 mod rate_limit;
@@ -154,6 +155,10 @@ pub async fn build_state(config: &Config) -> anyhow::Result<(AppState, Arc<lapin
         metrics: Arc::new(crate::metrics::Metrics::default()),
         amqp_conn: Arc::clone(&amqp_conn),
         session_ttl_secs: config.session_ttl_secs,
+        // Built here, at boot, so a malformed SMTP_URL is a startup failure rather than a silent
+        // one discovered by the first person who cannot log in.
+        mailer: crate::mail::Mailer::from_url(&config.smtp_url, &config.mail_from)?,
+        app_base_url: config.app_base_url.clone(),
     };
 
     Ok((state, amqp_conn))
@@ -208,6 +213,11 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/register", post(accounts::register))
         .route("/auth/login", post(accounts::login))
         .route("/auth/logout", post(accounts::logout))
+        // Public, like register and login, and rate limited for the same reason (invariant 18).
+        .route("/auth/password/forgot", post(accounts::forgot_password))
+        .route("/auth/password/reset", post(accounts::reset_password))
+        // Session-authenticated: changing a password you still know.
+        .route("/auth/password", post(accounts::change_password))
         .route("/auth/me", get(accounts::me))
         .route(
             "/auth/keys",

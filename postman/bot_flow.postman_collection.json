@@ -582,6 +582,144 @@
           }
         },
         {
+          "name": "Forgot Password",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "content-type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/password/forgot",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "password",
+                "forgot"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"owner@acme.test\"\n}"
+            },
+            "description": "Emails a single-use reset link that expires in one hour.\n\nALWAYS returns 202 \u2014 for a registered address, an unregistered one, and outright garbage. That is deliberate: /auth/login refuses to reveal which emails are registered, and this endpoint would hand that straight back if it answered 404.\n\nIn development the mail goes to Mailpit, not to an inbox: open http://localhost:8025 and copy the token out of the link.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('always 202, whoever the address belongs to', function () {",
+                  "    pm.response.to.have.status(202);",
+                  "});",
+                  "console.log('Read the email at http://localhost:8025 and copy the token from the link.');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reset Password",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "content-type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/password/reset",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "password",
+                "reset"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"token\": \"rst_paste-from-the-email\",\n  \"password\": \"a brand new password\"\n}"
+            },
+            "description": "Redeems the link and sets a new password.\n\nSingle use: a second attempt with the same token is a 400. So is an expired one, and so is a forged one \u2014 they are indistinguishable on purpose.\n\nOn success EVERY session for the account is revoked, including any an attacker was holding, and every other outstanding reset link is burned. No session is returned: log in with the new password.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 and no session issued', function () {",
+                  "    pm.response.to.have.status(204);",
+                  "    pm.expect(pm.response.text()).to.be.empty;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Change Password",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "content-type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/password",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "password"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"current_password\": \"correct horse battery staple\",\n  \"new_password\": \"a newer password\"\n}"
+            },
+            "description": "Changes a password you still know. Session-authenticated.\n\nThe current password is required even though you already hold a session: a session is a bearer token, and a stolen one must not be enough to take the account.\n\nA wrong current password is 403, NOT 401 \u2014 a 401 would tell the web app the session had died and log the user out for a typo.\n\nRevokes every OTHER session; this one survives.",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{sessionToken}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204', function () { pm.response.to.have.status(204); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "Logout",
           "request": {
             "auth": {

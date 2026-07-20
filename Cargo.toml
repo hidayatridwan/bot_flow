@@ -29,6 +29,18 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid"] }
 # Password hashing for self-serve tenant accounts (Argon2id). `std` pulls the getrandom-backed
 # OsRng used to draw a per-password salt. api-only, but versioned here so it can't drift.
 argon2 = { version = "0.5", features = ["std"] }
+# SMTP, for password reset — the one flow that must reach a user who has lost their credential.
+# rustls to match every other TLS client in the workspace (one backend, one version). `smtp://`
+# (no TLS) is what the local Mailpit sink speaks; `smtps://` is what a real relay does.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls-tls",
+    "builder",
+    "hostname",
+    "ring",
+    "webpki-roots",
+] }
 # Integration tests only: `ServiceExt::oneshot` drives the real Router in-process, with no socket
 # and no teardown race, while still running every layer — extractors included, which is where the
 # auth bugs live. Versioned here rather than in the member crate for the usual reason.

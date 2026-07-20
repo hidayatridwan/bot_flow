@@ -45,3 +45,35 @@ export const login = (client: ApiClient, body: LoginBody) =>
 export const logout = (client: ApiClient) => client.post<void>('/auth/logout');
 
 export const me = (client: ApiClient) => client.get<MeResponse>('/auth/me');
+
+export interface ForgotPasswordBody {
+	email: string;
+}
+
+export interface ResetPasswordBody {
+	token: string;
+	password: string;
+}
+
+export interface ChangePasswordBody {
+	current_password: string;
+	new_password: string;
+}
+
+/**
+ * 202, empty body — **always**, whether or not the address is registered.
+ *
+ * Do not add error handling that distinguishes those cases here or above: the API returns one
+ * status on purpose so the endpoint cannot be used to discover which emails exist, and the only way
+ * to break that is from this side. See `mapForgotPasswordError`.
+ */
+export const forgotPassword = (client: ApiClient, body: ForgotPasswordBody) =>
+	client.post<void>('/auth/password/forgot', body);
+
+/** 204 on success; 400 when the link is expired, already used, or never existed. */
+export const resetPassword = (client: ApiClient, body: ResetPasswordBody) =>
+	client.post<void>('/auth/password/reset', body);
+
+/** 204 on success; 403 when the current password is wrong (not 401 — see `mapChangePasswordError`). */
+export const changePassword = (client: ApiClient, body: ChangePasswordBody) =>
+	client.post<void>('/auth/password', body);

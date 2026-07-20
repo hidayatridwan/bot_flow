@@ -33,4 +33,9 @@ pub struct AppState {
     /// `lapin::Connection` trap one layer up.
     pub amqp_conn: std::sync::Arc<lapin::Connection>,
     pub session_ttl_secs: i64,
+    /// Outbound mail. Built at boot so a bad `SMTP_URL` fails the process rather than the first
+    /// locked-out user's reset request.
+    pub mailer: crate::mail::Mailer,
+    /// The web app's origin, for building reset links. See `Config::app_base_url`.
+    pub app_base_url: String,
 }

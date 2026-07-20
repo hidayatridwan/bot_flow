@@ -159,6 +159,28 @@ pub fn generate_session_token() -> String {
     )
 }
 
+/// The prefix on a password-reset token.
+///
+/// Deliberately **not** `sess_`, and that is a correctness constraint rather than a naming taste.
+/// `Actor` routes any bearer token beginning `sess_` to the `sessions` table; a reset token wearing
+/// that prefix would be looked up there, miss, and 401 — but worse, it would mean a credential that
+/// changes a password was being offered to a code path that grants access. The two families are
+/// disjoint by construction, and this prefix is what makes them so.
+///
+/// A reset token is never sent as a bearer token at all — it arrives in a request body, because it
+/// belongs in the reset request and nowhere else.
+pub const RESET_PREFIX: &str = "rst_";
+
+/// Generate a password-reset token. Same entropy as a session (two v4 UUIDs, ~244 bits), and — like
+/// every other credential here — only its SHA-256 reaches the database.
+pub fn generate_reset_token() -> String {
+    format!(
+        "{RESET_PREFIX}{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 /// Which credential family a bearer token belongs to, decided by its prefix alone — before any
 /// database round-trip. Keeping this pure is what lets the dispatch rule be unit-tested.
 fn is_session_token(token: &str) -> bool {

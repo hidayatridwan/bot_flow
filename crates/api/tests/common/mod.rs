@@ -7,7 +7,8 @@
 //! Two things make this harness trustworthy rather than merely green — see [`guard_test_database`]
 //! and [`guard_not_superuser`]. Read those before adding a test.
 
-#![allow(dead_code)] // each test binary uses a different subset of this module
+#![allow(dead_code)]
+// each test binary uses a different subset of this module
 // Same reason, for the re-exports below: `mod common` is compiled into *every* test binary, so a
 // name only one of them needs (`FAKE_ANSWER`) is genuinely unused in the other seven.
 #![allow(unused_imports)]
@@ -246,6 +247,14 @@ impl TestApp {
             redis_url: env("REDIS_URL"),
             // The fake embedder scores an exact match at ~1.0 and unrelated text near 0.0, so this
             // floor is nowhere near either. It is not tuned; it is just out of the way.
+            // Mail: a black hole. `smtp://` at a port nothing listens on, so `Mailer::from_url`
+            // parses and builds fine (it connects lazily) while every send fails in the spawned
+            // task and is logged. These tests assert on what the *database* holds, which is where
+            // every property they cover actually lives — the delivery path is exercised by hand
+            // against Mailpit and recorded in the phase doc.
+            smtp_url: "smtp://127.0.0.1:2".to_string(),
+            mail_from: "bot_flow test <noreply@invalid.test>".to_string(),
+            app_base_url: "http://web.invalid.test".to_string(),
             rag_score_threshold: 0.5,
             // A table-driven auth test fires many requests as one tenant and must not 429 itself.
             rate_limit_per_minute: 100_000,
@@ -527,6 +536,71 @@ impl TestApp {
             .await
             .unwrap();
         tx
+    }
+
+    /// The email `register_session` uses for a tenant's owner account.
+    pub fn account_email(tenant_id: &str) -> String {
+        format!("owner@{tenant_id}.test")
+    }
+
+    /// The password `register_session` uses. Exposed so a test can log in again.
+    pub const ACCOUNT_PASSWORD: &str = "correct horse battery staple";
+
+    /// Log in and return a fresh session token. Panics unless the login succeeds — a test that
+    /// wanted a *failed* login should assert on the status itself.
+    pub async fn login(&self, email: &str, password: &str) -> String {
+        let (status, body) = self
+            .request(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "email": email, "password": password }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "login failed: {body}");
+        body["session_token"].as_str().unwrap().to_string()
+    }
+
+    /// Mint a password-reset token row directly, returning the plaintext.
+    ///
+    /// **Why the harness writes this rather than reading it from a mail sink:** a reset token is
+    /// delivered only by email and stored only as a SHA-256 hash, so there is nowhere to read the
+    /// plaintext from. The row is written exactly as `forgot_password` writes it.
+    ///
+    /// That duplication is safe in the direction that matters. If the handler ever changed how it
+    /// hashes, it would derive a different hash from this plaintext, match no row, and every test
+    /// using this helper would go **red** — the failure mode is a loud one, not a silent pass.
+    ///
+    /// `expired: true` back-dates it, for the expiry assertions.
+    pub async fn issue_reset_token(&self, email: &str, expired: bool) -> String {
+        use sha2::Digest;
+        let token = format!(
+            "rst_{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let account_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM accounts WHERE lower(email) = lower($1)")
+                .bind(email)
+                .fetch_one(&self.db)
+                .await
+                .expect("no account for that email");
+
+        let interval = if expired { "-1 hour" } else { "1 hour" };
+        sqlx::query(&format!(
+            "INSERT INTO password_reset_tokens (token_hash, account_id, expires_at) \
+             VALUES ($1, $2, now() + interval '{interval}')"
+        ))
+        .bind(hex::encode(sha2::Sha256::digest(token.as_bytes())))
+        .bind(account_id)
+        .execute(&self.db)
+        .await
+        .expect("failed to insert a reset token");
+        token
     }
 
     /// `POST /search` with the given credential.

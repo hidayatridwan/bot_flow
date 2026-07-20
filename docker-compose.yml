@@ -109,6 +109,25 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+  # A local SMTP sink. Password reset is the first feature here that sends mail, and a reset link is
+  # a live credential — so development must not point at a real relay that could deliver one to a
+  # real inbox. Mailpit accepts everything, delivers nothing, and shows it in a browser.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: bot_flow-mailpit
+    ports:
+      - "1025:1025" # SMTP — this is what SMTP_URL points at
+      - "8025:8025" # web UI (browser): read the reset emails here
+    volumes:
+      - mailpit_data:/data
+    environment:
+      # Persist across restarts, so a reset link written before a restart is still readable.
+      MP_DATABASE: /data/mailpit.db
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   postgres_data:
@@ -116,3 +135,4 @@ volumes:
   minio_data:
   rabbitmq_data:
   redis_data:
+  mailpit_data:

@@ -42,6 +42,25 @@ pub struct Config {
     /// How long a login session stays valid, in seconds. Bound into the sessions.expires_at
     /// computed at mint time; there is no refresh — an expired token means log in again.
     pub session_ttl_secs: i64,
+    /// SMTP endpoint for outbound mail. `smtp://localhost:1025` in development (the Mailpit sink in
+    /// `docker-compose.yml`), `smtps://…` against a real relay.
+    ///
+    /// **Required, and that is a deliberate departure from `metrics_token`'s "absent config, absent
+    /// surface".** The reasoning inverts here: a missing metrics token costs you a dashboard, while
+    /// a missing mailer costs a locked-out user their account — with no error they can see, because
+    /// the reset endpoint answers `202` either way (invariant 18's non-oracle rule). A silent
+    /// feature is acceptable for observability and not for account recovery, so this fails at boot
+    /// instead, naming itself.
+    pub smtp_url: String,
+    /// The `From:` on every message. Required for the same reason: a default here would be a
+    /// guessed sender domain, and mail from a guessed domain is mail that silently lands in spam.
+    pub mail_from: String,
+    /// Where the reset link points — the **web app's** origin, not the API's.
+    ///
+    /// A user opens this in a browser and lands on `web/`'s reset page; the API is not something an
+    /// end user visits. Getting this wrong produces a link that 404s at exactly the moment someone
+    /// is already locked out, which is why it is required rather than derived from anything.
+    pub app_base_url: String,
 }
 
 impl Config {
@@ -120,6 +139,12 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2_592_000),
+            smtp_url: std::env::var("SMTP_URL")
+                .context("SMTP_URL is not set (dev: smtp://localhost:1025 — see docker-compose)")?,
+            mail_from: std::env::var("MAIL_FROM")
+                .context("MAIL_FROM is not set (dev: bot_flow <noreply@localhost>)")?,
+            app_base_url: std::env::var("APP_BASE_URL")
+                .context("APP_BASE_URL is not set (dev: http://localhost:5173 — the web app)")?,
         })
     }
 }

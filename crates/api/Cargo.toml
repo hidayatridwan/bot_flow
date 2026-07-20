@@ -24,6 +24,7 @@ reqwest = { workspace = true }
 sha2 = "0.10"
 hex = "0.4"
 argon2 = { workspace = true }
+lettre = { workspace = true }
 futures-util = "0.3"
 eventsource-stream = "0.2"
 async-stream = "0.3"
@@ -34,3 +35,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 # honest; `cargo test -- --ignored` needs `docker compose up -d` plus the bot_flow_test database.
 [dev-dependencies]
 tower = { workspace = true }
+# The password-reset suite mints a token row directly, because a reset token is only ever delivered
+# by email and only its hash is stored — so a test cannot read one back. Note the drift is safe: if
+# the handler ever hashed differently, it would compute a different hash from the harness's
+# plaintext, find no row, and the tests would go RED rather than quietly passing.
+sha2 = "0.10"
+hex = "0.4"

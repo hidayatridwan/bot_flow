@@ -108,5 +108,36 @@ export const signupSchema = z
 		path: ['confirmPassword']
 	});
 
+export const forgotPasswordSchema = z.object({ email });
+
+export const resetPasswordSchema = z
+	.object({
+		// The token rides in a hidden field, put there by the page from the query string. Validated
+		// only for presence: its shape is the API's business, and a client-side format rule here
+		// would be a second definition of a credential format to drift from.
+		token: z.string().min(1, 'This reset link is missing its token.'),
+		password,
+		// Client-only, exactly like signup's: dropped before the wire call.
+		confirmPassword: z.string().min(1, 'Confirm your password.')
+	})
+	.refine((v) => v.password === v.confirmPassword, {
+		message: 'Passwords do not match.',
+		path: ['confirmPassword']
+	});
+
+export const changePasswordSchema = z
+	.object({
+		currentPassword: z.string().min(1, 'Enter your current password.'),
+		newPassword: password,
+		confirmPassword: z.string().min(1, 'Confirm your new password.')
+	})
+	.refine((v) => v.newPassword === v.confirmPassword, {
+		message: 'Passwords do not match.',
+		path: ['confirmPassword']
+	});
+
 export type LoginSchema = typeof loginSchema;
 export type SignupSchema = typeof signupSchema;
+export type ForgotPasswordSchema = typeof forgotPasswordSchema;
+export type ResetPasswordSchema = typeof resetPasswordSchema;
+export type ChangePasswordSchema = typeof changePasswordSchema;

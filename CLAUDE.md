@@ -189,13 +189,34 @@ Breaking one is not a bug to be weighed against other bugs — it is a product f
     to resolve a bearer token against — `sessions` or `api_keys`. The two are disjoint, so a token
     sent to the wrong one simply misses and 401s. Rename or drop the prefix and every session
     resolves against `api_keys`, misses, and the whole dashboard 401s at once.
-18. **`/auth/register` and `/auth/login` are the only public credential endpoints, and both are rate
-    limited.** Register is the single path that *creates a tenant* without the admin key, so its cap
-    bounds abuse and `/embeddings` spend; login is a password oracle, throttled per email. Login
-    failures are *uniform* — an unknown email and a wrong password return the identical 401, so the
-    endpoint never reveals which emails exist (the same non-oracle rule as invariant 8). Sessions are
-    Bearer tokens, **never cookies**: the `allow_origin(Any)` reasoning (see Security) depends on
-    there being no cookie/CSRF surface, so the web BFF — not the API — owns any cookie.
+    **Password reset tokens join this rule** (phase 16): `password_reset_tokens` is a third global,
+    RLS-free table, the token is stored SHA-256 and carries its own `rst_` prefix, and it is never
+    logged — not the token, and not the link containing it. A reset link is the most dangerous
+    credential in the system, because redeeming one *takes* an account rather than merely opening
+    it, and it arrives in an email nobody controls after delivery. Hence: single use, one hour, and
+    redeeming one revokes **every session** the account had (the person resetting may be recovering
+    from a compromise) and burns every other outstanding link. `rst_` must never become `sess_`,
+    for the reason above and a worse one — `Actor` would then offer a password-changing credential
+    to a code path that grants access.
+18. **Every public credential endpoint is rate limited, and none of them is an existence oracle.**
+    There are four: `/auth/register`, `/auth/login`, `/auth/password/forgot` and
+    `/auth/password/reset`. Register is the single path that *creates a tenant* without the admin
+    key, so its cap bounds abuse and `/embeddings` spend; login is a password oracle, throttled per
+    email; forgot is throttled per email too; reset is throttled per token.
+    **The non-oracle rule is what they share**, and it is the same rule as invariant 8. Login
+    failures are *uniform* — an unknown email and a wrong password return the identical 401.
+    `/auth/password/forgot` goes further and returns **`202` for everything**: a registered address,
+    an unregistered one, and outright garbage. It deliberately does not even validate the address
+    shape, because a `422` for a malformed one is a free "this shape is accepted" signal for a
+    well-formed one. `/auth/password/reset` answers one `400` for expired, already-used and
+    never-existed alike — one `UPDATE … WHERE used_at IS NULL AND expires_at > now()` covers all
+    three, so the API genuinely cannot tell them apart and therefore cannot leak which it was.
+    **The rule extends to *timing*, not just status codes.** A known address costing an SMTP
+    conversation while an unknown one returned instantly would make the response *time* the oracle
+    the status code is not — which is why delivery is spawned rather than awaited. Measured: known
+    2.3–3.3ms, unknown 1.5–2.5ms, ranges overlapping. The residue is one `INSERT`, not a round trip.
+    Sessions are Bearer tokens, **never cookies**: the `allow_origin(Any)` reasoning (see Security)
+    depends on there being no cookie/CSRF surface, so the web BFF — not the API — owns any cookie.
 19. **The uniform login failure must stay uniform in the UI.** Invariant 18 buys the non-oracle
     property at the API; the web app can hand it straight back. Under the *email* field, "invalid
     email or password" reads as *this email is wrong*; under *password*, as *this email exists, but
@@ -468,6 +489,12 @@ Each of these exists in, or nearly slipped into, this codebase.
 | `ORDER BY created_at` when the SELECT has `created_at::text AS created_at` | Qualify it: `ORDER BY documents.created_at` | Postgres resolves a **bare** name in ORDER BY against the *output* list first, so the alias wins and the sort runs on the text rendering. Measured on 5k rows: `Seq Scan` + `Sort Key: ((created_at)::text)` at cost 371, versus an index scan with **no sort node** at cost 0.29 once qualified. The 0016 index exists for this one query and the bare form never touches it. It reads like a correctness bug too — the keyset `WHERE` compares `timestamptz` — but is not: `timestamptz` normalises to UTC and renders in one session zone, so text order agrees with chronological order. The bug is the plan, not the result |
 | Paginate a polled list with `LIMIT/OFFSET` | Keyset on `(created_at, id)` | A row inserted between two polls shifts every later row by one, so the reader sees a row twice or skips one — and neither is an error. The `id` half is not optional either: `created_at` defaults to `transaction_timestamp()`, so same-transaction rows are byte-identical, and a cursor without a tiebreaker loses exactly the rows on a boundary. Verified by deleting the tiebreaker: **5 of 9 documents vanished** and the listing still looked fine |
 | Build the cursor query string by concatenation | `URLSearchParams` / `encodeURIComponent` | The cursor carries `+00`, and a bare `+` in a query string decodes to a **space** — corrupting the offset, not merely the separator. It fails only at a page boundary, never on page one, which is where anyone would look |
+| Return `404`/`422` from `/auth/password/forgot` for an unknown or malformed address | Always `202` | It is the same oracle `/auth/login` refuses to be, rebuilt on a new endpoint. Validating the *shape* leaks too: a 422 for a malformed address tells an attacker which shapes are accepted, and the two paths then differ. Garbage simply matches no row |
+| `await` the reset email before responding | Spawn it | A known address would then cost an SMTP round trip and an unknown one nothing, making the response *time* the oracle the status code is not. Measured after spawning: 2.3–3.3ms vs 1.5–2.5ms, overlapping |
+| Log the reset link "just while debugging" | Log that a send failed, and to whom | The link **is** the credential, and redeeming one takes the account outright. A link in a log file is invariant 14 broken by the newest secret in the system |
+| Issue a session when a reset succeeds | Redirect to login | Redeeming a link proves control of an inbox, not knowledge of the password. Handing back a session means a leaked link becomes a live login without the password ever being typed |
+| Return `401` when the current password is wrong on change-password | `403` | The BFF clears its session cookie on a 401 (invariant 21), so a 401 signs the user out for a typo — on the one page where they are proving they are still themselves |
+| Give a reset token the `sess_` prefix, or no prefix | `rst_` | `Actor` dispatches on `sess_`. A reset token wearing it would be resolved against `sessions` — offering a password-*changing* credential to the path that grants access |
 | Map an unrecognised failure to the tenant's fault | `system_error` unless the sidecar *proves* otherwise (exit 3 or 4) | The two errors are not symmetric. Excusing a broken file wastes one support ticket; blaming a tenant for our outage sends them re-uploading a good file in a loop that cannot succeed, while the real fault goes unreported. `classify` therefore has one narrow `match` and a catch-all, and `status.ts`'s `system_error` branch is the one place the word "upload" must never appear — pinned by a test |
 | Add a `failure_reason` variant in one place | Three places, and only one fails closed | `failure.rs`, migration 0015's `CHECK`, and the TS union. A worker writing a variant the `CHECK` lacks aborts its transaction — loud, and the good case. A variant the **TS** lacks renders as the cause-agnostic copy — silent, and merely vague. Adding to TS alone is the dangerous order: the UI promises copy for a value nothing writes |
 | Trust `documents.error` to stay unexposed because it always has been | Select `failure_reason`, never `error` | They sit one column apart in the same row and the same `SELECT`. `error` holds the gateway bodies and stack traces invariant 16 exists to contain, and adding it "just for debugging" is a one-word diff that reviews clean |
@@ -577,6 +604,10 @@ the code.
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
 | `AuthTenant` / `AdminAuth` / `SessionAuth` / `Actor`, `hash_key`, `require_secret` vs `require_management`, the `sess_` prefix dispatch, `normalize_origin` (next to the `Origin` check it must agree with), key + session token gen | `crates/api/src/auth.rs` |
 | Self-serve accounts: register / login / logout / me / self-serve key mgmt; Argon2 hashing | `crates/api/src/accounts.rs` |
+| Password reset + change: the non-oracle `forgot`, the single-use `reset`, and why a change is 403-not-401 | `crates/api/src/accounts.rs` |
+| The SMTP transport, and the two rules about it — never log a link, never surface a send failure | `crates/api/src/mail.rs` |
+| That a reset revokes every session, cannot be replayed, and tells nobody which emails exist | `crates/api/tests/password_reset.rs` |
+| Forgot / reset / change-password pages, and the copy that must not confirm an address exists | `web/src/routes/(auth)/forgot-password/`, `.../reset-password/`, `web/src/routes/(authenticated)/settings/password/` |
 | `AppError` and the blanket `From` impl that makes `?` a 500 | `crates/api/src/error.rs` |
 | Env vars and their defaults | `crates/api/src/config.rs` |
 | Worker claim / status machine | `crates/worker/src/lifecycle.rs` |
@@ -773,6 +804,24 @@ superset — everything known, whether or not it blocks.
   test and a faked clock would assert against a stub. The frame contract around it is now covered.
 - The DB permits an `uploaded` document status that **no code path ever assigns**. A vestige. Either
   give it meaning or drop it from the constraint — an unreachable state is a trap for the next reader.
+- **Account recovery exists (phase 16), and here is exactly how far it goes.** `POST
+  /auth/password/forgot` mails a single-use, one-hour link; `POST /auth/password/reset` redeems it,
+  revokes **every** session and burns the account's other outstanding links; `POST /auth/password`
+  changes a password you still know, keeps the current session and revokes the others. Mail goes
+  through `lettre` to `SMTP_URL` — **Mailpit in `docker-compose.yml` for development**, so a live
+  reset link can never reach a real inbox from a dev box.
+  **Three new required env vars**, and they fail at boot rather than at first use: `SMTP_URL`,
+  `MAIL_FROM`, `APP_BASE_URL`. That is deliberately unlike `METRICS_TOKEN`'s "absent config, absent
+  surface" — a missing metrics token costs a dashboard, a missing mailer costs a locked-out user
+  their account, silently, because `forgot` answers `202` either way.
+  **Still open, and worth knowing:** there is **no email verification**, so an address is still
+  unproven at signup (`accounts.rs` has said so since phase 2) — which means recovery is only as
+  good as the address someone typed. There is **no durable outbox**: the send is a spawned task, so
+  an email lost to a crash between the `202` and delivery is lost silently and the user must ask
+  again. Spent and expired token rows are **never swept** (harmless — both guards are in the
+  redemption query — but the table only grows). And **delivery has no automated test**: the harness
+  points `SMTP_URL` at a dead port on purpose, so the mail path is covered by a manual Mailpit drill
+  recorded in the phase doc, while the suite covers redemption, revocation and the non-oracle.
 - **No `.env.example`**, though `.gitignore` expects one. A new contributor reconstructs the required
   configuration from `config.rs`. Names only, values blank; its absence is pure friction.
 

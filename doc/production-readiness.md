@@ -8,7 +8,8 @@
 > **Extended 2026-07-20 to cover `web/`, which it had never assessed.** Blockers 1–5 were all about
 > the Rust API; the dashboard appeared only twice, in passing, as "the dashboard". That was a scoping
 > error, not a judgement that the web tier was fine — nobody had looked. Blockers 6–8 are the result
-> of looking, and two of them are worse than anything left on the API side.
+> of looking, and two of them were worse than anything left on the API side. Blocker 6 was closed the
+> same day by [phase 16](feature/phase-16-account-recovery.md); 7 and 8 stand.
 
 ## At a glance
 
@@ -19,24 +20,25 @@
 | 3 | ~~No metrics, no alerting, no backups~~ | ~~blocking~~ | **CLOSED** — [phase 13](feature/phase-13-observability.md), invariant 30; alert *delivery* and error reporting remain |
 | 4 | ~~`failed` cannot tell a tenant whether to re-upload or wait~~ | ~~high~~ | **CLOSED** — [phase 14](feature/phase-14-failure-classification.md) |
 | 5 | ~~`GET /documents` unpaginated; `/auth/keys` unmetered; `/ask/stream` unbounded~~ | ~~high~~ | **CLOSED** — [phase 15](feature/phase-15-bounded-reads.md) |
-| 6 | **No account recovery** — a forgotten password is unrecoverable, and no email is ever sent | blocking | not designed |
+| 6 | ~~No account recovery — a forgotten password is unrecoverable, and no email is ever sent~~ | ~~blocking~~ | **CLOSED** — [phase 16](feature/phase-16-account-recovery.md) |
 | 7 | **`web/` has no deployment path, and 403s everything behind TLS as configured** | blocking | not designed |
 | 8 | **The dashboard advertises features that do not exist**, and has no error page | high | not designed |
 
-**Blockers 1–5 (the API) are closed** by phases 11–15. **Blockers 6–8 are new, and they are all in
-`web/`.** They are not regressions — they were never assessed, because this document was written
-about the Rust half and quietly stayed that way.
+**Blockers 1–5 (the API) are closed** by phases 11–15. **Blocker 6 is closed** by phase 16.
+**Blockers 7 and 8 remain**, and both are in `web/` — they are not regressions, they were simply
+never assessed until 2026-07-20.
 
 Re-verified 2026-07-20 after phase 15: `GET /documents` bounds every caller — including one sending
 no parameters — and pages by keyset cursor; `POST /auth/keys` returns 429 past its own bucket's
 limit; and `/ask/stream` carries a 300s wall clock that ends the stream with `done` rather than
 discarding the answer. There is still **no** endpoint exposing `documents.error`.
 
-Also verified 2026-07-20, by reading the files rather than recalling them: `grep -ri "password_reset\|
-reset_token\|smtp\|mailer" crates/` returns **nothing**; the root `Dockerfile` never mentions `web`,
-`node` or `bun`; `docker-compose.yml` has no `web` service; `web/package.json` has no `start` script;
-`hooks.server.ts` sets **no** response headers; and `web/src/routes/(authenticated)/dashboard/+page.svelte`
-is one line containing the text `dashboard tenant`.
+Also verified 2026-07-20, by reading the files rather than recalling them: the root `Dockerfile`
+never mentions `web`, `node` or `bun`; `docker-compose.yml` has no `web` service; `web/package.json`
+has no `start` script; `hooks.server.ts` sets **no** response headers; and
+`web/src/routes/(authenticated)/dashboard/+page.svelte` is one line containing the text
+`dashboard tenant`. (The mail grep that used to appear here now returns plenty — that is blocker 6
+closing, and the phase-16 doc records what it looked like before.)
 
 ## Verdict
 
@@ -51,16 +53,17 @@ that have actually been restored, a failure a tenant can act on, and no unbounde
 write or unbounded stream.
 
 **`web/` is roughly two-thirds of a product.** The path a new tenant walks — sign up, see the key
-once, upload a document, watch it index, ask a question in the playground, copy the embed snippet —
-is complete, and unusually carefully built: the login error is form-level so the API's non-oracle
+once, upload a document, watch it index, ask a question in the playground, copy the embed snippet,
+and recover the account if they lose the password (phase 16) — is complete, and unusually carefully built: the login error is form-level so the API's non-oracle
 survives into the UI (invariant 19), the one-time `sk_` moves in a read-and-delete httpOnly cookie
 rather than a query param (invariant 22), an API outage renders an alert rather than an empty
 library, and both JSON endpoints hand-roll an `Origin` check because SvelteKit's CSRF guard never
 sees a JSON POST. Cookies are `httpOnly`, `secure: !dev`, `sameSite: 'lax'`.
 
-**Everything around that path is missing**, and three pieces of it block going live — see blockers
-6, 7 and 8. The shortest statement of the problem: *a user who forgets their password cannot get back
-in, the app cannot be deployed by any means in this repo, and the sidebar offers them Billing.*
+**Everything around that path is still missing**, and two pieces of it block going live — see
+blockers 7 and 8. The shortest statement of what is left: *the app cannot be deployed by any means in this repo, and
+the sidebar offers a fresh signup a Billing page that does not exist.* A forgotten password is no
+longer on that list.
 
 Standing deployment gaps, unchanged and still not code blockers:
 
@@ -74,7 +77,7 @@ Standing deployment gaps, unchanged and still not code blockers:
 - **`app_user` ships the dev password** from migration 0005 unless the role is pre-created.
 
 A design-partner or internal pilot, with accounts created by an operator, is well served today.
-Self-serve signup is blocked on 6 and 7.
+Self-serve signup is now blocked on 7 alone — the app has no deployment path.
 
 The distinction is not polish. Most of what goes wrong in this system goes wrong *quietly* — a
 plausible answer, a silent refusal, a partially re-indexed collection. That is the specific reason
@@ -243,29 +246,29 @@ the listing still looks perfectly normal.
 - **A truncated answer is persisted mid-sentence**, so the next rewrite reasons over it. That is the
   better half of the trade against losing the answer entirely, but it is a trade.
 
-### 6. No account recovery — a forgotten password is the end of the account
+### 6. ~~No account recovery~~ — CLOSED (phase 16)
 
-`grep -ri "password_reset\|reset_token\|forgot_password\|smtp\|mailer" crates/` returns **nothing**.
-This is not a missing screen. There is no reset endpoint, no reset token, no email transport, and no
-UI — the capability is absent at every layer, infrastructure included.
+**Closed on its stated condition:** an email transport exists (`lettre` → `SMTP_URL`, with Mailpit
+in `docker-compose.yml` for development), `POST /auth/password/forgot` issues a single-use expiring
+token hashed at rest, and the reset page consumes it. `POST /auth/password` also lands, for changing
+a password you still know.
 
-The registered auth surface is six routes (`lib.rs:208-219`): `register`, `login`, `logout`, `me`,
-and three key routes. There is no change-password, no email verification (`accounts.rs:48` says so
-outright — *"the real proof an address exists would be a confirmation email, which this MVP does not
-send"*), no self-serve account deletion, and no way to change a tenant name after registration.
+**The security properties, each verified red-first:** redeeming a link revokes **every** session the
+account had (someone resetting may be recovering *from* a compromise), a token works exactly once,
+redeeming one burns the account's other outstanding links, and `/auth/password/forgot` answers `202`
+for registered, unregistered and malformed addresses alike — invariant 18's non-oracle rule arriving
+at a third public endpoint. Delivery is spawned rather than awaited so the *timing* is not the
+oracle the status code is not.
 
-Why this is *the* blocker for self-serve rather than a gap: **every lockout becomes a manual database
-edit by an operator**, and the operator cannot verify the requester owns the address, because nothing
-ever proved the address was real at signup. That is a support burden and an account-takeover vector
-arriving together. It also interacts badly with invariant 22 — the one-time `sk_` is genuinely
-unrecoverable, so a locked-out tenant loses both their login *and* their ability to mint a new key.
+**One thing the original entry got right and is worth keeping:** it said reset and verification want
+the same transport and are one piece of work. Only half was built. Verification is still absent, so
+recovery remains only as reliable as the address someone typed at signup.
 
-Sequencing note: email verification and password reset want the same transport, so they are one
-piece of work, not two.
-
-*Closes when:* an email transport exists, `POST /auth/password-reset` issues a single-use expiring
-token (hashed at rest, like every other credential here — invariants 14 and 17), and the reset page
-consumes it. Verification of the address at signup should land with it.
+**What is deliberately still open:** no email verification; no durable outbox (a send lost to a
+crash is lost silently); spent token rows are never swept; delivery itself has no automated test —
+the harness points `SMTP_URL` at a dead port on purpose, and the mail path is a manual Mailpit drill
+recorded in the phase doc. Self-serve account deletion and renaming a tenant, which this entry also
+named, are not built.
 
 ### 7. `web/` cannot be deployed, and would 403 everything if it were
 
@@ -302,13 +305,14 @@ The sidebar is still the shadcn sample, and `app-sidebar.svelte:14-17` admits it
 data… the teams, the Config group and every remaining `#` are mocked — nothing backs them."* What a
 paying signup actually sees:
 
-- A **Settings** submenu — General, **Team**, **Billing**, Limits — every one `url: '#'`
-  (`app-sidebar.svelte:62-84`). These are exactly the account-management pages blocker 6 says do not
-  exist, presented as though they do.
+- ~~A **Settings** submenu — General, **Team**, **Billing**, Limits — every one `url: '#'`.~~
+  **Fixed in phase 16**, because that phase gave Settings a page that actually exists: the submenu
+  is now one real entry, *Password*. Leaving a fake Billing link beside a working one would have
+  been worse than the original four.
 - A **tenant switcher** offering *Acme Inc*, *Acme Corp.* and **Evil Corp.** on plans
   *Enterprise/Startup/Free* (`:22-38`), rendered above the user's real tenant.
 - **Upgrade to Pro**, **Account**, **Billing**, **Notifications** in the user menu, all inert
-  (`nav-user.svelte:67-85`). Only **Log out** works.
+  (`nav-user.svelte:67-85`). Only **Log out** works. Still true after phase 16.
 - A breadcrumb reading *Build Your Application / Data Fetching* with `href="##"`, on every
   authenticated page (`(authenticated)/+layout.svelte:27-31`).
 
@@ -397,10 +401,10 @@ The `web/` blockers are claims about absence, which is the kind that rots quietl
 does not make this document wrong loudly. Each is a one-line check:
 
 ```bash
-grep -ri "password_reset\|reset_token\|smtp\|mailer" crates/   # blocker 6: expect no output
 grep -n "web\|bun\|node" Dockerfile                            # blocker 7: expect no output
 grep -n "ORIGIN" web/src/lib/server/env.ts                     # blocker 7: expect no output
-grep -rn "url: '#'" web/src/lib/components/app-sidebar.svelte  # blocker 8: expect many
+grep -rn "url: '#'" web/src/lib/components/app-sidebar.svelte  # blocker 8: 3 left (the Config group)
+grep -n "Billing" web/src/lib/components/nav-user.svelte       # blocker 8: an inert menu item
 find web/src -name "+error.svelte"                             # blocker 8: expect no output
 ```
 

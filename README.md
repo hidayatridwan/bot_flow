@@ -6,7 +6,7 @@ that content — with citations, streamed token by token into an embeddable chat
 
 ## Services
 
-The project builds **two Rust binaries** from one Cargo workspace, backed by five
+The project builds **two Rust binaries** from one Cargo workspace, backed by six
 infrastructure containers.
 
 | Service | What it is | Responsibility |
@@ -21,6 +21,7 @@ infrastructure containers.
 | `minio` | MinIO (S3 API) | Raw uploaded files, keyed `tenants/{tenant_id}/documents/{document_id}/original.{ext}`. |
 | `rabbitmq` | RabbitMQ 3.13 | Carries MinIO's `ObjectCreated` events on a quorum queue with a dead-letter queue. |
 | `redis` | Redis 7 | Fixed-window per-tenant rate limiting. |
+| `mailpit` | Mailpit | A local SMTP sink for development. Accepts every message, delivers none, and shows them at <http://localhost:8025>. Password reset is the only mail this system sends, and a reset link is a live credential — so a dev box must never point at a real relay. |
 
 Upload flow: `POST /documents/upload-url` returns a **presigned PUT**; the client uploads straight to
 MinIO, and the API never sees a byte. MinIO publishes `ObjectCreated` to RabbitMQ, and the worker
@@ -99,6 +100,9 @@ weakest one already reaches, which is why the chat routes admit all three.
 | `POST` | `/auth/register` | none | Self-serve: creates a tenant + owner account, returns a session and the first `sk_`. Rate-limited |
 | `POST` | `/auth/login` | none | Verifies email + password, returns a session. Rate-limited per email |
 | `POST` | `/auth/logout` | session | Ends the current session |
+| `POST` | `/auth/password/forgot` | none | `{"email"}` — emails a reset link. **Always `202`**, whether or not the address is registered: it must not reveal which emails exist. Rate-limited per email |
+| `POST` | `/auth/password/reset` | none | `{"token","password"}` — redeems a link. Single use, one hour, and **revokes every session** the account had. `400` covers expired, already-used and forged alike |
+| `POST` | `/auth/password` | session | `{"current_password","new_password"}` — the current password is required even with a valid session. Revokes every *other* session, keeps this one. A wrong password is `403`, never `401` |
 | `GET` | `/auth/me` | session | The account + tenant behind the session |
 | `GET` | `/auth/keys` | session | Lists this tenant's key metadata (never the raw key) |
 | `POST` | `/auth/keys` | session | Self-serve mint of a `secret`/`publishable` key. Origins are validated and canonicalised; a `publishable` key with none is refused (`422`). Rate-limited on its own bucket, so minting keys cannot eat your question budget |
@@ -182,6 +186,13 @@ ADMIN_API_KEY=<pick any long random string>
 # Must NOT be ADMIN_API_KEY — that key can erase a tenant, and a scrape config is a widely-read file.
 # METRICS_TOKEN=<a different long random string>
 SESSION_TTL_SECS=2592000         # login session lifetime; default 30 days
+
+# Mail. All three are REQUIRED — the process exits at startup without them, deliberately: a missing
+# mailer costs a locked-out user their account, and `/auth/password/forgot` answers 202 either way,
+# so the failure would otherwise be invisible.
+SMTP_URL=smtp://localhost:1025            # Mailpit, from docker-compose. smtps://user:pass@host:465 in prod
+MAIL_FROM="bot_flow <noreply@localhost>"  # quote it: the angle brackets and space need it
+APP_BASE_URL=http://localhost:5173        # where reset links point — the WEB app, not the API
 RUST_LOG=info,api=debug
 
 # Optional. The integration suite derives both from the two URLs above by swapping the database
@@ -469,6 +480,40 @@ curl -sX POST localhost:3000/auth/keys -H "authorization: Bearer $SESS" -H 'cont
   -d '{"kind":"publishable","label":"website","allowed_origins":["http://localhost:5500"]}'
 # {"api_key":"pk_…", …}   ← mint your widget's pk_ without the admin key
 ```
+
+### Losing and changing a password
+
+```bash
+# 1. Ask for a link. This ALWAYS returns 202 — for a registered address, an unregistered one, and
+#    garbage alike. It will not tell you which emails exist, by design.
+curl -sX POST localhost:3000/auth/password/forgot -H 'content-type: application/json' \
+  -d '{"email":"owner@acme.test"}'
+
+# 2. Read it. In development the mail lands in Mailpit, not in an inbox:
+open http://localhost:8025
+
+# 3. Redeem the token from the link. Single use, one hour.
+curl -sX POST localhost:3000/auth/password/reset -H 'content-type: application/json' \
+  -d '{"token":"rst_…","password":"a new password"}'
+# 204 — and EVERY session for that account is now revoked, including any an attacker held.
+
+# 4. Or change it while logged in. The current password is required even though you hold a
+#    session: a stolen session must not be enough to take the account.
+curl -sX POST localhost:3000/auth/password -H "authorization: Bearer $SESS" \
+  -H 'content-type: application/json' \
+  -d '{"current_password":"a new password","new_password":"a newer password"}'
+# 204 — every OTHER session is revoked; this one survives, because you are using it.
+```
+
+A wrong current password is a **403**, not a 401. That matters more than it looks: the web app
+clears its session cookie on a 401, so a 401 here would sign you out for a typo.
+
+In the dashboard this is `/forgot-password`, `/reset-password` and `/settings/password`. The whole
+flow works without JavaScript.
+
+**There is still no email verification**, so an address is unproven at signup — recovery is only as
+reliable as the address someone typed. And the send is fire-and-forget: an email lost to a crash is
+lost silently, and you ask again.
 
 The same flow through a browser is the `web/` dashboard — see
 [Run the web dashboard](#5-run-the-web-dashboard-optional). Sessions are Bearer tokens here and
