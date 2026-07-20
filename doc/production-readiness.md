@@ -12,29 +12,42 @@
 | 1 | ~~`/ingest` vectors cannot be attributed to a document~~ | ~~blocking~~ | **CLOSED** — [phase 11](feature/phase-11-ingest-gdpr.md), invariant 29 |
 | 2 | ~~No tenant-level erasure, no audit trail, history unredacted~~ | ~~blocking~~ | **CLOSED** — [phase 12](feature/phase-12-tenant-erasure.md); one window left open, stated below |
 | 3 | ~~No metrics, no alerting, no backups~~ | ~~blocking~~ | **CLOSED** — [phase 13](feature/phase-13-observability.md), invariant 30; alert *delivery* and error reporting remain |
-| 4 | `failed` cannot tell a tenant whether to re-upload or wait | high | not designed |
-| 5 | `GET /documents` unpaginated; `/auth/keys` unmetered; `/ask/stream` unbounded | high | not designed |
+| 4 | ~~`failed` cannot tell a tenant whether to re-upload or wait~~ | ~~high~~ | **CLOSED** — [phase 14](feature/phase-14-failure-classification.md) |
+| 5 | ~~`GET /documents` unpaginated; `/auth/keys` unmetered; `/ask/stream` unbounded~~ | ~~high~~ | **CLOSED** — [phase 15](feature/phase-15-bounded-reads.md) |
 
-Blockers 1, 2 and 3 were closed by phases 11, 12 and 13 and are struck through above, with what
-remains stated in each. **Blockers 4 and 5 are what is left**, and neither loses data or hides a
-failure — they are a UX gap and a scaling gap.
+**Every blocker on this list is now closed**, by phases 11–15. What remains is in *Not blockers* below
+and in CLAUDE.md's *Known state & debt*, which is the superset this document filters.
 
-Re-verified 2026-07-19 after phase 13: there is still **no** endpoint exposing `documents.error`, and
-**no** `LIMIT`/`OFFSET` in `list_documents`.
+Re-verified 2026-07-20 after phase 15: `GET /documents` bounds every caller — including one sending
+no parameters — and pages by keyset cursor; `POST /auth/keys` returns 429 past its own bucket's
+limit; and `/ask/stream` carries a 300s wall clock that ends the stream with `done` rather than
+discarding the answer. There is still **no** endpoint exposing `documents.error`.
 
 ## Verdict
 
-**Ready for a design-partner or internal pilot. Not ready for self-serve signups from strangers
-handling real customer policy.**
+**Every blocker this document raised is closed. That is not the same as "ready", and the difference
+is now a deployment question rather than a code one.**
 
-**Closer than it was, and the remaining distance is narrower and more concrete.** Phases 11 and 12
-closed the correctness blockers — the system can erase a document and erase a tenant, and prove it.
-Phase 13 closed the operational one: it now has instruments that move, backups that have actually
-been restored, and alert rules ready to wire.
+Phases 11 and 12 closed the correctness blockers — the system can erase a document and erase a
+tenant, and prove it. Phase 13 closed the operational one: instruments that move, backups that have
+actually been restored, alert rules ready to wire. Phase 14 closed the UX one: a failed document says
+whether to re-upload or to wait. Phase 15 closed the scaling one: no unbounded read, no unmetered
+write, no unbounded stream.
 
-What still stands between this and self-serve is smaller and no longer structural: **alerts that
-nobody has wired to a human**, a `failed` status a tenant cannot act on, and an unpaginated document
-list. None of those loses data. All of them are worth fixing before strangers arrive.
+**What stands between this and self-serve signups is no longer on this list**, and saying so plainly
+matters more than declaring victory:
+
+- **Nobody is paged.** `doc/ops/alerts.yml` exists and **no rule in it has ever fired** — there is no
+  Prometheus in this repo to fire them. Until that is wired, the system is observable but not
+  monitored, and the difference is whoever notices first.
+- **Backups are manual, local, unencrypted, unrotated, with no PITR.** The restore drill was real,
+  and it was run by hand.
+- **CI is report-only.** A red run does not stop a merge.
+- **`app_user` ships the dev password** from migration 0005 unless the role is pre-created.
+
+None of those is a code blocker, which is exactly why they are easy to carry into production
+unnoticed. A design-partner or internal pilot is well served today. Strangers handling real customer
+policy need the four above done first.
 
 The distinction is not polish. Most of what goes wrong in this system goes wrong *quietly* — a
 plausible answer, a silent refusal, a partially re-indexed collection. That is the specific reason
@@ -147,26 +160,61 @@ the consumer's absence, which beats a heartbeat and needed no worker code. Verif
 - **No per-tenant metric history**, deliberately: invariant 30 keeps tenant identity out of any store
   the erasure saga cannot reach.
 
-### 4. `failed` cannot tell a tenant what to do
+### 4. ~~`failed` cannot tell a tenant what to do~~ — CLOSED (phase 14)
 
-`mark_failed` writes the parser's stderr; the reaper writes `'processing lease expired; worker
-presumed dead'`. Both land in the same `error` column, which **no endpoint exposes** — correctly,
-since invariant 16 forbids shipping either string to a client. So the UI says "failed" and names both
-possible causes, and the tenant cannot tell whether to re-upload a broken PDF or wait for us.
+**Closed on its own stated condition:** the worker writes a classified reason code beside the raw
+text, and the API exposes the code, not the text. `failure_reason` is a closed enum
+(`unreadable_file` / `unsupported_type` / `too_large` / `system_error`) cut by **what the tenant
+should do**, and the dashboard renders re-upload advice or wait advice accordingly.
 
-*Closes when:* the worker writes a classified reason code beside the raw text and the API exposes the
-code (not the text).
+**The assessment above under-described the problem.** It framed this as the UI being vague. The
+sharper version is that the vagueness was *load-bearing*: the copy had to cover a dead worker and a
+corrupt PDF at once, so a tenant whose worker died was told their file might be damaged and sent to
+re-upload a good file into a system that was down. That is not a missing detail, it is wrong advice
+delivered politely — which is why `system_error` is the one branch tested never to say "upload".
 
-### 5. Unbounded reads and unmetered writes
+**One finding worth recording, because it would have inverted the fix.** This repo's own documented
+sidecar contract (`2` = unreadable, `3` = unsupported) was wrong: `2` is argv misuse the worker
+cannot trigger, and a genuinely unreadable PDF was an uncaught traceback on **exit 1** —
+indistinguishable from our own sidecar being broken. Classifying on the documented contract would
+have reported every deployment fault to tenants as their damaged document. The sidecar gained an
+explicit exit `4`; verified against the real interpreter, not the docs.
 
-- **`GET /documents` has no pagination** (`handlers.rs`) — the whole table, fully materialised, every
-  call, and the dashboard polls it. Fine at 10 documents; a real problem at 10,000, and the polling
-  back-off is a mitigation rather than a fix.
-- **`/auth/keys` is unmetered** — a logged-in session can mint unbounded keys. Session-gated and not
-  a spend multiplier, so this is an audit-surface problem, not a cost one.
-- **`/ask/stream` has no maximum duration.** Bounds are stalls, not deadlines (deliberately —
-  invariant 28), so a gateway trickling one token just inside `READ_TIMEOUT` streams indefinitely.
-  `MAX_TOKENS` bounds it only for a well-behaved gateway.
+**What is deliberately still open:** rows that failed before phase 14 carry no reason and render as
+the old both-causes copy (nothing recorded a cause; a backfill would be inventing one). The enum
+lives in three places and only the DB `CHECK` fails closed. And the reason is coarse for *operators*
+— it answers "re-upload or wait", not "which store was down", which still means reading logs.
+
+### 5. ~~Unbounded reads and unmetered writes~~ — CLOSED (phase 15)
+
+**Closed, all three.** `GET /documents` pages by keyset cursor with a default that bounds callers who
+send no parameters at all; `POST /auth/keys` is metered on its own bucket; `/ask/stream` carries a
+300s wall clock.
+
+**Two things the original assessment got wrong, both found by measuring rather than reading.**
+
+The pagination entry framed this as purely a scaling problem. It was also a *plan* problem that
+predated pagination: the listing had sorted `ORDER BY created_at DESC` since migration 0003 **with no
+index behind it**, so every call was a sequential scan plus a sort. Worse, `created_at::text AS
+created_at` shadows the column — Postgres resolves a bare ORDER BY name against the output list
+first, so the sort ran on the *text rendering*. Measured on 5k rows: cost 371 with a `Seq Scan`,
+versus 0.29 and no sort node once the reference was qualified and migration 0016's index existed.
+
+And `created_at` is **not unique** — it defaults to `transaction_timestamp()`, so documents created
+in one transaction share a timestamp to the microsecond. A cursor without the `id` tiebreaker
+silently loses rows on a page boundary; deleting it from the query drops **5 of 9 documents** while
+the listing still looks perfectly normal.
+
+**What is deliberately still open:**
+
+- **`STREAM_DEADLINE` firing has no test.** At 300s a real one would be a five-minute test, and a
+  faked clock would assert against a stub rather than the code. The frames around it are now covered
+  — `/ask/stream` had no tests at all before this phase.
+- **No `total` and no "previous page".** Both are consequences of the keyset choice: a count is the
+  full scan this replaced, and a cursor moves one way. The dashboard uses browser history; an API
+  client must keep its own cursors.
+- **A truncated answer is persisted mid-sentence**, so the next rewrite reasons over it. That is the
+  better half of the trade against losing the answer entirely, but it is a trade.
 
 ## Not blockers, but do them before you forget
 

@@ -465,6 +465,12 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Pick `RAG_SCORE_THRESHOLD` by reasoning about it | Sweep it on the bench | Every value in this repo's history was wrong: 0.70 (E5-era) refuses everything, 0.35 silently drops 4.5% of answers. 0.25 is the highest floor that costs no recall — and it was only knowable by measuring |
 | Change the chunker, the model or the payload in place | Bump `common::COLLECTION` | `ensure_collection` early-returns when the collection exists, so an in-place change **silently does not happen**. The version is also this system's only rollback: the old collection stays queryable while the new one fills |
 | Trust `sqlx::migrate!` to notice a new migration file | Rebuild the crate that embeds it (touch a source file, or `cargo clean -p worker`) | It is a **compile-time** read of a directory, exactly like `include_str!` for `widget.js`. The worker embeds `../api/migrations`; adding `0013` and running `cargo test --workspace` failed with `VersionMissing(13)` because the worker binary still held the old set. The database was ahead of the binary, and the error names the version rather than the cause |
+| `ORDER BY created_at` when the SELECT has `created_at::text AS created_at` | Qualify it: `ORDER BY documents.created_at` | Postgres resolves a **bare** name in ORDER BY against the *output* list first, so the alias wins and the sort runs on the text rendering. Measured on 5k rows: `Seq Scan` + `Sort Key: ((created_at)::text)` at cost 371, versus an index scan with **no sort node** at cost 0.29 once qualified. The 0016 index exists for this one query and the bare form never touches it. It reads like a correctness bug too — the keyset `WHERE` compares `timestamptz` — but is not: `timestamptz` normalises to UTC and renders in one session zone, so text order agrees with chronological order. The bug is the plan, not the result |
+| Paginate a polled list with `LIMIT/OFFSET` | Keyset on `(created_at, id)` | A row inserted between two polls shifts every later row by one, so the reader sees a row twice or skips one — and neither is an error. The `id` half is not optional either: `created_at` defaults to `transaction_timestamp()`, so same-transaction rows are byte-identical, and a cursor without a tiebreaker loses exactly the rows on a boundary. Verified by deleting the tiebreaker: **5 of 9 documents vanished** and the listing still looked fine |
+| Build the cursor query string by concatenation | `URLSearchParams` / `encodeURIComponent` | The cursor carries `+00`, and a bare `+` in a query string decodes to a **space** — corrupting the offset, not merely the separator. It fails only at a page boundary, never on page one, which is where anyone would look |
+| Map an unrecognised failure to the tenant's fault | `system_error` unless the sidecar *proves* otherwise (exit 3 or 4) | The two errors are not symmetric. Excusing a broken file wastes one support ticket; blaming a tenant for our outage sends them re-uploading a good file in a loop that cannot succeed, while the real fault goes unreported. `classify` therefore has one narrow `match` and a catch-all, and `status.ts`'s `system_error` branch is the one place the word "upload" must never appear — pinned by a test |
+| Add a `failure_reason` variant in one place | Three places, and only one fails closed | `failure.rs`, migration 0015's `CHECK`, and the TS union. A worker writing a variant the `CHECK` lacks aborts its transaction — loud, and the good case. A variant the **TS** lacks renders as the cause-agnostic copy — silent, and merely vague. Adding to TS alone is the dangerous order: the UI promises copy for a value nothing writes |
+| Trust `documents.error` to stay unexposed because it always has been | Select `failure_reason`, never `error` | They sit one column apart in the same row and the same `SELECT`. `error` holds the gateway bodies and stack traces invariant 16 exists to contain, and adding it "just for debugging" is a one-word diff that reviews clean |
 | Label a metric with `tenant` | Aggregate only; `GET /admin/ops/tenants` for attribution | Invariant 30. A TSDB is a fourth store the erasure saga cannot reach, is designed not to be deleted from, and its series outlive the tenant. Hashing the id does not help — a stable pseudonym survives erasure too |
 | Scrape `/metrics` with `ADMIN_API_KEY` | A separate `METRICS_TOKEN`; no token means no route | The admin key can **erase a tenant** (phase 12), and a scrape config is a low-trust, widely-readable artifact. Unset means the route is not registered at all — an endpoint that refuses still confirms it exists |
 | Read gauges with `SELECT count(*) FROM documents` on the app pool | `metrics_document_counts()` (`SECURITY DEFINER`, aggregates only) | `documents` is RLS-FORCED and the API is `app_user`: it matches zero rows and *reports success*. Every gauge reads 0 and the dashboard is permanently, beautifully green — in the one endpoint whose job is to say something is wrong |
@@ -483,11 +489,32 @@ Each of these exists in, or nearly slipped into, this codebase.
 | Republish ingest events to re-index everything | `cargo run -p worker -- reindex` | Invariant 10 skips a redelivered document whose fingerprint is unchanged — the very thing that makes redelivery safe makes a migration a silent no-op. The driver bypasses `claim` deliberately, which is also why the normal worker must be stopped first |
 | List only the tables you name in a `TRUNCATE … CASCADE` prompt | Name what CASCADE will reach as well | `accounts` and `sessions` hang off `tenants` by FK, so a wipe of "tenants, api_keys, documents" silently destroys every dashboard login too. Verified from the `NOTICE` output. A prompt that understates its blast radius is approved by someone who did not know what they were approving |
 
-The sidecar signals failure with **exit codes, not stderr**: `2` = unreadable, `3` = unsupported type.
-The worker classifies these into fatal-vs-retryable. It is a cross-language contract and neither side
-documents the other — change one, change both. An unclassified error in the worker is a bug: if you
-cannot say whether a failure is fatal or retryable, that is the design question to answer before
-writing the code.
+The sidecar signals failure with **exit codes, not stderr**, and the code says *whose fault it is*:
+
+| Code | Meaning | Whose fault | `failure_reason` |
+| --- | --- | --- | --- |
+| `0` | text on stdout | — | — |
+| `1` | uncaught crash (a missing `pypdf`, a bug) | **ours** | `system_error` |
+| `2` | usage error — wrong argv count | **ours** (the worker always passes one arg) | `system_error` |
+| `3` | unsupported extension | the document's | `unsupported_type` |
+| `4` | unreadable content: encrypted, truncated, malformed | the document's | `unreadable_file` |
+
+This table was wrong in this file for eleven phases — it read *"`2` = unreadable, `3` = unsupported
+type"*. `2` is argv misuse, which `parser.rs` cannot trigger; a genuinely unreadable PDF was an
+**uncaught traceback on `1`**, indistinguishable from our own sidecar being broken. `4` exists
+because that distinction is now load-bearing: it decides whether a tenant is told to re-upload or to
+wait, and mapping `1` to "your file is damaged" would tell someone to re-upload a good file every
+time *our* deployment broke. Hence the rule inside `parser.py`: **when in doubt, crash (1)** — never
+widen `4` to cover an internal fault.
+
+It is a cross-language contract and neither side documents the other — change one, change both.
+`failure::classify` is the Rust half, and it is *conservative by construction*: only codes 3 and 4
+implicate the document, everything else is `system_error`. The worker separately classifies
+fatal-vs-retryable for the **queue**, which is a different axis and must not be conflated — a
+`Retryable` failure still writes a `failure_reason`, because the tenant sees the row now and the
+redelivery may be twenty minutes away. An unclassified error in the worker is a bug: if you cannot
+say whether a failure is fatal or retryable, that is the design question to answer before writing
+the code.
 
 ## Security
 
@@ -542,12 +569,19 @@ writing the code.
 | Worker integration tests — concurrent claim and the fence (`lifecycle.rs`), the lease-respecting sweeps (`reaper.rs`), and their shared setup. In-crate on purpose; the module doc says why | `crates/worker/src/{lifecycle,reaper,testsupport}.rs` |
 | CI — and why `cargo test` runs *before* the services start, and why `bun run lint` is absent | `.github/workflows/ci.yml` |
 | Handlers, Qdrant search, SSE stream | `crates/api/src/handlers.rs` |
+| The keyset cursor — `encode_cursor` / `parse_cursor` / `is_our_timestamp`, and why a cursor we did not mint is a 422 rather than a 500 | `crates/api/src/handlers.rs` |
+| `STREAM_DEADLINE` — the wall clock on a streamed answer, and why firing it is a `done` rather than an `error` | `crates/api/src/handlers.rs` |
+| That paging loses no row, including across identical timestamps | `crates/api/tests/pagination.rs` |
+| The `/ask/stream` frame contract and the turn it persists — the route's first tests | `crates/api/tests/ask_stream.rs` |
+| Page navigation as links, so reading the library still needs no JavaScript | `web/src/lib/features/documents/components/pager.svelte` |
 | `tenant_tx()` and the two pools | `crates/api/src/db.rs` |
 | `AuthTenant` / `AdminAuth` / `SessionAuth` / `Actor`, `hash_key`, `require_secret` vs `require_management`, the `sess_` prefix dispatch, `normalize_origin` (next to the `Origin` check it must agree with), key + session token gen | `crates/api/src/auth.rs` |
 | Self-serve accounts: register / login / logout / me / self-serve key mgmt; Argon2 hashing | `crates/api/src/accounts.rs` |
 | `AppError` and the blanket `From` impl that makes `?` a 500 | `crates/api/src/error.rs` |
 | Env vars and their defaults | `crates/api/src/config.rs` |
 | Worker claim / status machine | `crates/worker/src/lifecycle.rs` |
+| `FailureReason` and `classify` — the closed enum behind a `failed` badge, and why anything unrecognised is *our* fault | `crates/worker/src/failure.rs` |
+| The sidecar exit-code contract in Rust (`SidecarExit`, `EXIT_UNREADABLE`) — the typed error `classify` downcasts to | `crates/worker/src/parser.rs` |
 | MinIO event parsing (the percent-encoding trap) | `crates/worker/src/event.rs` |
 | Chunking — `chunk_text` and the `CHUNK_SIZE`/`CHUNK_OVERLAP` constants. In `common` because it is half the index recipe: the worker writes chunks and the bench must reproduce them byte for byte | `crates/common/src/chunk.rs` |
 | The retrieval bench — fixture corpus, golden set, the metrics, and the sabotage table that must move before any number is believed. Writes to `eval_bench`, never the live collection | `crates/eval/` |
@@ -576,7 +610,7 @@ writing the code.
 | Browser → MinIO upload; the presigned-URL-is-not-a-credential boundary (invariant 24) | `web/src/lib/features/documents/upload.ts` |
 | Origin validation + the mint/PATCH rules, shared by admin and self-serve | `crates/api/src/handlers.rs` (`checked_origins`, in `insert_api_key`) |
 | The embed snippet, and its refusal to carry an `sk_` | `web/src/lib/features/keys/embed.ts` |
-| Status → user-facing copy; where invariant 16 is enforced *in the UI* | `web/src/lib/features/documents/status.ts` |
+| Status (+ `failure_reason`) → user-facing copy; where invariant 16 is enforced *in the UI*, and the only place the re-upload-vs-wait decision is made | `web/src/lib/features/documents/status.ts` |
 | The two BFF routes a browser fetches directly — the shared origin / content-type / `locals.session` guard chain, and why it is not `requireUser` | `web/src/routes/(authenticated)/documents/upload-url/+server.ts` (mint + re-mint) and `.../playground/ask/+server.ts` (the SSE proxy) |
 | Migrations — forward-only, run at API startup on the admin pool, which is then closed | `crates/api/migrations/` |
 | Counters, the exposition format, and why there is no metrics dependency (plus the stated stopping point: no histograms) | `crates/api/src/metrics.rs` |
@@ -630,23 +664,50 @@ superset — everything known, whether or not it blocks.
   strand orphaned vectors) and must erase one whose lease has elapsed. So the trade is now a tested
   decision instead of an assumed one — and whoever closes it has a test that will tell them if the
   fix reintroduces the race.
-- **`GET /documents` has no pagination.** It returns the tenant's entire table, every call, fully
-  materialised. Fine for a new tenant; a real problem at scale, and the dashboard polls it. The
-  polling backs off to a 15s ceiling precisely because this query is unbounded — that is a mitigation,
-  not a fix.
-- **`failed` conflates "your file is broken" with "our worker died".** `mark_failed` writes the
-  parser's stderr; the reaper writes `'processing lease expired; worker presumed dead'`. Both land in
-  the `error` column, which **no endpoint exposes** — correctly, since invariant 16 forbids shipping
-  either string to a client. The cost is that the UI cannot tell a tenant whether to re-upload or
-  wait, so its copy names both causes. The fix is for the worker to write a *classified* reason code
-  alongside the raw text, which the API could then expose safely. Until then a `failed` badge is
-  honest but not actionable.
+- **`GET /documents` is paginated (phase 15).** It used to return the tenant's entire table, every
+  call, fully materialised, on a route the dashboard polls. It now takes `?limit=` (default 50, max
+  200) and `?before=<cursor>`, and answers `{documents, next_cursor, limit}`.
+  **Keyset, not `OFFSET`, because the list is polled**: with an offset a document created between
+  two polls shifts every later row by one, so the reader silently sees a row twice or misses one.
+  The cursor is `(created_at, id)` and **both halves are required** — `created_at` defaults to
+  `now()`, which is `transaction_timestamp()`, so rows written in one transaction are byte-identical
+  and a cursor on the timestamp alone loses exactly the rows on a page boundary. Migration 0016 adds
+  the `(tenant_id, created_at desc, id desc)` index the sort never had.
+  Three residues. The **default is the load-bearing part** — it is what bounds an un-updated client,
+  which is why `limit` is optional rather than required. There is **no `total`**, deliberately: a
+  count is the full scan this replaced. And **the cursor cannot go backwards**; the dashboard uses
+  browser history for that, which is free and correct but means "previous page" is unavailable to an
+  API client that did not keep its own cursors.
+- **`failed` no longer conflates "your file is broken" with "our worker died" (phase 14).** It used
+  to: `mark_failed` wrote the parser's stderr and the reaper wrote `'processing lease expired; worker
+  presumed dead'`, both into the `error` column that **no endpoint exposes** — correctly, since
+  invariant 16 forbids shipping either string to a client. So the UI had to name both causes at once
+  and a tenant could not tell whether to re-upload or wait.
+  The worker now writes a *classified* `failure_reason` beside the raw text — a closed enum
+  (`unreadable_file` / `unsupported_type` / `too_large` / `system_error`) cut by **what the tenant
+  should do**, not by what broke. `GET /documents` returns the code; `error` stays unexposed.
+  Three residues worth knowing. **Rows that failed before this exist with `failure_reason IS NULL`**
+  and are not backfilled — nothing recorded a cause for them, and grepping the old `error` text for
+  the reaper's string would be inventing a fact from free text that was never a contract; the UI
+  renders null as the old both-causes copy. **The enum lives in three places** (`failure.rs`,
+  migration 0015's `CHECK`, `web/src/lib/types/documents.ts`) and only the `CHECK` fails closed.
+  And **`error` is still not classified for operators** — the reason code is deliberately coarse, so
+  diagnosing *which* store was down still means reading logs.
 - **`POST /documents` (multipart proxy) is deprecated** — it buffers whole files in API memory. Use
   `POST /documents/upload-url`. It gets deleted along with `crates/api/src/queue.rs` and the worker's
   `consume_legacy` / `LEGACY_QUEUE`. Do not add features to it. Do not add callers.
-- **`/auth/keys` is unmetered** — a logged-in session can mint unbounded keys. It is session-gated and
-  does not multiply LLM spend (`rate_limit::check` buckets on `tenant_id`), so this is an audit and
-  revocation-surface problem rather than a cost one. The last unmetered route that creates state.
+- **`POST /auth/keys` is metered (phase 15).** A logged-in session could mint unbounded keys — not a
+  spend problem (minting buys no embeddings) but an **audit and revocation-surface** one: every row
+  is a live credential someone must later enumerate and revoke. It was the last route that created
+  state without a meter.
+  It takes its **own bucket**, `keys:{tenant_id}`, and the prefix is the point rather than tidiness.
+  `rate_limit::check` keys on whatever string it is handed, so passing the bare `tenant_id` would put
+  key-minting in the *same* window as `/ask` — a tenant provisioning keys would spend their own
+  question budget, and their widget would start 429ing for a reason no log connects to the dashboard
+  tab that caused it. Verified: at `RATE_LIMIT_PER_MINUTE=5`, mints 1–5 returned 201, 6–7 returned
+  429, and `POST /documents/upload-url` still returned 201 on the same session.
+  `GET`/`PATCH`/`DELETE` on `/auth/keys` stay unmetered: they create no rows, and their cost is
+  bounded by the number of keys that already exist.
 - **The isolation guarantee is tested now — here is exactly how far that goes.** Phase 9 added
   `crates/api/tests/` and `.github/workflows/ci.yml`. **Covered:** cross-tenant denial on both
   mechanisms (RLS row reads/deletes, *and* the Qdrant tenant filter, each with the control assertion
@@ -661,7 +722,13 @@ superset — everything known, whether or not it blocks.
   refusal to erase a row whose lease is still live; **lease reclaim**; and two worker-side tenancy
   assertions (a foreign document is invisible to `claim`; a sweep bound to one tenant cannot touch
   another's rows, which is the corollary trap asserted rather than trusted).
-  **Not covered, and worth knowing precisely:** `/ask/stream`; the *migration* driver, which is
+  Phase 15 added the pagination suite (`pagination.rs` — the tie case, the guard rails, and the
+  bounded default) and, for the first time, **`/ask/stream`** (`ask_stream.rs` — frame order, the
+  data-less `done`, the persisted turn, a refusal costing no LLM call, and a `pk_` reaching the
+  route). Both were verified red first: deleting the cursor's `id` tiebreaker loses 5 of 9 rows.
+  **Not covered, and worth knowing precisely:** `STREAM_DEADLINE` *firing* — at 300s a real test
+  would take five minutes and a faked clock would assert against a stub, so the bound is reasoned
+  and reviewed rather than proven. Also the *migration* driver, which is
   exercised by hand rather than by a test. Retrieval quality is no longer uncovered but it is
   measured rather than asserted — see the bench. And one gap that is structural rather than deferred — removing the
   `tenant_id` leg of `delete_document_stores`' Qdrant filter turns **nothing** red, because
@@ -688,14 +755,22 @@ superset — everything known, whether or not it blocks.
   not rebuild it, and invariant 10 *skips* a redelivered document whose fingerprint is unchanged. So
   dropping the collection alone leaves it permanently empty, with no error. The document rows must go
   too. Whoever changes the model next will hit both.
-- **`/ask/stream` still has no maximum duration, and that is the residue of invariant 28.** Every
-  gateway call is now bounded, but the streaming answer's bound is a *stall* — silence between reads —
-  not a deadline, because a deadline caps how long an answer may be rather than how long a gateway may
-  hang. So a gateway trickling one token just inside `READ_TIMEOUT` streams indefinitely. In practice
-  `MAX_TOKENS` bounds it, which is a real bound only on a well-behaved gateway — the same caveat that
-  entry has always carried. Closing it properly means a token budget with a wall clock, which is a
-  design rather than a constant. Accepted deliberately: the failure mode is a slow answer, not a
-  leaked task, and capping legitimate long answers is the worse trade.
+- **`/ask/stream` has a maximum duration now (phase 15), and invariant 28's residue is closed.**
+  Every gateway call was bounded, but the streaming answer's bound was a *stall* — silence between
+  reads — so a gateway trickling one token just inside `READ_TIMEOUT` streamed indefinitely while
+  never once looking unhealthy. `STREAM_DEADLINE` (300s, `handlers.rs`) is an absolute wall clock,
+  taken **once before the loop**: a per-token deadline would reset on every delta and bound nothing,
+  which is the mistake that makes this look already-solved.
+  **It lives in the handler's loop, never on the reqwest client.** A client `.timeout()` is a total
+  deadline *including the body*, and this body is the answer — it would cap answer length rather
+  than gateway hangs (`llm.rs` has two tests that go red if someone adds it).
+  **Firing is not a failure, and that is the design.** The obvious version sets `failed = true`,
+  which emits an `error` frame after the client has already rendered good prose *and* skips
+  `append_turn`, so invariant 7 drops from history a turn only our own ceiling truncated — losing the
+  answer and the record of asking. Instead it emits a normal `done` and **persists what arrived**.
+  The cost, real and accepted: an answer cut mid-sentence becomes history the next rewrite reasons
+  over. Still open: **the deadline firing has no test** — at 300s a real one would be a five-minute
+  test and a faked clock would assert against a stub. The frame contract around it is now covered.
 - The DB permits an `uploaded` document status that **no code path ever assigns**. A vestige. Either
   give it meaning or drop it from the constraint — an unreachable state is a trap for the next reader.
 - **No `.env.example`**, though `.gitignore` expects one. A new contributor reconstructs the required

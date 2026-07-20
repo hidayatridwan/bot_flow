@@ -7,6 +7,7 @@
 //! All statements run inside a transaction that has set `app.current_tenant`, so RLS confines
 //! them to one tenant. A row belonging to someone else is invisible, not forbidden.
 
+use crate::failure::FailureReason;
 use anyhow::Context;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -73,7 +74,11 @@ pub async fn claim(
                 uploaded_at = coalesce(uploaded_at, now()),
                 processing_started_at = now(),
                 attempts = attempts + 1,
-                error = null
+                error = null,
+                -- Cleared with `error`, and for the same reason: this row is being tried again, so
+                -- the last attempt's verdict is no longer true. Leaving it would tell a tenant
+                -- their file type is unsupported while it is indexing fine.
+                failure_reason = null
           WHERE id = $1",
     )
     .bind(document_id)
@@ -109,28 +114,55 @@ fn claim_decision(status: &str, known_etag: Option<&str>, etag: &str) -> Option<
 
 /// Terminal success. Guarded on `processing` — see [`finish_from_processing`].
 pub async fn mark_ready(db: &PgPool, tenant_id: &str, document_id: Uuid) -> anyhow::Result<bool> {
-    finish_from_processing(db, tenant_id, document_id, "ready", None).await
+    finish_from_processing(db, tenant_id, document_id, "ready", None, None).await
 }
 
 /// Retryable failure. The queue's delivery limit decides when to stop trying. Guarded on
 /// `processing` — see [`finish_from_processing`].
+///
+/// Takes both halves of the story on purpose: `error` is the raw diagnostic no endpoint may
+/// expose, `reason` is the classified one the tenant is shown. Writing the first without the
+/// second is what made a `failed` badge unactionable for a tenant.
 pub async fn mark_failed(
     db: &PgPool,
     tenant_id: &str,
     document_id: Uuid,
     error: &str,
+    reason: FailureReason,
 ) -> anyhow::Result<bool> {
-    finish_from_processing(db, tenant_id, document_id, "failed", Some(error)).await
+    finish_from_processing(
+        db,
+        tenant_id,
+        document_id,
+        "failed",
+        Some(error),
+        Some(reason),
+    )
+    .await
 }
 
-/// The object broke a rule no retry can fix (oversize, unreadable type). The bytes are deleted.
+/// The object broke a rule no retry can fix (oversize). The bytes are deleted.
+///
+/// `reason` is a parameter rather than a hardcoded [`FailureReason::TooLarge`] because the UI copy
+/// for `quarantined` names the size limit specifically. Today that is honest — the oversize check
+/// is this status's only writer — and a second writer has to state its own reason here rather than
+/// silently inherit one that would then be a lie.
 pub async fn mark_quarantined(
     db: &PgPool,
     tenant_id: &str,
     document_id: Uuid,
-    reason: &str,
+    error: &str,
+    reason: FailureReason,
 ) -> anyhow::Result<()> {
-    set_status(db, tenant_id, document_id, "quarantined", Some(reason)).await
+    set_status(
+        db,
+        tenant_id,
+        document_id,
+        "quarantined",
+        Some(error),
+        Some(reason),
+    )
+    .await
 }
 
 /// A worker's terminal transition **out of `processing`**, guarded so it only fires on a row the
@@ -151,12 +183,14 @@ async fn finish_from_processing(
     document_id: Uuid,
     status: &str,
     error: Option<&str>,
+    reason: Option<FailureReason>,
 ) -> anyhow::Result<bool> {
     let mut tx = tenant_tx(db, tenant_id).await?;
     let result = sqlx::query(
         "UPDATE documents
             SET status = $2,
                 error = $3,
+                failure_reason = $4,
                 processed_at = case when $2 = 'ready' then now() else processed_at end,
                 processing_started_at = null
           WHERE id = $1 AND status = 'processing'",
@@ -164,6 +198,7 @@ async fn finish_from_processing(
     .bind(document_id)
     .bind(status)
     .bind(error)
+    .bind(reason.map(FailureReason::as_str))
     .execute(&mut *tx)
     .await
     .context("failed to update document status")?;
@@ -179,12 +214,14 @@ async fn set_status(
     document_id: Uuid,
     status: &str,
     error: Option<&str>,
+    reason: Option<FailureReason>,
 ) -> anyhow::Result<()> {
     let mut tx = tenant_tx(db, tenant_id).await?;
     let result = sqlx::query(
         "UPDATE documents
             SET status = $2,
                 error = $3,
+                failure_reason = $4,
                 processed_at = case when $2 = 'ready' then now() else processed_at end,
                 processing_started_at = null
           WHERE id = $1",
@@ -192,6 +229,7 @@ async fn set_status(
     .bind(document_id)
     .bind(status)
     .bind(error)
+    .bind(reason.map(FailureReason::as_str))
     .execute(&mut *tx)
     .await
     .context("failed to update document status")?;
@@ -341,7 +379,7 @@ mod integration {
 
         // Same fence on the failure path.
         let doc2 = seed_document(&db, &tenant, "deleting", Some("1 minute")).await;
-        let finished = mark_failed(&db, &tenant, doc2, "boom")
+        let finished = mark_failed(&db, &tenant, doc2, "boom", FailureReason::SystemError)
             .await
             .expect("mark_failed errored");
         assert!(!finished, "mark_failed is not guarded on `processing`");

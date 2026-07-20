@@ -59,6 +59,11 @@
     {
       "key": "widgetEtag",
       "value": ""
+    },
+    {
+      "key": "documentsCursor",
+      "value": "",
+      "type": "string"
     }
   ],
   "item": [
@@ -501,7 +506,7 @@
                 "keys"
               ]
             },
-            "description": "Mint a key for your own tenant with a session instead of the admin key \u2014 the dashboard equivalent of Admin > Mint API Key. kind = 'secret' or 'publishable'. Raw key returned once."
+            "description": "Mint a key for your own tenant with a session instead of the admin key \u2014 the dashboard equivalent of Admin > Mint API Key. kind = 'secret' or 'publishable'. Raw key returned once.\n\nRate-limited on its own bucket (`keys:{tenant_id}`), separate from the tenant's /ask budget - so provisioning keys cannot throttle your live widget. Over the limit returns 429."
           }
         },
         {
@@ -786,16 +791,106 @@
             "method": "GET",
             "header": [],
             "url": {
-              "raw": "{{baseUrl}}/documents",
+              "raw": "{{baseUrl}}/documents?limit=50",
               "host": [
                 "{{baseUrl}}"
               ],
               "path": [
                 "documents"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50",
+                  "description": "Optional. 1-200, default 50. Omitting it still returns a bounded page."
+                },
+                {
+                  "key": "before",
+                  "value": "{{documentsCursor}}",
+                  "disabled": true,
+                  "description": "Optional. The next_cursor from the previous page. Use 'List Documents (next page)' instead \u2014 Postman URL-encodes the cursor's '+' there."
+                }
               ]
             },
-            "description": "List this tenant's documents with status (RLS-scoped). Requires a SECRET key."
-          }
+            "description": "One page of this tenant's documents, newest first (RLS-scoped). Secret key or session.\n\nReturns {documents, next_cursor, limit}. `next_cursor` is null on the last page.\n\nThe test script below saves `next_cursor` into the `documentsCursor` collection variable, so 'List Documents (next page)' works without copy-pasting."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('200 with a documents array', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    pm.expect(body.documents).to.be.an('array');",
+                  "});",
+                  "pm.test('page is bounded by the limit', function () {",
+                  "    pm.expect(body.documents.length).to.be.at.most(body.limit);",
+                  "});",
+                  "// Saved so the next-page request needs no copy-paste. Null on the last page, which is",
+                  "// why it is cleared rather than left pointing at a page you have already read.",
+                  "pm.collectionVariables.set('documentsCursor', body.next_cursor || '');",
+                  "console.log(body.next_cursor ? 'More pages: run \"List Documents (next page)\".'",
+                  "                             : 'Last page reached (next_cursor is null).');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List Documents (next page)",
+          "request": {
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{apiKey}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/documents?limit=50&before={{documentsCursor}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "documents"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                },
+                {
+                  "key": "before",
+                  "value": "{{documentsCursor}}",
+                  "description": "Set automatically by 'List Documents'. Opaque - echo it back unchanged."
+                }
+              ]
+            },
+            "description": "The page after 'List Documents'. Run that first: it stores `next_cursor` in the `documentsCursor` variable.\n\nKeyset, not offset - a document created between two calls does not shift the pages, so nothing is skipped or repeated.\n\nNOTE: the cursor contains a '+' (the UTC offset). Postman encodes it as part of the query parameter; hand-building this URL by string concatenation sends a space instead and the API answers 422 invalid cursor."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('not a 422 - the cursor survived the query string', function () {",
+                  "    pm.expect(pm.response.code, 'a 422 here means the cursor was corrupted in transit')",
+                  "        .to.not.eql(422);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('documentsCursor', body.next_cursor || '');"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Delete Document",
@@ -1068,7 +1163,7 @@
                 "stream"
               ]
             },
-            "description": "Server-Sent Events: a 'conversation' event first (the conversation_id), then 'sources', then incremental 'token' events, then 'done'.\n\nSend no conversation_id to start a new conversation. Postman cannot run a test script against a stream, so copy the id from the first `conversation` event and paste it into the {{conversationId}} collection variable to continue.\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) \u2014 no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket.\n\nTwo things about the frames that are easy to get wrong. An LLM failure yields a single 'error' event carrying a FIXED string \u2014 the gateway's own error body goes to the API log and never to a client (invariant 16), because for a pk_ widget this frame reaches a stranger's browser. And 'done' carries no `data:` field at all, so a browser EventSource \u2014 which drops any event with an empty data buffer, per the WHATWG spec \u2014 would never fire it. Read the stream with fetch, not EventSource."
+            "description": "Server-Sent Events: a 'conversation' event first (the conversation_id), then 'sources', then incremental 'token' events, then 'done'.\n\nSend no conversation_id to start a new conversation. Postman cannot run a test script against a stream, so copy the id from the first `conversation` event and paste it into the {{conversationId}} collection variable to continue.\n\nAUTH: a secret key, a publishable key, OR a session (invariant 27) \u2014 no gate. With a publishable key, also send an Origin header matching the key's allowed_origins. Rate limited per tenant, not per credential, so a dashboard question and a widget question share one bucket.\n\nTwo things about the frames that are easy to get wrong. An LLM failure yields a single 'error' event carrying a FIXED string \u2014 the gateway's own error body goes to the API log and never to a client (invariant 16), because for a pk_ widget this frame reaches a stranger's browser. And 'done' carries no `data:` field at all, so a browser EventSource \u2014 which drops any event with an empty data buffer, per the WHATWG spec \u2014 would never fire it. Read the stream with fetch, not EventSource.\n\nOne answer streams for at most 5 minutes (STREAM_DEADLINE). That ceiling bounds total duration; the gateway timeouts bound silence between tokens, which is a different thing. If it fires you get a normal `done` and keep the partial answer - not an `error` - because the text has already been shown and discarding it would discard the record of asking too."
           }
         }
       ],

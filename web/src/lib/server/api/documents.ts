@@ -17,11 +17,27 @@ export interface DocumentDto {
 	 * Narrowing happens in `features/documents/status.ts`, where unknown falls to a safe branch.
 	 */
 	status: string;
+	/**
+	 * Also deliberately `string | null`, for the same reason as `status` — and one more: this field
+	 * is null both for "did not fail" and for "failed before classification existed", and the second
+	 * of those is a fact about old rows the type must not paper over. Narrowed by `toFailureReason`.
+	 */
+	failure_reason: string | null;
 	created_at: string;
 }
 
 export interface ListDocumentsResponse {
 	documents: DocumentDto[];
+	/**
+	 * The cursor for the next (older) page, or `null` on the last page.
+	 *
+	 * Opaque by contract — echo it back untouched. It encodes `(created_at, id)`, and the `id` half
+	 * is not decoration: the API's `created_at` is not unique, so a cursor without it would land on
+	 * a page boundary that cannot be resolved.
+	 */
+	next_cursor: string | null;
+	/** The page size actually applied, which is the default when the caller named none. */
+	limit: number;
 }
 
 export interface UploadUrlBody {
@@ -35,8 +51,25 @@ export interface UploadUrlResponse {
 	expires_at: string;
 }
 
-/** Returns the tenant's entire table — no pagination server-side. Scoped by Postgres RLS. */
-export const listDocuments = (client: ApiClient) => client.get<ListDocumentsResponse>('/documents');
+/**
+ * One page of the tenant's documents, newest first. Scoped by Postgres RLS.
+ *
+ * Keyset, not offset: this list is *polled*, and with an offset a document created between two
+ * polls shifts every following row by one — so the reader silently sees a row twice or misses one.
+ * Pass the previous response's `next_cursor` as `before` to walk backwards in time.
+ *
+ * Omitting both parameters is a valid call and returns a bounded first page; the API defaults the
+ * size rather than returning everything.
+ */
+export const listDocuments = (client: ApiClient, page: { before?: string | null } = {}) => {
+	// URLSearchParams because the cursor carries `+` (the UTC offset) and `:` — and a raw `+` in a
+	// query string decodes to a space, which would corrupt the timestamp rather than merely look
+	// untidy. Hand-concatenating this is the bug that does not show up until a page boundary.
+	const qs = new URLSearchParams();
+	if (page.before) qs.set('before', page.before);
+	const suffix = qs.size > 0 ? `?${qs}` : '';
+	return client.get<ListDocumentsResponse>(`/documents${suffix}`);
+};
 
 export const createUploadUrl = (client: ApiClient, body: UploadUrlBody) =>
 	client.post<UploadUrlResponse>('/documents/upload-url', body);

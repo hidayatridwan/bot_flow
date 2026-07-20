@@ -2,7 +2,7 @@ use crate::auth::{self, Actor, AdminAuth, AuthTenant};
 use crate::queue::{self, IngestJob};
 use crate::rate_limit;
 use anyhow::Context;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use qdrant_client::qdrant::{
@@ -392,6 +392,134 @@ fn checked_limit(limit: u64) -> Result<u64, AppError> {
     Ok(limit)
 }
 
+/// Query string of `GET /documents`. Both fields are optional, which is what keeps an existing
+/// `sk_` client working unchanged — it simply starts receiving a bounded first page.
+#[derive(Deserialize)]
+pub struct ListDocumentsQuery {
+    limit: Option<u64>,
+    /// The `next_cursor` from a previous page. Opaque to the caller by contract, even though it is
+    /// legible: nothing but a token we minted is accepted.
+    before: Option<String>,
+}
+
+/// Rows returned when the caller names no `limit`.
+///
+/// Chosen to be larger than any tenant's screen and smaller than any tenant's table. It is also the
+/// value an **un-updated client** silently receives, which is the entire point of defaulting rather
+/// than requiring the parameter: the unbounded read closes for every caller on deploy, not just for
+/// callers who adopt the parameter.
+const DEFAULT_PAGE_LIMIT: u64 = 50;
+
+/// The most rows one page may carry. A ceiling on `?limit=`, for the same reason [`MAX_LIMIT`]
+/// bounds `/search`: without it `?limit=100000` is a valid request that reinstates exactly the
+/// unbounded read this parameter exists to close.
+const MAX_PAGE_LIMIT: u64 = 200;
+
+fn checked_page_limit(limit: Option<u64>) -> Result<u64, AppError> {
+    let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    if limit == 0 || limit > MAX_PAGE_LIMIT {
+        return Err(AppError::client(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "limit must be between 1 and 200",
+        ));
+    }
+    Ok(limit)
+}
+
+/// A keyset cursor: the `(created_at, id)` of the last row of a page.
+///
+/// **Keyset rather than `OFFSET` because this listing is polled.** With an offset, a document
+/// created between two polls shifts every following row by one, so the reader sees a row twice or
+/// misses one entirely — and neither shows up as an error. A cursor names a *position in the
+/// ordering*, so an insert above it changes nothing below it.
+///
+/// Both halves are required. `created_at` alone is not unique (see migration 0016), and a cursor on
+/// a non-unique key loses exactly the rows that share the boundary timestamp.
+struct Cursor {
+    created_at: String,
+    id: uuid::Uuid,
+}
+
+/// Render `(created_at, id)` as the `next_cursor` string.
+///
+/// The `T` is not cosmetic: Postgres renders `timestamptz::text` with a **space** separator
+/// (`2026-07-20 04:09:35.353682+00`), and a space in a query parameter is the `%20`-or-`+`
+/// ambiguity that `event.rs` already documents for MinIO keys. Emitting ISO-8601 keeps the token
+/// safe to paste into a URL by hand, and Postgres accepts the `T` form back verbatim.
+fn encode_cursor(created_at: &str, id: uuid::Uuid) -> String {
+    format!("{}~{}", created_at.replacen(' ', "T", 1), id)
+}
+
+/// Parse a cursor, rejecting anything we did not mint.
+///
+/// The strictness is load-bearing rather than fussy. The timestamp half is interpolated into the
+/// query as a `::timestamptz` bind, and a value Postgres cannot cast raises a database error, which
+/// the blanket `From` turns into a **500** — an internal error for what is plainly a caller's
+/// malformed input. Validating the shape here is what keeps that a `422`, and it is why this
+/// accepts only the exact format [`encode_cursor`] emits instead of anything date-like.
+fn parse_cursor(raw: &str) -> Result<Cursor, AppError> {
+    let invalid = || AppError::client(StatusCode::UNPROCESSABLE_ENTITY, "invalid cursor");
+
+    // `rsplit_once`: a UUID contains no `~`, so the last one is always the separator.
+    let (ts, id) = raw.rsplit_once('~').ok_or_else(invalid)?;
+    let id = uuid::Uuid::parse_str(id).map_err(|_| invalid())?;
+    if !is_our_timestamp(ts) {
+        return Err(invalid());
+    }
+    Ok(Cursor {
+        created_at: ts.to_string(),
+        id,
+    })
+}
+
+/// Does this string match the timestamp shape we emit — `YYYY-MM-DDTHH:MM:SS[.ffffff]+00[:00]`?
+///
+/// Deliberately a shape *and range* check, not merely a character-class one. `9999-99-99T99:99:99`
+/// passes any plausible "looks like a date" test and still fails the `::timestamptz` cast, which is
+/// the 500 this function exists to prevent.
+fn is_our_timestamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    // `2026-07-20T04:09:35` is the shortest accepted form.
+    if b.len() < 19 {
+        return false;
+    }
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
+    let num = |r: std::ops::Range<usize>| s[r].parse::<u32>().unwrap_or(u32::MAX);
+
+    if !(digits(0..4) && b[4] == b'-' && digits(5..7) && b[7] == b'-' && digits(8..10)) {
+        return false;
+    }
+    if !(b[10] == b'T'
+        && digits(11..13)
+        && b[13] == b':'
+        && digits(14..16)
+        && b[16] == b':'
+        && digits(17..19))
+    {
+        return false;
+    }
+    if !(1..=12).contains(&num(5..7))
+        || !(1..=31).contains(&num(8..10))
+        || num(11..13) > 23
+        || num(14..16) > 59
+        // 60 is a leap second, which Postgres accepts.
+        || num(17..19) > 60
+    {
+        return false;
+    }
+
+    // Optional fractional seconds, then an offset we must recognise.
+    let mut rest = &s[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let n = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if n == 0 || n > 6 {
+            return false;
+        }
+        rest = &frac[n..];
+    }
+    matches!(rest, "" | "Z" | "+00" | "+00:00" | "-00" | "-00:00")
+}
+
 pub async fn search(
     State(state): State<AppState>,
     actor: Actor, // FromRequestParts — reads headers, no body
@@ -488,6 +616,33 @@ const NO_ANSWER: &str = "Sorry, I couldn't find any relevant information.";
 /// On a `pk_` widget this frame reaches a stranger's browser (invariant 15) — the least private
 /// surface in the system.
 const STREAM_FAILED: &str = "the answer could not be completed";
+
+/// The maximum wall-clock life of one streamed answer, and the close of invariant 28's residue.
+///
+/// **Read this before moving it, and especially before putting it back on the HTTP client.**
+/// `READ_TIMEOUT` bounds *silence between reads*, which is what a hung gateway looks like — it says
+/// nothing about total duration, so a gateway emitting one token every 59 seconds streams forever
+/// while never once looking unhealthy. That is the hole this closes, and it can only be closed
+/// here: a `.timeout()` on the reqwest client is a total deadline **including the body**, and this
+/// body *is* the answer, so it would cap how long an answer may be on every call (the trap table's
+/// own entry, and `llm.rs` has two tests that go red if someone adds it).
+///
+/// **The deadline is not a failure, and that distinction is the whole design.** The obvious
+/// implementation sets `failed = true`, which is wrong twice over: the client gets an `error` frame
+/// after having already rendered three good paragraphs, and `append_turn` is then skipped, so
+/// invariant 7 drops from history a turn that only our own ceiling truncated — the user loses the
+/// answer they watched arrive *and* the record of having asked. So this path emits a normal `done`
+/// and **persists what arrived**.
+///
+/// The cost of persisting, stated because it is real: an answer cut mid-sentence becomes history
+/// the next rewrite reasons over. That is the better half of the trade — a slightly awkward
+/// follow-up beats a vanished conversation — but it is a trade, not a free win.
+///
+/// Sized so that firing is evidence of a misbehaving gateway rather than a long answer: `MAX_TOKENS`
+/// is 4096, which a healthy gateway streams in well under a minute. A named constant beside the code
+/// it bounds, not an env var, for the reason `MAX_TOKENS` and `READ_TIMEOUT` are: a bound on our own
+/// resource use is a correctness decision, not a deployment preference.
+const STREAM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// `""`, whitespace and `null` all mean "no conversation yet".
 ///
@@ -898,21 +1053,36 @@ pub async fn ask_stream(
         // 3. stream the answer tokens, accumulating them so the full reply can be stored.
         let mut answer = String::new();
         let mut failed = false;
+        // The wall clock. Absolute, taken once: a per-token deadline would reset on every delta and
+        // bound nothing, which is precisely how a gateway trickling one token just inside
+        // READ_TIMEOUT streamed forever.
+        let deadline = tokio::time::Instant::now() + STREAM_DEADLINE;
         match llm.answer_stream(RAG_SYSTEM_PROMPT, &user).await {
             Ok(token_stream) => {
                 futures_util::pin_mut!(token_stream); // make it pollable with .next()
-                while let Some(item) = token_stream.next().await {
-                    match item {
-                        Ok(text) if !text.is_empty() => {
-                            answer.push_str(&text);
-                            yield Ok(Event::default().event("token").data(text));
-                        }
-                        Ok(_) => {} // empty delta (role-only / [DONE]) — skip
-                        Err(e) => {
-                            failed = true;
-                            tracing::error!("llm stream failed mid-answer: {e:#}");
-                            yield Ok(Event::default().event("error").data(STREAM_FAILED));
+                loop {
+                    match tokio::time::timeout_at(deadline, token_stream.next()).await {
+                        // The ceiling fired. Deliberately NOT `failed`: see STREAM_DEADLINE.
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                chars = answer.len(),
+                                "ask stream hit its duration ceiling; ending the answer early"
+                            );
                             break;
+                        }
+                        Ok(None) => break, // the gateway finished
+                        Ok(Some(item)) => match item {
+                            Ok(text) if !text.is_empty() => {
+                                answer.push_str(&text);
+                                yield Ok(Event::default().event("token").data(text));
+                            }
+                            Ok(_) => {} // empty delta (role-only / [DONE]) — skip
+                            Err(e) => {
+                                failed = true;
+                                tracing::error!("llm stream failed mid-answer: {e:#}");
+                                yield Ok(Event::default().event("error").data(STREAM_FAILED));
+                                break;
+                            }
                         }
                     }
                 }
@@ -924,8 +1094,10 @@ pub async fn ask_stream(
             }
         }
 
-        // 4. persist the turn. A stream that errored may have emitted a partial answer —
-        // storing it would make the next rewrite reason over a truncated sentence.
+        // 4. persist the turn. A stream that *errored* may have emitted a partial answer —
+        // storing it would make the next rewrite reason over a truncated sentence. A stream that
+        // hit the deadline is the other case and is stored: see STREAM_DEADLINE for why the two
+        // are not the same thing.
         if !failed && !answer.is_empty() {
             if let Err(e) = conversation::append_turn(&db, &tenant_id, conversation_id, &question, &answer, &source_docs).await {
                 tracing::error!("failed to persist turn: {e:?}");
@@ -942,8 +1114,11 @@ pub async fn ask_stream(
 pub async fn list_documents(
     State(state): State<AppState>,
     actor: Actor,
+    Query(q): Query<ListDocumentsQuery>,
 ) -> Result<Json<Value>, AppError> {
     actor.require_management()?;
+    let limit = checked_page_limit(q.limit)?;
+    let cursor = q.before.as_deref().map(parse_cursor).transpose()?;
     // The dashboard reads this with a `sess_`; a tenant's own server reads it with an `sk_`. Both
     // yield the same tenant_id, so RLS below is identical either way — it is keyed on the string,
     // not on how the string was obtained.
@@ -952,15 +1127,54 @@ pub async fn list_documents(
     // That's the whole point: forgetting the filter can't leak other tenants' rows.
     // Exclude `deleting`: a tombstoned document is on its way out (phase 8) and must not appear in
     // the tenant's list — it has already left, as far as they are concerned.
+    // `failure_reason`, never `error`. They are two halves of one failure and only one of them may
+    // leave the building: `error` holds raw parser stderr and our own post-mortems (invariant 16),
+    // while `failure_reason` is a closed enum whose whole purpose is to be shown. Selecting `error`
+    // here — even "just for debugging" — is how a gateway's internals reach a tenant's browser.
+    //
+    // The row-value comparison `(created_at, id) < ($1, $2)` is the keyset predicate, and it is one
+    // expression rather than the `created_at < $1 OR (created_at = $1 AND id < $2)` it expands to
+    // precisely so it cannot be written subtly wrong. It also matches the 0016 index directly.
+    //
+    // `limit + 1`: we ask for one row more than we return, and its existence is how we know whether
+    // there is a next page. Counting the table instead would reinstate the full scan this is
+    // replacing, one query along.
+    //
+    // **`ORDER BY documents.created_at` is qualified deliberately — do not "tidy" it to
+    // `created_at`.** `created_at::text AS created_at` puts an output column of that name in scope,
+    // and Postgres resolves a *bare* name in ORDER BY against the output list first, so the
+    // unqualified form sorts by the **text rendering** rather than the timestamp.
+    //
+    // That costs the index. Measured on 5k rows: bare gave `Seq Scan` + `Sort Key:
+    // ((created_at)::text)` at cost 371 for the first page; qualified gives an `Index Scan using
+    // idx_documents_tenant_created` with no sort node at all, at cost 0.29. The 0016 index exists
+    // for this query and the bare form never touches it.
+    //
+    // It reads like a correctness bug too — the keyset `WHERE` compares `timestamptz` while the
+    // bare ORDER BY compares text — but it is not, and the reason is worth writing down so nobody
+    // "fixes" it twice: `timestamptz` normalises to UTC on storage and renders in the session's
+    // TimeZone, so every row's text carries the *same* offset and lexicographic order agrees with
+    // chronological order. The bug is the plan, not the result.
     let rows = sqlx::query(
-        "SELECT id, filename, status, created_at::text AS created_at
-           FROM documents WHERE status <> 'deleting' ORDER BY created_at DESC",
+        "SELECT id, filename, status, failure_reason, created_at::text AS created_at
+           FROM documents
+          WHERE status <> 'deleting'
+            AND ($1::text IS NULL OR (created_at, id) < ($1::timestamptz, $2::uuid))
+          ORDER BY documents.created_at DESC, documents.id DESC
+          LIMIT $3",
     )
+    .bind(cursor.as_ref().map(|c| c.created_at.as_str()))
+    .bind(cursor.as_ref().map(|c| c.id))
+    .bind((limit + 1) as i64)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
 
-    let docs: Vec<Value> = rows
+    // The probe row is evidence, not content — it must never be rendered.
+    let has_more = rows.len() as u64 > limit;
+    let page = &rows[..rows.len().min(limit as usize)];
+
+    let docs: Vec<Value> = page
         .iter()
         .map(|r| {
             let id: uuid::Uuid = r.get("id");
@@ -968,12 +1182,27 @@ pub async fn list_documents(
                 "id": id.to_string(),
                 "filename": r.get::<String, _>("filename"),
                 "status": r.get::<String, _>("status"),
+                // Null for a document that failed before phase 14 classified failures, and for
+                // every document that has not failed at all. The client renders null as the old
+                // both-causes copy rather than guessing.
+                "failure_reason": r.get::<Option<String>, _>("failure_reason"),
                 "created_at": r.get::<String, _>("created_at"),
             })
         })
         .collect();
 
-    Ok(Json(json!({ "documents": docs })))
+    // Null rather than absent when the page is last, so a client can branch on one thing. Built
+    // from the last **returned** row, never the probe.
+    let next_cursor = has_more.then(|| page.last()).flatten().map(|r| {
+        encode_cursor(
+            &r.get::<String, _>("created_at"),
+            r.get::<uuid::Uuid, _>("id"),
+        )
+    });
+
+    Ok(Json(
+        json!({ "documents": docs, "next_cursor": next_cursor, "limit": limit }),
+    ))
 }
 
 /// `DELETE /documents/{id}` — erase a document across all three stores (phase 8).
@@ -1456,5 +1685,118 @@ mod tests {
     #[test]
     fn a_malformed_conversation_id_is_still_an_error() {
         assert!(parse(r#"{"query":"q","conversation_id":"not-a-uuid"}"#).is_err());
+    }
+
+    /// The listing's page size. The default is the load-bearing part: it is what an un-updated
+    /// client receives, and therefore what actually closes the unbounded read.
+    mod page_limit {
+        use super::*;
+
+        #[test]
+        fn absent_means_the_default_not_unbounded() {
+            assert_eq!(checked_page_limit(None).unwrap(), DEFAULT_PAGE_LIMIT);
+        }
+
+        #[test]
+        fn a_caller_cannot_reinstate_the_unbounded_read() {
+            // The entire point of the cap. `?limit=100000` was the obvious way to undo this change.
+            assert!(checked_page_limit(Some(MAX_PAGE_LIMIT + 1)).is_err());
+            assert!(checked_page_limit(Some(u64::MAX)).is_err());
+            assert!(checked_page_limit(Some(MAX_PAGE_LIMIT)).is_ok());
+        }
+
+        #[test]
+        fn zero_is_a_caller_error_not_an_empty_page() {
+            assert!(checked_page_limit(Some(0)).is_err());
+        }
+    }
+
+    /// The keyset cursor. Its failure mode is silent — a cursor that round-trips wrongly skips or
+    /// repeats rows at a page boundary and looks like a working listing.
+    mod cursor {
+        use super::*;
+
+        const TS: &str = "2026-07-20 04:09:35.353682+00";
+        const ID: &str = "5d2810fc-4117-4b34-b4a4-37009bffee40";
+
+        #[test]
+        fn a_minted_cursor_round_trips_exactly() {
+            let id = uuid::Uuid::parse_str(ID).unwrap();
+            let parsed = parse_cursor(&encode_cursor(TS, id)).unwrap();
+            assert_eq!(parsed.id, id);
+            // The microseconds must survive: they are what separates two rows written in the same
+            // second, and losing them silently drops rows at the boundary.
+            assert_eq!(parsed.created_at, "2026-07-20T04:09:35.353682+00");
+        }
+
+        #[test]
+        fn the_space_separator_becomes_a_t() {
+            // Postgres renders `timestamptz::text` with a space. A raw space in a query parameter
+            // is the `%20`-or-`+` ambiguity, and `+` decodes to a space — which would corrupt the
+            // offset, not just the separator.
+            let encoded = encode_cursor(TS, uuid::Uuid::parse_str(ID).unwrap());
+            assert!(!encoded.contains(' '), "cursor must be URL-safe: {encoded}");
+            assert!(encoded.starts_with("2026-07-20T04:09:35"));
+        }
+
+        #[test]
+        fn only_the_first_space_is_replaced() {
+            // `replacen(.., 1)`: the separator is the only space in a timestamp, and a blanket
+            // `replace` would silently rewrite anything that followed.
+            let e = encode_cursor("2026-07-20 04:09:35+00", uuid::Uuid::nil());
+            assert_eq!(e.matches('T').count(), 1);
+        }
+
+        #[test]
+        fn garbage_is_a_client_error_and_never_reaches_postgres() {
+            // Each of these would otherwise be interpolated into a `::timestamptz` cast, where the
+            // database raises an error that `?` turns into a 500 — an internal error for what is
+            // plainly the caller's malformed input.
+            for bad in [
+                "",
+                "nonsense",
+                "~",                                  // no halves
+                "2026-07-20T04:09:35+00",             // no id
+                "2026-07-20T04:09:35+00~not-a-uuid",  // bad id
+                "not-a-date~5d2810fc-4117-4b34-b4a4-37009bffee40",
+                // Shape-valid, range-invalid: passes any "looks like a date" check and still fails
+                // the cast. This is the case a character-class validator would let through.
+                "9999-99-99T99:99:99+00~5d2810fc-4117-4b34-b4a4-37009bffee40",
+                "2026-13-01T00:00:00+00~5d2810fc-4117-4b34-b4a4-37009bffee40",
+                "2026-07-20T24:00:00+00~5d2810fc-4117-4b34-b4a4-37009bffee40",
+                // An offset we never emit — accepting it would mean comparing against a moment
+                // other than the one the cursor names.
+                "2026-07-20T04:09:35+05:30~5d2810fc-4117-4b34-b4a4-37009bffee40",
+                // Injection through the timestamp half.
+                "2026-07-20T04:09:35+00'; DROP TABLE documents;--~5d2810fc-4117-4b34-b4a4-37009bffee40",
+            ] {
+                assert!(parse_cursor(bad).is_err(), "should have rejected: {bad:?}");
+            }
+        }
+
+        #[test]
+        fn the_forms_postgres_actually_emits_are_accepted() {
+            for good in [
+                "2026-07-20T04:09:35+00",        // whole second
+                "2026-07-20T04:09:35.3+00",      // trailing zeros trimmed by Postgres
+                "2026-07-20T04:09:35.353682+00", // full microseconds
+                "2026-07-20T04:09:35",           // no offset
+                "2026-07-20T04:09:35Z",
+                "2026-07-20T04:09:35+00:00",
+                "2026-12-31T23:59:60+00", // leap second; Postgres accepts it
+            ] {
+                assert!(
+                    is_our_timestamp(good),
+                    "should have accepted: {good:?} — Postgres emits this and a cursor built from \
+                     it would be rejected as invalid"
+                );
+            }
+        }
+
+        #[test]
+        fn fractional_seconds_are_bounded() {
+            assert!(!is_our_timestamp("2026-07-20T04:09:35.+00")); // a dot with no digits
+            assert!(!is_our_timestamp("2026-07-20T04:09:35.1234567+00")); // 7 digits: not ours
+        }
     }
 }

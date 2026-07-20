@@ -2,12 +2,15 @@
 	import { Badge } from '$lib/components/ui/badge/index.js';
 	import { Spinner } from '$lib/components/ui/spinner/index.js';
 	import * as Tooltip from '$lib/components/ui/tooltip/index.js';
-	import type { DocumentStatus } from '$lib/types/documents';
+	import type { DocumentStatus, FailureReason } from '$lib/types/documents';
 	import { toDisplay } from '../status';
 
-	let { status }: { status: DocumentStatus | 'unknown' } = $props();
+	let {
+		status,
+		failureReason = null
+	}: { status: DocumentStatus | 'unknown'; failureReason?: FailureReason | null } = $props();
 
-	const display = $derived(toDisplay(status));
+	const display = $derived(toDisplay(status, failureReason));
 
 	// The registry's Badge has no `success` variant (default | secondary | destructive | outline |
 	// ghost | link), so a settled-and-happy state needs a colour at the call site. Passing `class` to

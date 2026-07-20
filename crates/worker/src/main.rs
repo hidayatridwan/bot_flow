@@ -1,4 +1,5 @@
 mod event;
+mod failure;
 mod lifecycle;
 mod parser;
 mod reaper;
@@ -407,9 +408,15 @@ async fn handle(ctx: &Ctx, body: &[u8]) -> Result<(), Failure> {
             obj.size, ctx.max_upload_bytes
         );
         tracing::warn!("quarantining {}: {reason}", obj.document_id);
-        lifecycle::mark_quarantined(&ctx.db, &obj.tenant_id, obj.document_id, &reason)
-            .await
-            .map_err(Retryable)?;
+        lifecycle::mark_quarantined(
+            &ctx.db,
+            &obj.tenant_id,
+            obj.document_id,
+            &reason,
+            failure::FailureReason::TooLarge,
+        )
+        .await
+        .map_err(Retryable)?;
         let _ = ctx.bucket.delete_object(&obj.object_key).await;
         return Ok(());
     }
@@ -463,8 +470,16 @@ async fn finish(
         }
         Err(e) => {
             let msg = format!("{e:#}");
+            // Two halves of the same failure: `msg` is the raw diagnostic, for our logs and the
+            // `error` column no endpoint exposes; `reason` is the classified verdict the tenant is
+            // actually shown. See `failure::classify` for why anything unrecognised is our fault.
+            let reason = failure::classify(&e);
+            tracing::error!(
+                document = %document_id, reason = reason.as_str(),
+                "indexing failed: {msg}"
+            );
             // Record the failure, but keep the error for the nack + delivery-limit machinery.
-            let _ = lifecycle::mark_failed(&ctx.db, tenant_id, document_id, &msg).await;
+            let _ = lifecycle::mark_failed(&ctx.db, tenant_id, document_id, &msg, reason).await;
             // Fatal acks, which destroys the document; Retryable dead-letters it after the delivery
             // limit, which preserves it. So only a document that can never embed is Fatal — a bad
             // EMBEDDING_API_KEY is the operator's problem, not the document's. See EmbedError::is_fatal.

@@ -8,6 +8,9 @@
 //! and [`guard_not_superuser`]. Read those before adding a test.
 
 #![allow(dead_code)] // each test binary uses a different subset of this module
+// Same reason, for the re-exports below: `mod common` is compiled into *every* test binary, so a
+// name only one of them needs (`FAKE_ANSWER`) is genuinely unused in the other seven.
+#![allow(unused_imports)]
 
 use std::sync::Arc;
 
@@ -24,7 +27,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tower::ServiceExt; // for `oneshot`
 
 mod gateway;
-pub use gateway::{fake_embedding, FakeGateway};
+pub use gateway::{fake_embedding, FakeGateway, FAKE_ANSWER};
 
 /// Name of the database these tests are allowed to touch. Never the dev database: this harness
 /// creates and deletes tenants, and a stray truncation against real dev data is a bad afternoon.
@@ -448,6 +451,34 @@ impl TestApp {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
+    /// `POST /ask/stream`, returning the raw SSE body.
+    ///
+    /// Separate from [`Self::request`], which parses JSON, and from [`Self::text`], which sends no
+    /// body: an SSE response is neither. The whole body is collected before it is returned, which is
+    /// fine here only because the fake gateway completes immediately — this helper cannot observe
+    /// timing, and so cannot test the stream's wall-clock deadline.
+    pub async fn sse(&self, token: &str, body: &str) -> String {
+        let res = self
+            .router
+            .clone()
+            .oneshot(
+                json_request("POST", "/ask/stream", token)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("router failed");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "ask/stream did not open the stream"
+        );
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("failed to read stream body");
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
     /// One counter's current value, scraped. Named metrics only — no labels.
     pub async fn metric(&self, name: &str) -> u64 {
         let body = self.text("/metrics", &self.metrics_token.clone()).await;
@@ -480,6 +511,22 @@ impl TestApp {
             .get(0);
         tx.commit().await.unwrap();
         n
+    }
+
+    /// A transaction bound to one tenant, for a test that must *write* to an RLS-forced table.
+    ///
+    /// Same hazard as [`Self::count_as_tenant`], and the same fix — but a separate helper because a
+    /// write sometimes has to be several statements in **one** transaction. The pagination suite
+    /// needs exactly that: `created_at` defaults to `now()`, which is `transaction_timestamp()`, so
+    /// rows sharing a timestamp can only be produced by rows sharing a transaction.
+    pub async fn tenant_tx(&self, tenant_id: &str) -> sqlx::Transaction<'_, sqlx::Postgres> {
+        let mut tx = self.db.begin().await.unwrap();
+        sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx
     }
 
     /// `POST /search` with the given credential.

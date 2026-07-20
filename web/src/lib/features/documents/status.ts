@@ -1,11 +1,18 @@
-import type { DocumentStatus } from '$lib/types/documents';
+import type { DocumentStatus, FailureReason } from '$lib/types/documents';
 
 /**
  * Status → what the user is told. This file is where invariant 16 is enforced *in the UI*.
  *
- * The API deliberately does not expose the `documents.error` column: it holds raw parser stderr and
- * our own "worker presumed dead" post-mortem. So everything a user learns about a failure is written
- * here, from the status alone, and none of it may describe our internals.
+ * The API still does not expose the `documents.error` column — it holds raw parser stderr and our
+ * own "worker presumed dead" post-mortem, and none of that may describe our internals to a tenant.
+ * What it *does* expose is `failure_reason`, a closed enum whose entire purpose is to be shown. So
+ * the copy below is written from the status **and** that reason, and from nothing else.
+ *
+ * The distinction the reason buys is the only one a tenant can act on: **re-upload, or wait.**
+ * Before it existed, `failed` had to name both causes at once, and someone whose worker had died
+ * was told to re-upload a file that was never broken. Getting this backwards is worse than the
+ * ambiguity it replaces, which is why `system_error` — the catch-all — is the branch that must
+ * never tell anyone to re-upload.
  */
 
 export type StatusVariant = 'secondary' | 'destructive' | 'outline';
@@ -30,6 +37,31 @@ const ALL: readonly DocumentStatus[] = [
 /** Exported for tests: the set the display map must cover exhaustively. */
 export const ALL_STATUSES = ALL;
 
+const ALL_REASONS: readonly FailureReason[] = [
+	'unreadable_file',
+	'unsupported_type',
+	'too_large',
+	'system_error'
+];
+
+/** Exported for tests: the set `toDisplay` must handle for a `failed` document. */
+export const ALL_FAILURE_REASONS = ALL_REASONS;
+
+/**
+ * Narrow an untrusted wire reason, same contract as `toStatus` — but note the fallback differs on
+ * purpose. An unrecognised *status* becomes `'unknown'` and gets its own branch; an unrecognised
+ * *reason* becomes `null`, which renders as the cause-agnostic copy.
+ *
+ * That is the safe direction. A reason this build predates is one we cannot explain, and guessing
+ * would either blame a tenant for our outage or excuse a broken file — the two failure modes this
+ * whole column exists to prevent. Saying less is the correct degradation.
+ */
+export function toFailureReason(raw: string | null | undefined): FailureReason | null {
+	return raw != null && (ALL_REASONS as readonly string[]).includes(raw)
+		? (raw as FailureReason)
+		: null;
+}
+
 /**
  * Narrow an untrusted wire string. Anything unrecognised becomes 'unknown' rather than being cast —
  * the API may ship a status this build predates (the DB CHECK already carries a writerless
@@ -52,7 +84,60 @@ export function isTransient(status: DocumentStatus | 'unknown'): boolean {
 	return status === 'uploading' || status === 'processing';
 }
 
-export function toDisplay(status: DocumentStatus | 'unknown'): StatusDisplay {
+/**
+ * The `failed` copy, which is the whole reason `failure_reason` exists.
+ *
+ * Two of these branches say "try again" and two say "we're on it", and that split is the product
+ * decision — not the wording. `null` keeps the original both-causes copy, because a row that failed
+ * before classification genuinely has no known cause and inventing one would be worse than vague.
+ */
+function failedDisplay(reason: FailureReason | null): StatusDisplay {
+	const base = { label: 'Failed', variant: 'destructive', spinner: false } as const;
+	switch (reason) {
+		case 'unreadable_file':
+			return {
+				...base,
+				description:
+					"We couldn't read this file — it may be damaged, password-protected, or a scan with " +
+					'no text in it. Try uploading it again, or export a fresh copy.'
+			};
+		case 'unsupported_type':
+			return {
+				...base,
+				description: "We can't read this file type. Upload a PDF, TXT or MD file instead."
+			};
+		case 'too_large':
+			// Reachable in principle, though the size cap normally lands on `quarantined` before a
+			// claim. Kept because the enum is closed and a silent fall-through would be a lie.
+			return {
+				...base,
+				description: 'This file is over the 25 MB limit. Upload a smaller file.'
+			};
+		case 'system_error':
+			// The one branch that must NOT suggest re-uploading. The tenant's file is very likely
+			// fine; something on our side failed, and telling them to re-upload sends them round a
+			// loop that cannot succeed while blaming them for our outage.
+			return {
+				...base,
+				description:
+					"Something went wrong on our side while processing this file — it's not a problem " +
+					"with your document. We're looking into it; this will retry automatically."
+			};
+		case null:
+			// Pre-classification rows. Says exactly as much as is actually known.
+			return {
+				...base,
+				description:
+					"We couldn't process this file. This can happen if the file is damaged, or if " +
+					'something went wrong on our side. Try uploading it again.'
+			};
+	}
+}
+
+export function toDisplay(
+	status: DocumentStatus | 'unknown',
+	reason: FailureReason | null = null
+): StatusDisplay {
 	switch (status) {
 		case 'uploading':
 			return {
@@ -76,19 +161,7 @@ export function toDisplay(status: DocumentStatus | 'unknown'): StatusDisplay {
 				spinner: false
 			};
 		case 'failed':
-			// Names both causes on purpose. This status conflates a broken file with a dead worker of
-			// ours, and we cannot tell them apart without the `error` column. "Your file is corrupt"
-			// would blame the user for our outage; "something went wrong on our end" would excuse a
-			// genuinely broken PDF. Re-uploading is the right move under both, which is what makes the
-			// ambiguity survivable rather than merely vague.
-			return {
-				label: 'Failed',
-				description:
-					"We couldn't process this file. This can happen if the file is damaged, or if " +
-					'something went wrong on our side. Try uploading it again.',
-				variant: 'destructive',
-				spinner: false
-			};
+			return failedDisplay(reason);
 		case 'expired':
 			// Not destructive: nothing broke. The usual cause is a closed tab.
 			return {

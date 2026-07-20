@@ -3,6 +3,7 @@
 	import * as Alert from '$lib/components/ui/alert/index.js';
 	import CircleAlertIcon from '@lucide/svelte/icons/circle-alert';
 	import DocumentTable from '$lib/features/documents/components/document-table.svelte';
+	import Pager from '$lib/features/documents/components/pager.svelte';
 	import UploadCard from '$lib/features/documents/components/upload-card.svelte';
 	import { POLL_MIN_MS, nextInterval } from '$lib/features/documents/poll';
 	import { isTransient } from '$lib/features/documents/status';
@@ -21,9 +22,16 @@
 	 *
 	 * There is no upload-completion callback by design (storage announces the upload itself), so the
 	 * only way to see `uploading → processing → ready` is to ask again. Three gates keep that honest:
-	 * a tenant whose documents are all settled starts no timer at all; a hidden tab stops asking; and
+	 * a page whose documents are all settled starts no timer at all; a hidden tab stops asking; and
 	 * the interval backs off while nothing changes, because an upload that never arrives sits for
 	 * ~20 minutes before the reaper settles it.
+	 *
+	 * **"A page", not "a tenant", since the list became paginated** — `data.documents` is now one
+	 * page, so a transient document further back in the library starts no timer here. That is the
+	 * behaviour you want rather than a gap to close: uploads land at the *top* of a newest-first
+	 * list, so anything actually in flight is on page one, and polling a page the tenant is not
+	 * looking at would be asking a question nobody is waiting on. `invalidate` re-runs the load with
+	 * the current URL, so a poll refreshes the page being viewed and never jumps back to the newest.
 	 *
 	 * Each tick costs two API calls, not one: hooks.server.ts resolves the session via GET /auth/me
 	 * before this load runs GET /documents. That is the number that would justify a dedicated
@@ -92,5 +100,6 @@
 		</Alert.Root>
 	{:else}
 		<DocumentTable documents={data.documents} />
+		<Pager nextCursor={data.nextCursor} isFirstPage={data.isFirstPage} />
 	{/if}
 </div>

@@ -41,7 +41,9 @@
 				{#each documents as doc (doc.id)}
 					<Table.Row>
 						<Table.Cell class="font-medium">{doc.filename}</Table.Cell>
-						<Table.Cell><StatusBadge status={doc.status} /></Table.Cell>
+						<Table.Cell
+							><StatusBadge status={doc.status} failureReason={doc.failureReason} /></Table.Cell
+						>
 						<Table.Cell class="text-muted-foreground hidden md:table-cell">
 							{formatCreatedAt(doc.createdAt)}
 						</Table.Cell>
@@ -84,7 +86,7 @@
 					{#if doc.status === 'failed' || doc.status === 'quarantined' || doc.status === 'expired'}
 						<Table.Row class="hover:bg-transparent">
 							<Table.Cell colspan={4} class="text-muted-foreground pt-0 text-sm">
-								{toDisplay(doc.status).description}
+								{toDisplay(doc.status, doc.failureReason).description}
 							</Table.Cell>
 						</Table.Row>
 					{/if}

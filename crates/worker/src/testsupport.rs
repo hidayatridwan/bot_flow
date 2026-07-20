@@ -185,6 +185,24 @@ pub async fn seed_document(
 }
 
 /// Read one document's status back, under tenant context. `None` if the row is gone.
+/// The classified failure reason, read under tenant context for the same reason as [`status_of`]:
+/// `documents` is RLS-FORCED, so a read on the plain pool matches zero rows and *reports success*.
+pub async fn failure_reason_of(db: &PgPool, tenant_id: &str, id: Uuid) -> Option<String> {
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.current_tenant', $1, true)")
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT failure_reason FROM documents WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    row.and_then(|r| r.get("failure_reason"))
+}
+
 pub async fn status_of(db: &PgPool, tenant_id: &str, id: Uuid) -> Option<String> {
     let mut tx = db.begin().await.unwrap();
     sqlx::query("SELECT set_config('app.current_tenant', $1, true)")

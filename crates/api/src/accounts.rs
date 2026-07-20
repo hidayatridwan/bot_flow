@@ -328,6 +328,18 @@ pub async fn create_key(
     State(state): State<AppState>,
     Json(req): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
+    // The last route that created state without a meter. Minting does not multiply LLM spend, so
+    // this is not a cost bound — it bounds the **audit and revocation surface**: an unmetered mint
+    // lets one session write unbounded rows into `api_keys`, every one of them a live credential
+    // someone must later enumerate and revoke.
+    //
+    // A bucket of its own (`keys:`), not the bare tenant id, and that prefix is the point rather
+    // than tidiness. `check` keys on whatever string it is handed, so reusing `tenant_id` would put
+    // key-minting in the *same* 60/min window as `/ask` — a tenant provisioning keys would spend
+    // their own question budget, and the widget would start 429ing for a reason no log connects to
+    // the dashboard tab that caused it.
+    rate_limit::check(&state, &format!("keys:{}", session.tenant_id)).await?;
+
     if req.kind != "secret" && req.kind != "publishable" {
         return Err(AppError::client(
             StatusCode::BAD_REQUEST,

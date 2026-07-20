@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { ALL_STATUSES, isTransient, toDisplay, toStatus } from './status';
+import {
+	ALL_FAILURE_REASONS,
+	ALL_STATUSES,
+	isTransient,
+	toDisplay,
+	toFailureReason,
+	toStatus
+} from './status';
 
 describe('toStatus — the wire is untrusted', () => {
 	it('narrows every real status', () => {
@@ -69,20 +76,31 @@ describe('toDisplay', () => {
 			'panic'
 		];
 
-		for (const s of [...ALL_STATUSES, 'unknown' as const]) {
-			const copy = `${toDisplay(s).label} ${toDisplay(s).description}`.toLowerCase();
+		// Every status, and every failure reason — the reason branches are new copy, and they are the
+		// ones written closest to the raw error, so they are the likeliest to leak.
+		const cases: [string, ReturnType<typeof toDisplay>][] = [
+			...[...ALL_STATUSES, 'unknown' as const].map(
+				(s) => [s, toDisplay(s)] as [string, ReturnType<typeof toDisplay>]
+			),
+			...ALL_FAILURE_REASONS.map(
+				(r) => [`failed/${r}`, toDisplay('failed', r)] as [string, ReturnType<typeof toDisplay>]
+			)
+		];
+
+		for (const [name, d] of cases) {
+			const copy = `${d.label} ${d.description}`.toLowerCase();
 			for (const word of forbidden) {
-				expect(copy, `"${s}" copy leaks "${word}"`).not.toContain(word);
+				expect(copy, `"${name}" copy leaks "${word}"`).not.toContain(word);
 			}
 		}
 	});
 
-	it('blames neither the user nor us for a `failed`, because we cannot tell which it was', () => {
-		const { description } = toDisplay('failed');
-		// It must hold both possibilities open: the status conflates a broken file with a dead worker.
+	it('holds both causes open when the reason is unknown', () => {
+		// `null` means the row failed before the worker classified failures. Nothing recorded a cause,
+		// so the copy must say only what is actually known — the pre-classification wording.
+		const { description } = toDisplay('failed', null);
 		expect(description).toMatch(/damaged/i);
 		expect(description).toMatch(/our side/i);
-		// And it must give the advice that is correct under both.
 		expect(description).toMatch(/again/i);
 	});
 
@@ -96,5 +114,60 @@ describe('toDisplay', () => {
 		// Nothing broke — the user closed a tab. Red would be a lie.
 		expect(toDisplay('expired').variant).toBe('outline');
 		expect(toDisplay('failed').variant).toBe('destructive');
+	});
+});
+
+/**
+ * The point of the whole feature: a `failed` document must tell the tenant whether to re-upload or
+ * to wait. These tests pin the *decision*, not the wording — each asserts on the presence or
+ * absence of a call to action rather than on a sentence.
+ */
+describe('toDisplay(failed, reason) — re-upload, or wait', () => {
+	it('gives every classified reason its own copy', () => {
+		const seen = new Set(ALL_FAILURE_REASONS.map((r) => toDisplay('failed', r).description));
+		expect(
+			seen.size,
+			'two reasons share copy — one of them is telling the tenant the wrong thing'
+		).toBe(ALL_FAILURE_REASONS.length);
+	});
+
+	it('tells the tenant to act only when acting can help', () => {
+		for (const r of ['unreadable_file', 'unsupported_type', 'too_large'] as const) {
+			expect(
+				toDisplay('failed', r).description,
+				`${r} is the tenant's to fix, so the copy must ask them to`
+			).toMatch(/upload|export|convert/i);
+		}
+	});
+
+	it('never tells the tenant to re-upload when the fault is ours', () => {
+		// The single most important assertion in this file. `system_error` covers a dead worker, a
+		// crashed sidecar, an embedding outage — the document is very likely fine. Asking for a
+		// re-upload sends them round a loop that cannot succeed, and blames them for our outage.
+		// That was the pre-classification behaviour, and it is exactly what this feature exists to end.
+		const { description } = toDisplay('failed', 'system_error');
+		expect(description).not.toMatch(/upload/i);
+		expect(description).toMatch(/our side|on our end/i);
+	});
+
+	it('does not blame the document when the fault is ours', () => {
+		expect(toDisplay('failed', 'system_error').description).not.toMatch(/damaged|corrupt|broken/i);
+	});
+});
+
+describe('toFailureReason — the wire is untrusted here too', () => {
+	it('narrows every real reason', () => {
+		for (const r of ALL_FAILURE_REASONS) expect(toFailureReason(r)).toBe(r);
+	});
+
+	it('degrades an unrecognised reason to null, not to a guess', () => {
+		// Note this differs from `toStatus`, which has an 'unknown' branch. A reason we do not
+		// recognise must fall back to the cause-agnostic copy: guessing would either blame the tenant
+		// for our outage or excuse a genuinely broken file.
+		expect(toFailureReason('something_new')).toBeNull();
+		expect(toFailureReason('SYSTEM_ERROR')).toBeNull(); // case matters; the API is lowercase
+		expect(toFailureReason('')).toBeNull();
+		expect(toFailureReason(null)).toBeNull();
+		expect(toFailureReason(undefined)).toBeNull();
 	});
 });

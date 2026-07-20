@@ -9,7 +9,12 @@ export const POLL_MIN_MS = 3_000;
 /**
  * The ceiling exists because of the slow path, not the fast one: an `uploading` row whose PUT never
  * arrives sits for the presign TTL (15 min) plus UPLOAD_GRACE (5 min) before the reaper settles it.
- * At a flat 3s that is ~400 requests returning an identical body over an unpaginated table.
+ * At a flat 3s that is ~400 requests returning an identical body.
+ *
+ * That body is now one bounded page rather than the tenant's whole table, so each request costs far
+ * less than it did — but the ceiling is not therefore removable. ~400 pointless round trips is still
+ * ~400 round trips, and each one costs *two* API calls (the session resolve, then the list). The
+ * back-off was never really about response size; pagination just narrowed the blast radius.
  */
 export const POLL_MAX_MS = 15_000;
 

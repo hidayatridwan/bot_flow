@@ -101,18 +101,18 @@ weakest one already reaches, which is why the chat routes admit all three.
 | `POST` | `/auth/logout` | session | Ends the current session |
 | `GET` | `/auth/me` | session | The account + tenant behind the session |
 | `GET` | `/auth/keys` | session | Lists this tenant's key metadata (never the raw key) |
-| `POST` | `/auth/keys` | session | Self-serve mint of a `secret`/`publishable` key. Origins are validated and canonicalised; a `publishable` key with none is refused (`422`) |
+| `POST` | `/auth/keys` | session | Self-serve mint of a `secret`/`publishable` key. Origins are validated and canonicalised; a `publishable` key with none is refused (`422`). Rate-limited on its own bucket, so minting keys cannot eat your question budget |
 | `PATCH` | `/auth/keys/{key_hash}` | session | Change a key's `allowed_origins`. `kind` and the hash are immutable |
 | `DELETE` | `/auth/keys/{key_hash}` | session | Revokes one of this tenant's keys |
 | `POST` | `/documents/upload-url` | secret **or** session | `{"filename": "cv.pdf"}` → a presigned PUT. Rate-limited. Returns `201` |
 | `POST` | `/documents/{id}/upload-url` | secret **or** session | Re-mint a URL for a document still `uploading` or `expired`. Only safe for *the same file* — see the note below |
 | `POST` | `/documents` | secret | **Deprecated** multipart proxy — buffers the file in the API's memory |
-| `GET` | `/documents` | secret **or** session | Lists this tenant's documents and their status |
+| `GET` | `/documents` | secret **or** session | One page of this tenant's documents, newest first. `?limit=` (default 50, max 200) and `?before=<cursor>` — see [Paging the document list](#paging-the-document-list) |
 | `DELETE` | `/documents/{id}` | secret **or** session | Erases the document across Postgres, Qdrant and MinIO. `204` when done inline, `202` when a worker is mid-index and the reaper finishes it. Unknown/other-tenant id → `404` |
 | `POST` | `/ingest` | secret | `{"filename","text","external_id?"}` — index text inline, without a file. Creates a real document: the API stores the text as an object and the worker indexes it, so it is listable and erasable like any upload. Returns `202`; poll until `ready`. Rate-limited |
 | `POST` | `/search` | secret **or** session | `{"query": "…", "limit": 3}` — returns raw scored chunks, no LLM. Rate-limited. **Not** open to `pk_`: raw retrieval is not asking a question |
 | `POST` | `/ask` | any key **or** session | Retrieval + LLM answer as one JSON blob. Rate-limited |
-| `POST` | `/ask/stream` | any key **or** session | Same, as SSE: a `conversation` event, a `sources` event, then `token` events, then `done`. An LLM failure yields one `error` event carrying a fixed string — the detail goes to the log, never the client |
+| `POST` | `/ask/stream` | any key **or** session | Same, as SSE: a `conversation` event, a `sources` event, then `token` events, then `done`. An LLM failure yields one `error` event carrying a fixed string — the detail goes to the log, never the client. One answer may stream for at most 5 minutes; see [How long an answer may take](#how-long-an-answer-may-take) |
 
 Both ask endpoints accept an optional `conversation_id` and return one. See
 [Conversation memory](#conversation-memory).
@@ -535,6 +535,51 @@ curl -sX POST localhost:3000/ingest \
 Both `cargo run -p api` and `cargo run -p worker` must be running, or the document sits at
 `uploading` forever — the worker is the only thing that ever moves it forward.
 
+### Paging the document list
+
+`GET /documents` returns **one page**, newest first — not the whole table:
+
+```bash
+curl -s "localhost:3000/documents?limit=50" -H "authorization: Bearer $SK"
+# {"documents":[…],"next_cursor":"2026-07-20T05:31:48.705273+00~c5b9f76d-…","limit":50}
+```
+
+Follow `next_cursor` to walk backwards in time, and stop when it comes back `null`:
+
+```bash
+curl -s -G "localhost:3000/documents" \
+  --data-urlencode "before=2026-07-20T05:31:48.705273+00~c5b9f76d-…" \
+  -H "authorization: Bearer $SK"
+```
+
+Note `--data-urlencode`, not string concatenation. **The cursor contains a `+`** (the UTC offset),
+and a bare `+` in a query string decodes to a space — so a hand-pasted cursor arrives corrupted and
+comes back `422 invalid cursor`. It fails only on the second page, never the first.
+
+Treat the cursor as opaque and echo it back unchanged. It encodes `(created_at, id)`, and the `id`
+half matters more than it looks: `created_at` is a transaction timestamp, so documents created
+together share one to the microsecond. A cursor naming only the timestamp cannot say where a page
+ended, and rows sitting on the boundary are silently skipped.
+
+Two limits are deliberate. There is **no `total`** — counting the table is the full scan pagination
+exists to avoid. And there is **no "previous"**: a keyset cursor only moves one way. The dashboard
+uses the browser's Back button, which is why each page is a real URL.
+
+Omitting both parameters is fine and gives you a bounded first page; the default applies whether or
+not you ask for it, so an old client is bounded too.
+
+### How long an answer may take
+
+A streamed answer runs for at most **5 minutes** (`STREAM_DEADLINE` in `handlers.rs`). This is not
+the same bound as the gateway timeouts: those cap *silence* between tokens, which is what a hung
+gateway looks like, and say nothing about total duration — a gateway emitting one token every 59
+seconds would otherwise stream forever without ever looking unhealthy.
+
+If the ceiling is reached, the stream ends with a normal `done` and **the partial answer is kept**,
+both on screen and in conversation history. It is deliberately not an `error`: you have already been
+shown the prose, and discarding it would also discard the record of having asked. In practice
+`MAX_TOKENS` ends a healthy answer long first — reaching the ceiling means the gateway is misbehaving.
+
 ### Three ways to get step 2 wrong
 
 - **`-F file=@handbook.pdf` instead of `--upload-file`.** `-F` sends a multipart form body, so MinIO
@@ -554,7 +599,9 @@ The collection in [postman/](postman/) has the whole flow under **Documents**:
 2. **Upload File to MinIO (presigned PUT)** — already set to `PUT {{uploadUrl}}`, **No Auth**, body
    mode **binary**. Open the Body tab and pick your file; Postman can't persist a file path in the
    collection, so that part is once per machine. It asserts `200` and an `ETag`.
-3. **List Documents** — poll until `status` is `ready`.
+3. **List Documents** — poll until `status` is `ready`. Its test script saves `next_cursor` into a
+   collection variable, so **List Documents (next page)** walks the pages with no copy-pasting —
+   which also sidesteps the `+`-in-a-cursor trap, since Postman encodes the parameter for you.
 
 Body mode **binary**, not *form-data* — same trap as `-F` above.
 

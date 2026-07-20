@@ -38,6 +38,32 @@ pub fn spawn(db: PgPool, qdrant: Arc<Qdrant>, bucket: Box<Bucket>, every: Durati
     });
 }
 
+/// Reclaim documents whose worker died holding the lease.
+///
+/// A function rather than an inline `format!` because the test drives *this* statement. It used to
+/// hold a verbatim copy, so the two could disagree — and a test asserting on its own private copy
+/// of the SQL passes no matter what the reaper actually does.
+///
+/// Back to `failed`, not `uploaded`: the object is still there, so a redelivered event (or a manual
+/// retry) can claim it again. `failed` is an accepted claim source.
+///
+/// The reason is `system_error` unconditionally, and that is the point of writing it here: a lease
+/// expires because *our* worker died, so the tenant's file may be perfectly good. This is precisely
+/// the case that made a `failed` badge unactionable — in the `error` column it is indistinguishable
+/// from a corrupt upload, and the classified column is what tells the tenant to wait rather than
+/// re-upload a file that was never broken.
+fn reclaim_stale_leases_sql() -> String {
+    format!(
+        "UPDATE documents
+            SET status = 'failed',
+                error = 'processing lease expired; worker presumed dead',
+                failure_reason = 'system_error',
+                processing_started_at = null
+          WHERE status = 'processing'
+            AND processing_started_at < now() - interval '{PROCESSING_LEASE}'"
+    )
+}
+
 async fn sweep(db: &PgPool, qdrant: &Qdrant, bucket: &Bucket) -> anyhow::Result<()> {
     // `tenants` has no RLS, so this read needs no tenant context.
     let tenants = sqlx::query("SELECT id FROM tenants").fetch_all(db).await?;
@@ -56,21 +82,7 @@ async fn sweep(db: &PgPool, qdrant: &Qdrant, bucket: &Bucket) -> anyhow::Result<
         )
         .await?;
 
-        // Back to 'failed', not 'uploaded': the object is there, so a redelivered event (or a
-        // manual retry) can claim it again. `failed` is an accepted claim source.
-        let reclaimed = sweep_one(
-            db,
-            &tenant_id,
-            &format!(
-                "UPDATE documents
-                    SET status = 'failed',
-                        error = 'processing lease expired; worker presumed dead',
-                        processing_started_at = null
-                  WHERE status = 'processing'
-                    AND processing_started_at < now() - interval '{PROCESSING_LEASE}'"
-            ),
-        )
-        .await?;
+        let reclaimed = sweep_one(db, &tenant_id, &reclaim_stale_leases_sql()).await?;
 
         let deleted = finish_deletions(db, qdrant, bucket, &tenant_id).await?;
 
@@ -185,7 +197,7 @@ async fn sweep_one(db: &PgPool, tenant_id: &str, sql: &str) -> anyhow::Result<u6
 #[cfg(test)]
 mod integration {
     use super::*;
-    use crate::testsupport::{seed_document, seed_tenant, status_of, test_pool};
+    use crate::testsupport::{failure_reason_of, seed_document, seed_tenant, status_of, test_pool};
 
     /// **The case the phase-9 design says took a live stack to check.**
     ///
@@ -256,20 +268,9 @@ mod integration {
         let live = seed_document(&db, &tenant, "processing", Some("1 minute")).await;
         let dead = seed_document(&db, &tenant, "processing", Some("31 minutes")).await;
 
-        let reclaimed = sweep_one(
-            &db,
-            &tenant,
-            &format!(
-                "UPDATE documents
-                    SET status = 'failed',
-                        error = 'processing lease expired; worker presumed dead',
-                        processing_started_at = null
-                  WHERE status = 'processing'
-                    AND processing_started_at < now() - interval '{PROCESSING_LEASE}'"
-            ),
-        )
-        .await
-        .expect("sweep_one errored");
+        let reclaimed = sweep_one(&db, &tenant, &reclaim_stale_leases_sql())
+            .await
+            .expect("sweep_one errored");
 
         assert_eq!(
             reclaimed, 1,
@@ -285,6 +286,13 @@ mod integration {
             Some("processing"),
             "the reaper reclaimed a lease that had not expired — it would be racing a live worker, \
              and `mark_ready`'s fence would then silently drop that worker's finished index"
+        );
+
+        assert_eq!(
+            failure_reason_of(&db, &tenant, dead).await.as_deref(),
+            Some("system_error"),
+            "a dead worker is our fault, not the document's — classifying it any other way tells \
+             the tenant to re-upload a file that was never broken"
         );
     }
 

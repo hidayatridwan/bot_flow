@@ -1,0 +1,17 @@
+-- The index `GET /documents` has always needed and never had.
+--
+-- The listing has sorted `ORDER BY created_at DESC` since 0003 with no index behind it: a sequential
+-- scan of the tenant's rows plus an in-memory sort, every call, on a table the dashboard polls.
+-- Fine at ten documents, which is why it went unnoticed.
+--
+-- The column order is the whole point and is not arbitrary:
+--
+--   * `tenant_id` leads because RLS applies its predicate as a filter, so the planner needs the
+--     tenant as the leading key to get an index scan rather than a filtered heap scan.
+--   * `created_at desc, id desc` matches the ORDER BY exactly, so the sort disappears.
+--   * `id` is in the index because it is in the ORDER BY, and it is in the ORDER BY because
+--     `created_at` alone **is not unique** — `default now()` is `transaction_timestamp()`, so every
+--     row written in one transaction shares a byte-identical timestamp. Ordering by a non-unique key
+--     is non-deterministic between calls, which for a *paginated* listing means rows silently
+--     skipped or repeated at a page boundary. The tiebreaker is what makes the keyset cursor sound.
+create index idx_documents_tenant_created on documents (tenant_id, created_at desc, id desc);
