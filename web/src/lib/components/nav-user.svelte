@@ -7,16 +7,15 @@
 	import { initialsFromEmail } from '$lib/features/auth/display';
 	import type { SessionUser } from '$lib/types/auth';
 	import { cn } from '$lib/utils.js';
-	import BadgeCheckIcon from '@lucide/svelte/icons/badge-check';
-	import BellIcon from '@lucide/svelte/icons/bell';
 	import ChevronsUpDownIcon from '@lucide/svelte/icons/chevrons-up-down';
-	import CreditCardIcon from '@lucide/svelte/icons/credit-card';
+	import KeyRoundIcon from '@lucide/svelte/icons/key-round';
 	import LogOutIcon from '@lucide/svelte/icons/log-out';
-	import SparklesIcon from '@lucide/svelte/icons/sparkles';
 
-	// The API gives us an email and a tenant, and no avatar — so the avatar stays the mock image and
-	// the fallback is derived from the email.
-	let { user, avatar = '/avatars/shadcn.jpg' }: { user: SessionUser; avatar?: string } = $props();
+	// **Initials, not an image.** The API has no avatar to give, and the placeholder here used to be
+	// `/avatars/shadcn.jpg` — a photograph of a real person (the shadcn author), rendered as every
+	// tenant's own avatar. Initials derived from the signed-in email are real data and belong to the
+	// person looking at them.
+	let { user }: { user: SessionUser } = $props();
 
 	const sidebar = useSidebar();
 	const initials = $derived(initialsFromEmail(user.email));
@@ -33,7 +32,6 @@
 						{...props}
 					>
 						<Avatar.Root class="size-8 rounded-lg">
-							<Avatar.Image src={avatar} alt={user.tenantName} />
 							<Avatar.Fallback class="rounded-lg">{initials}</Avatar.Fallback>
 						</Avatar.Root>
 						<div class="grid flex-1 text-start text-sm leading-tight">
@@ -53,7 +51,6 @@
 				<DropdownMenu.Label class="p-0 font-normal">
 					<div class="flex items-center gap-2 px-1 py-1.5 text-start text-sm">
 						<Avatar.Root class="size-8 rounded-lg">
-							<Avatar.Image src={avatar} alt={user.tenantName} />
 							<Avatar.Fallback class="rounded-lg">{initials}</Avatar.Fallback>
 						</Avatar.Root>
 						<div class="grid flex-1 text-start text-sm leading-tight">
@@ -63,25 +60,17 @@
 					</div>
 				</DropdownMenu.Label>
 				<DropdownMenu.Separator />
+				<!-- **Upgrade to Pro / Account / Billing / Notifications used to sit here, all inert.**
+				     There is no billing in this product and no notifications; "Account" was the only one
+				     that could have meant something, and what it would have meant is this link. -->
 				<DropdownMenu.Group>
 					<DropdownMenu.Item>
-						<SparklesIcon />
-						Upgrade to Pro
-					</DropdownMenu.Item>
-				</DropdownMenu.Group>
-				<DropdownMenu.Separator />
-				<DropdownMenu.Group>
-					<DropdownMenu.Item>
-						<BadgeCheckIcon />
-						Account
-					</DropdownMenu.Item>
-					<DropdownMenu.Item>
-						<CreditCardIcon />
-						Billing
-					</DropdownMenu.Item>
-					<DropdownMenu.Item>
-						<BellIcon />
-						Notifications
+						{#snippet child({ props })}
+							<a href="/settings/password" {...props}>
+								<KeyRoundIcon />
+								Change password
+							</a>
+						{/snippet}
 					</DropdownMenu.Item>
 				</DropdownMenu.Group>
 				<DropdownMenu.Separator />

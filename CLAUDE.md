@@ -489,6 +489,10 @@ Each of these exists in, or nearly slipped into, this codebase.
 | `ORDER BY created_at` when the SELECT has `created_at::text AS created_at` | Qualify it: `ORDER BY documents.created_at` | Postgres resolves a **bare** name in ORDER BY against the *output* list first, so the alias wins and the sort runs on the text rendering. Measured on 5k rows: `Seq Scan` + `Sort Key: ((created_at)::text)` at cost 371, versus an index scan with **no sort node** at cost 0.29 once qualified. The 0016 index exists for this one query and the bare form never touches it. It reads like a correctness bug too — the keyset `WHERE` compares `timestamptz` — but is not: `timestamptz` normalises to UTC and renders in one session zone, so text order agrees with chronological order. The bug is the plan, not the result |
 | Paginate a polled list with `LIMIT/OFFSET` | Keyset on `(created_at, id)` | A row inserted between two polls shifts every later row by one, so the reader sees a row twice or skips one — and neither is an error. The `id` half is not optional either: `created_at` defaults to `transaction_timestamp()`, so same-transaction rows are byte-identical, and a cursor without a tiebreaker loses exactly the rows on a boundary. Verified by deleting the tiebreaker: **5 of 9 documents vanished** and the listing still looked fine |
 | Build the cursor query string by concatenation | `URLSearchParams` / `encodeURIComponent` | The cursor carries `+00`, and a bare `+` in a query string decodes to a **space** — corrupting the offset, not merely the separator. It fails only at a page boundary, never on page one, which is where anyone would look |
+| Ship a nav item, plan or menu entry for a page that does not exist | Delete it, or build the page | A tenant who clicks Billing and finds nothing learns the UI does not mean what it says — and then every *true* claim has to earn belief separately. The sidebar carried Design Engineering / Sales & Marketing / Travel / Team / Billing for phases; none of it lost data, which is exactly why it survived |
+| Link every prefix when deriving a breadcrumb from the URL | Only paths in `LINKABLE` | `/settings/password` exists, `/settings` does not — so the obvious loop puts a guaranteed 404 inside the one component whose whole job is orientation |
+| Render a paginated count as a total | `formatCount(n, partial)` → `200+` | `GET /documents` returns no `total` on purpose (a count is the full scan pagination replaced), so a bare `200` for a 5,000-document tenant is a number that quietly means "the first page" — plausible, and wrong |
+| Count all API keys to decide the widget is set up | Count `kind === 'publishable'` only | Every tenant gets an `sk_` at registration, so counting all keys marks the step done for everyone on day one, forever — and an `sk_` cannot drive the widget |
 | Deploy `web/` without `ORIGIN` | Set it, or set both `PROTOCOL_HEADER` and `HOST_HEADER` | adapter-node infers the origin from the connection, so behind TLS termination the app sees `http://` while the browser sends `https://`. That mismatch fails SvelteKit's CSRF check **and** both hand-rolled `Origin` guards — every form post, upload and playground question 403s, with nothing in any log naming the cause. `env.ts` now refuses to boot without it |
 | Read a required env var lazily and call it validated | Check it at startup (`assertRuntimeEnv`) | A lazily-read `API_BASE_URL` let the process **start, bind, pass a TCP healthcheck, and then 500 every page**. An orchestrator calls that healthy. A process that refuses to start is a deploy that visibly fails |
 | Set `ASK_TIMEOUT_MS` below the API's `STREAM_DEADLINE` | Keep it strictly above (330s vs 300s) | The API's ceiling is *graceful* — it ends the stream with `done` and persists what arrived. The BFF's just aborts the fetch. If the BFF fires first the user loses the answer **and** the turn, which is the exact outcome `STREAM_DEADLINE` was designed to avoid. Two codebases, no compiler between them |
@@ -639,6 +643,8 @@ the code.
 | Web BFF hinge — session cookie → `GET /auth/me` → `locals` | `web/src/hooks.server.ts` |
 | Startup config validation — why `ORIGIN` is refused-at-boot rather than discovered from a 403 | `web/src/lib/server/env.ts` (`assertRuntimeEnv`) |
 | The web image: bun builds, node runs, and only `build/` ships | `web/Dockerfile` |
+| The go-live checklist, and why it counts only publishable keys and never states a total | `web/src/lib/features/dashboard/readiness.ts` |
+| Route → breadcrumb, and the prefix that must not be linked | `web/src/lib/utils/breadcrumb.ts` |
 | Typed API client: `ApiResult`, the JSON-vs-`text/plain` split, timeouts | `web/src/lib/server/api/` |
 | The SSE proxy: why the JSON client cannot carry a stream, and the ceiling that replaces its 10s | `web/src/lib/server/api/stream.ts` |
 | Session + one-time-key cookies; `requireUser` vs `requireSession` | `web/src/lib/server/auth/` |
@@ -828,6 +834,21 @@ superset — everything known, whether or not it blocks.
   redemption query — but the table only grows). And **delivery has no automated test**: the harness
   points `SMTP_URL` at a dead port on purpose, so the mail path is covered by a manual Mailpit drill
   recorded in the phase doc, while the suite covers redemption, revocation and the non-oracle.
+- **The dashboard only claims what exists now (phase 18).** The sidebar advertised Billing, Team and
+  three shadcn sample sections; the tenant switcher listed *Acme Inc* / *Evil Corp.* on fictional
+  plans above the tenant's real name; the avatar was a photograph of a real person; the breadcrumb
+  read *Build Your Application / Data Fetching* everywhere; and `/dashboard` — where onboarding lands
+  every signup — was one line reading `dashboard tenant`.
+  All of it is gone or real. `/dashboard` is now a **readiness checklist** (is a document indexed, is
+  there a `pk_`, have you tried it) built from `GET /documents` and `GET /auth/keys`, `/` is a
+  landing page whose every claim maps to documented behaviour, and there is a root `+error.svelte`.
+  **Two things in it are load-bearing rather than cosmetic.** It counts only `publishable` keys —
+  every tenant has an `sk_` from registration, so counting all of them would mark the step done for
+  everyone forever. And it renders `200+` rather than `200` when there are more pages, because the
+  API returns no `total` by design and a bare number would quietly mean "the first page".
+  Residues: the dashboard's `load` is not tested, only its pure readiness logic — the first time the
+  repo's "pure functions only" line has hidden something worth testing. And `web/` still sets **no
+  security response headers**, so the `sk_` reveal page is framable by any origin.
 - **`web/` is deployable now (phase 17), and `.env.example` exists.** The web app had no deployment
   path at all: the root `Dockerfile` built only the Rust binaries, compose had no `web` service, and
   `package.json` had no `start` script, so `bun run build` produced an artifact nothing ever ran.

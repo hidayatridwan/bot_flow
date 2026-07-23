@@ -22,12 +22,11 @@
 | 5 | ~~`GET /documents` unpaginated; `/auth/keys` unmetered; `/ask/stream` unbounded~~ | ~~high~~ | **CLOSED** — [phase 15](feature/phase-15-bounded-reads.md) |
 | 6 | ~~No account recovery — a forgotten password is unrecoverable, and no email is ever sent~~ | ~~blocking~~ | **CLOSED** — [phase 16](feature/phase-16-account-recovery.md) |
 | 7 | ~~`web/` has no deployment path, and 403s everything behind TLS as configured~~ | ~~blocking~~ | **CLOSED** — [phase 17](feature/phase-17-web-deployment.md) |
-| 8 | **The dashboard advertises features that do not exist**, and has no error page | high | not designed |
+| 8 | ~~The dashboard advertises features that do not exist, and has no error page~~ | ~~high~~ | **CLOSED** — [phase 18](feature/phase-18-honest-dashboard.md) |
 
-**Blockers 1–7 are closed**, by phases 11–17. **Blocker 8 is what is left** — the dashboard
-advertising features that do not exist — and it is the only one on this list that has never lost
-data, hidden a failure, or stopped anyone deploying. It is a credibility problem, not a correctness
-one.
+**Every blocker on this list is now closed**, by phases 11–18. What remains is in *Not blockers*
+below, in the standing deployment gaps under *Verdict*, and in CLAUDE.md's *Known state & debt* —
+which is the superset this document filters.
 
 Re-verified 2026-07-20 after phase 15: `GET /documents` bounds every caller — including one sending
 no parameters — and pages by keyset cursor; `POST /auth/keys` returns 429 past its own bucket's
@@ -37,18 +36,24 @@ discarding the answer. There is still **no** endpoint exposing `documents.error`
 Re-verified after phase 17: `web/Dockerfile` exists and its image boots, refuses to start without
 `ORIGIN`, runs as non-root and carries no `node_modules`; `docker compose --profile full up -d web`
 serves the app and a no-JS form post through it reaches the API and Mailpit; and
-`docker compose config --services` still omits `web` without the profile. What remains true from the
-original audit: `hooks.server.ts` sets **no** response headers, and
-`web/src/routes/(authenticated)/dashboard/+page.svelte` is one line containing the text
-`dashboard tenant`.
+`docker compose config --services` still omits `web` without the profile.
+
+Re-verified after phase 18, in a browser against a live stack: the dashboard renders a real
+readiness checklist driven by document and key counts, `/` is a real landing page, a 404 renders a
+styled error page, breadcrumbs name the route you are on, and a grep of the rendered shell finds
+none of *Design Engineering*, *Evil Corp*, *Acme Inc*, *Upgrade to Pro*, *Billing*, *Notifications*,
+*Data Fetching* or `shadcn.jpg` — with **no `href="#"` anywhere in the authenticated shell**. What
+remains true from the original audit: `hooks.server.ts` sets **no** response headers.
 
 ## Verdict
 
-**The API is in good shape. The product is not, and the gap is `web/`.**
+**Every blocker this document raised is closed. What is left is deployment, not code — and this
+time that claim has actually been checked on both halves.**
 
-An earlier version of this section said every blocker was closed and the rest was "a deployment
-question". That was true of the Rust half and wrong about the system, because the web tier had never
-been examined. Correcting it is the point of this revision.
+An earlier version of this section said exactly that sentence when it was only true of the Rust
+half, because the web tier had never been examined. The 2026-07-20 audit found three blockers there,
+two of them worse than anything left on the API side. They are now closed too, so the sentence has
+been re-earned rather than repeated.
 
 Phases 11–15 closed the API blockers: erasure that can be proved, instruments that move, backups
 that have actually been restored, a failure a tenant can act on, and no unbounded read, unmetered
@@ -62,10 +67,10 @@ rather than a query param (invariant 22), an API outage renders an alert rather 
 library, and both JSON endpoints hand-roll an `Origin` check because SvelteKit's CSRF guard never
 sees a JSON POST. Cookies are `httpOnly`, `secure: !dev`, `sameSite: 'lax'`.
 
-**What is left is blocker 8 alone**: the dashboard advertises features that do not exist. A fresh
-signup lands on a page reading `dashboard tenant`, is offered a Billing link that goes nowhere, and
-gets unstyled framework chrome on any 404. None of that loses data or stops a deploy — it costs
-trust, which is why it is filed high rather than blocking.
+Phase 18 finished the job on the front: a fresh signup now lands on a readiness checklist built from
+its own documents and keys instead of a page reading `dashboard tenant`, `/` is a real landing page,
+a 404 renders something with a way back, and nothing in the shell links anywhere that does not
+exist.
 
 Standing deployment gaps, unchanged and still not code blockers:
 
@@ -78,10 +83,13 @@ Standing deployment gaps, unchanged and still not code blockers:
   but **never `build`**, so a build-breaking change ships green.
 - **`app_user` ships the dev password** from migration 0005 unless the role is pre-created.
 
-A design-partner or internal pilot is well served today, and self-serve signup is no longer blocked
-by anything on this list. Before opening it to strangers, the four deployment gaps above still want
-doing — **especially the alerts**, since nothing here pages a human — and blocker 8 is worth an hour
-so the product does not promise what it cannot deliver.
+A design-partner or internal pilot is well served today, and **self-serve signup is no longer
+blocked by anything on this list**. Before opening it to strangers, the four gaps above still want
+doing — **especially the alerts**, since nothing here pages a human, and the missing security
+response headers, since the app is now genuinely deployable and still framable by any origin.
+
+Neither of those is a code blocker, which is precisely why they are easy to carry into production
+unnoticed. That is the failure mode this whole document exists to name.
 
 The distinction is not polish. Most of what goes wrong in this system goes wrong *quietly* — a
 plausible answer, a silent refusal, a partially re-indexed collection. That is the specific reason
@@ -302,50 +310,48 @@ could persist the partial answer — defeating that design one layer up. Now 330
 `ASK_TIMEOUT_MS` > `STREAM_DEADLINE` ordering is a cross-codebase invariant with nothing enforcing
 it; and there is no filesystem hardening beyond `USER node`.
 
-### 8. The dashboard advertises features that do not exist
+### 8. ~~The dashboard advertises features that do not exist~~ — CLOSED (phase 18)
 
-The sidebar is still the shadcn sample, and `app-sidebar.svelte:14-17` admits it: *"Part sample
-data… the teams, the Config group and every remaining `#` are mocked — nothing backs them."* What a
-paying signup actually sees:
+**Closed on its stated condition:** the mock nav is gone, `/dashboard` and `/` have real content, a
+root `+error.svelte` exists, and `mapKeyError` handles 429.
 
-- ~~A **Settings** submenu — General, **Team**, **Billing**, Limits — every one `url: '#'`.~~
-  **Fixed in phase 16**, because that phase gave Settings a page that actually exists: the submenu
-  is now one real entry, *Password*. Leaving a fake Billing link beside a working one would have
-  been worse than the original four.
-- A **tenant switcher** offering *Acme Inc*, *Acme Corp.* and **Evil Corp.** on plans
-  *Enterprise/Startup/Free* (`:22-38`), rendered above the user's real tenant.
-- **Upgrade to Pro**, **Account**, **Billing**, **Notifications** in the user menu, all inert
-  (`nav-user.svelte:67-85`). Only **Log out** works. Still true after phase 16.
-- A breadcrumb reading *Build Your Application / Data Fetching* with `href="##"`, on every
-  authenticated page (`(authenticated)/+layout.svelte:27-31`).
+What a paying signup used to see, and what replaced it:
 
-Then the destinations. **`/dashboard` — where onboarding sends every new user — is one line
-containing the text `dashboard tenant`.** The marketing root `/` is an unstyled `<h1>` and two bare
-links, which is what a cold self-serve visitor lands on.
+| Was | Now |
+| --- | --- |
+| A tenant switcher offering *Acme Inc*, *Acme Corp.* and **Evil Corp.** on Enterprise/Startup/Free plans | The tenant's real name and slug. A *switcher* was structurally wrong, not merely unpopulated — `accounts` has `unique index idx_accounts_tenant`, so there is nothing to switch to, ever |
+| A **Config** group — Design Engineering, Sales & Marketing, Travel — all `url: '#'` | Deleted, with its per-item dropdown and "More" row |
+| **Upgrade to Pro**, **Account**, **Billing**, **Notifications** in the user menu, all inert | One real entry: *Change password* |
+| `/avatars/shadcn.jpg` as every tenant's avatar | Initials from the signed-in email. It was a photograph of a real person |
+| Breadcrumb reading *Build Your Application / Data Fetching*, `href="##"`, on every page | Derived from the route, so a new page gets a correct breadcrumb by existing |
+| `/dashboard` — one line reading `dashboard tenant` | A readiness checklist: is a document indexed, is there a publishable key, have you tried it |
+| `/` — an unstyled `<h1>` and two bare links | A landing page whose every claim maps to real behaviour |
+| The `(auth)` shell branded **"Acme Inc."** | BotFlow |
+| No `+error.svelte` anywhere | A styled 404/5xx page with a way back |
 
-**There is no `+error.svelte` at any level**, so a 404, a 500, or any thrown `error()` renders
-SvelteKit's default black-on-white chrome: a status code, no styling, no navigation, no way back.
+**The dashboard is the part that could have gone wrong quietly.** The temptation is a wall of
+charts; the risk is inventing numbers. Two things keep it honest. It answers one question — *will my
+bot answer right now?* — because that is what someone has on the day they sign up. And it never
+states a total it cannot know: `GET /documents` returns **no `total`** by design (a count is the
+full scan keyset pagination replaced), so the counts cover one page and render as `200+` when there
+are more, rather than as a number that quietly means "the first 200".
 
-Finally one real inconsistency rather than a cosmetic one: `keys/error-map.ts:9-17` has **no 429
-branch**, so now that phase 15 meters key minting, hitting the limit shows *"Something went wrong.
-Please try again"* — advice that invites the retry that keeps them limited. `RATE_LIMITED` copy
-already exists in three sibling maps.
+**One inconsistency was real rather than cosmetic**, and it is fixed: `mapKeyError` had no 429
+branch, so once phase 15 metered key minting, hitting the limit showed *"Something went wrong.
+Please try again"* — advice that invites exactly the retry that keeps the caller limited.
 
-This is filed as high rather than blocking because nothing here loses data or leaks anything. It is
-filed at all because **offering Billing to someone who just entered a credit-card-free signup, and
-landing them on the word `dashboard tenant`, does more damage to trust than a missing feature does.**
-Deleting the mock nav is honest and takes minutes; building it is a product decision.
-
-*Closes when:* the mock nav is removed or built, `/dashboard` and `/` have real content, a root
-`+error.svelte` exists, and `mapKeyError` handles 429.
+**What is deliberately still open:** the app sets no security response headers, so the
+`/onboarding/api-key` page — which renders a live `sk_` — is framable by any origin. It is listed
+below rather than here because it is not what this blocker was about, but it is now the most
+worthwhile small thing left in `web/`.
 
 ## Not blockers, but do them before you forget
 
-- **No `.env.example`**, though `.gitignore` expects one. Pure friction for the next contributor.
 - **`app_user`'s password is hardcoded** as `'app_user'` in migration `0005`, and is only set on
   first creation — so a production deployment ships the dev password unless the role is pre-created
   out of band. Not exploitable from outside the network, but it is a credential in a tracked file.
-- **CI is report-only** — no branch protection, so a red run does not stop a merge.
+- **CI is report-only** — no branch protection, so a red run does not stop a merge. (It *does* now
+  run `bun run build`, added in phase 17.)
 - **The migration driver is exercised by hand**, not by a test.
 - **The `uploaded` document status is unreachable** — no code path assigns it. A trap for the next
   reader.
@@ -363,19 +369,15 @@ From the `web/` audit — none of these blocks, all are small:
   `delete`/`revoke`/`updateOrigins` actions skip validation while `isUuid` exists two files away. The
   blast radius is bounded — the caller is authenticated and the API authorises per tenant — but it is
   an unnecessary primitive and inconsistent with the discipline everywhere else.
-- **Env numbers are parsed with bare `Number()`** (`env.ts:33,35,53`), so `SESSION_TTL_SECS=30d`
-  silently becomes `NaN` and then a malformed cookie `maxAge`. Fails quietly, which is this system's
-  characteristic failure mode.
-- **`dependencies` is empty — everything is a devDependency.** It works because the bundle inlines
-  what it needs, but `bun install --production` yields a broken tree, which will matter the moment
-  blocker 7 gets a Dockerfile.
 - **Session expiry is a message, not a flow.** `ask.ts` and `upload.ts` render "Your session has
   expired. Please log in again" and then do nothing — no redirect, no re-login prompt. Navigation
   *is* handled correctly (`guard.ts` redirects with `redirectTo`); it is only the fetch surfaces.
-- **Five pages have no `<title>`** — including `/`, `/login`, `/signup` and `/dashboard`.
-- **No component, route or E2E tests.** All 18 web test files are pure unit tests, which is a
+- **No component, route or E2E tests.** All 21 web test files are pure unit tests, which is a
   deliberate and defensible line (`vite.config.ts` says so: the UI is shadcn primitives we do not
-  own) — but it means no test exercises a `load`, a form action, or a rendered page.
+  own) — but it means no test exercises a `load`, a form action, or a rendered page. Felt concretely
+  in phase 18: the dashboard's readiness *logic* is unit-tested and was verified red-first, while
+  the `load` that feeds it — including the `kind === 'publishable'` filter, which decides whether a
+  tenant is told their bot is live — is covered only by a manual browser check.
 
 ## The one to be most careful about
 
@@ -404,9 +406,14 @@ The `web/` blockers are claims about absence, which is the kind that rots quietl
 does not make this document wrong loudly. Each is a one-line check:
 
 ```bash
-grep -rn "url: '#'" web/src/lib/components/app-sidebar.svelte  # blocker 8: 3 left (the Config group)
-grep -n "Billing" web/src/lib/components/nav-user.svelte       # blocker 8: an inert menu item
-find web/src -name "+error.svelte"                             # blocker 8: expect no output
+# Phase 18 inverted these: what used to prove the mock nav existed now proves it is gone.
+grep -rn "url: '#'" web/src/lib/components/           # expect no output
+grep -rn "shadcn.jpg\|Evil Corp\|Data Fetching" web/src/   # expect no output
+find web/src -name "+error.svelte"                    # expect one
 ```
+
+The last one is the shape to be most careful with. These are claims about **absence**, and absence
+rots quietly — a mock item reappearing does not make this document wrong loudly, it just makes it
+wrong.
 
 and read CLAUDE.md's *Known state & debt*, which is the superset this document filters.

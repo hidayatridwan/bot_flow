@@ -23,6 +23,8 @@
 	}
 </script>
 
+<svelte:head><title>Your API key</title></svelte:head>
+
 <div class="mx-auto flex w-full max-w-xl flex-col gap-6 py-10">
 	<Card.Root>
 		<Card.Header>

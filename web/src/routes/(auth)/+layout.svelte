@@ -2,7 +2,7 @@
 	import '../layout.css';
 	import { resolve } from '$app/paths';
 	import favicon from '$lib/assets/favicon.svg';
-	import GalleryVerticalEndIcon from '@lucide/svelte/icons/gallery-vertical-end';
+	import BotMessageSquareIcon from '@lucide/svelte/icons/bot-message-square';
 
 	let { children } = $props();
 </script>
@@ -14,9 +14,9 @@
 			<div
 				class="bg-primary text-primary-foreground flex size-6 items-center justify-center rounded-md"
 			>
-				<GalleryVerticalEndIcon class="size-4" />
+				<BotMessageSquareIcon class="size-4" />
 			</div>
-			Acme Inc.
+			BotFlow
 		</a>
 		{@render children()}
 	</div>

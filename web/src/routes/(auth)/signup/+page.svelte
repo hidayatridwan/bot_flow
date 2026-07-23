@@ -5,4 +5,6 @@
 	let { data }: { data: PageData } = $props();
 </script>
 
+<svelte:head><title>Create your workspace</title></svelte:head>
+
 <SignupForm data={data.form} />

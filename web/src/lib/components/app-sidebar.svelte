@@ -1,41 +1,25 @@
 <script lang="ts" module>
-	import AudioWaveformIcon from '@lucide/svelte/icons/audio-waveform';
 	import BotMessageSquareIcon from '@lucide/svelte/icons/bot-message-square';
-	import ChartPieIcon from '@lucide/svelte/icons/chart-pie';
-	import CommandIcon from '@lucide/svelte/icons/command';
 	import FileTextIcon from '@lucide/svelte/icons/file-text';
-	import FrameIcon from '@lucide/svelte/icons/frame';
-	import GalleryVerticalEndIcon from '@lucide/svelte/icons/gallery-vertical-end';
 	import KeyRoundIcon from '@lucide/svelte/icons/key-round';
 	import LayoutDashboardIcon from '@lucide/svelte/icons/layout-dashboard';
-	import MapIcon from '@lucide/svelte/icons/map';
 	import Settings2Icon from '@lucide/svelte/icons/settings-2';
 
-	// Part sample data. `user` comes from the session (see the `user` prop below). Documents, API keys
-	// and Playground are real routes backed by the API; Dashboard is a real route that is still a
-	// one-line stub. The teams, the Config group and every remaining `#` are mocked — nothing backs
-	// them.
+	// **Every entry here is a route that exists.** That is the rule, and it is worth stating because
+	// this file used to break it in three ways at once: a "Config" group of shadcn sample items
+	// (Design Engineering / Sales & Marketing / Travel) pointing at `#`, a Settings submenu offering
+	// **Team** and **Billing** to a product that has neither, and a tenant switcher listing three
+	// fictional companies on three fictional plans.
 	//
-	// All three groups share one item shape (`title`/`url`/`icon`, optional `items`), because they
-	// all render through NavGroup. An item WITHOUT `items` is a leaf: a plain link, no chevron.
+	// None of it lost data or leaked anything, which is exactly why it survived so long. It cost
+	// something harder to see: a tenant who clicks Billing and finds nothing learns that this UI does
+	// not mean what it says, and after that the parts that *are* true have to earn belief separately.
+	//
+	// A short honest menu beats a long aspirational one. Add an entry when its page lands, not before.
+	//
+	// Both groups share one item shape (`title`/`url`/`icon`, optional `items`), because they render
+	// through NavGroup. An item WITHOUT `items` is a leaf: a plain link, no chevron.
 	const data = {
-		teams: [
-			{
-				name: 'Acme Inc',
-				logo: GalleryVerticalEndIcon,
-				plan: 'Enterprise'
-			},
-			{
-				name: 'Acme Corp.',
-				logo: AudioWaveformIcon,
-				plan: 'Startup'
-			},
-			{
-				name: 'Evil Corp.',
-				logo: CommandIcon,
-				plan: 'Free'
-			}
-		],
 		navOverview: [
 			{
 				title: 'Dashboard',
@@ -63,33 +47,12 @@
 				title: 'Settings',
 				url: '/settings/password',
 				icon: Settings2Icon,
-				// One real entry, not four mock ones. General/Team/Billing/Limits used to sit here
-				// pointing at '#', which advertised billing and team management to a signup that has
-				// neither — a worse failure than an obviously short menu, because it is only
-				// discovered after someone clicks. Add entries here when the pages exist.
 				items: [
 					{
 						title: 'Password',
 						url: '/settings/password'
 					}
 				]
-			}
-		],
-		navConfig: [
-			{
-				title: 'Design Engineering',
-				url: '#',
-				icon: FrameIcon
-			},
-			{
-				title: 'Sales & Marketing',
-				url: '#',
-				icon: ChartPieIcon
-			},
-			{
-				title: 'Travel',
-				url: '#',
-				icon: MapIcon
 			}
 		]
 	};
@@ -98,14 +61,8 @@
 <script lang="ts">
 	import NavGroup from './nav-group.svelte';
 	import NavUser from './nav-user.svelte';
-	import TeamSwitcher from './team-switcher.svelte';
-	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
+	import TenantBadge from './tenant-badge.svelte';
 	import * as Sidebar from '$lib/components/ui/sidebar/index.js';
-	import { useSidebar } from '$lib/components/ui/sidebar/context.svelte.js';
-	import EllipsisIcon from '@lucide/svelte/icons/ellipsis';
-	import FolderIcon from '@lucide/svelte/icons/folder';
-	import ForwardIcon from '@lucide/svelte/icons/forward';
-	import Trash2Icon from '@lucide/svelte/icons/trash-2';
 	import type { SessionUser } from '$lib/types/auth';
 	import type { ComponentProps } from 'svelte';
 
@@ -115,62 +72,15 @@
 		user,
 		...restProps
 	}: ComponentProps<typeof Sidebar.Root> & { user: SessionUser } = $props();
-
-	const sidebar = useSidebar();
 </script>
 
 <Sidebar.Root bind:ref {collapsible} {...restProps}>
 	<Sidebar.Header>
-		<TeamSwitcher teams={data.teams} />
+		<TenantBadge {user} />
 	</Sidebar.Header>
 	<Sidebar.Content>
 		<NavGroup label="Overview" items={data.navOverview} />
 		<NavGroup label="Core" items={data.navCore} />
-
-		<!-- Config is the one group with per-item actions and a trailing row. They live here, as
-		     snippets, rather than as flags on NavGroup — no other caller wants them. -->
-		<NavGroup label="Config" items={data.navConfig} hideWhenCollapsed>
-			{#snippet itemAction()}
-				<DropdownMenu.Root>
-					<DropdownMenu.Trigger>
-						{#snippet child({ props })}
-							<Sidebar.MenuAction showOnHover {...props}>
-								<EllipsisIcon />
-								<span class="sr-only">More</span>
-							</Sidebar.MenuAction>
-						{/snippet}
-					</DropdownMenu.Trigger>
-					<DropdownMenu.Content
-						class="w-48 rounded-lg"
-						side={sidebar.isMobile ? 'bottom' : 'right'}
-						align={sidebar.isMobile ? 'end' : 'start'}
-					>
-						<DropdownMenu.Item>
-							<FolderIcon class="text-muted-foreground" />
-							<span>View Project</span>
-						</DropdownMenu.Item>
-						<DropdownMenu.Item>
-							<ForwardIcon class="text-muted-foreground" />
-							<span>Share Project</span>
-						</DropdownMenu.Item>
-						<DropdownMenu.Separator />
-						<DropdownMenu.Item>
-							<Trash2Icon class="text-muted-foreground" />
-							<span>Delete Project</span>
-						</DropdownMenu.Item>
-					</DropdownMenu.Content>
-				</DropdownMenu.Root>
-			{/snippet}
-
-			{#snippet footer()}
-				<Sidebar.MenuItem>
-					<Sidebar.MenuButton class="text-sidebar-foreground/70">
-						<EllipsisIcon class="text-sidebar-foreground/70" />
-						<span>More</span>
-					</Sidebar.MenuButton>
-				</Sidebar.MenuItem>
-			{/snippet}
-		</NavGroup>
 	</Sidebar.Content>
 	<Sidebar.Footer>
 		<NavUser {user} />

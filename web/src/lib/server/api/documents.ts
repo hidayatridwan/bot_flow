@@ -61,15 +61,28 @@ export interface UploadUrlResponse {
  * Omitting both parameters is a valid call and returns a bounded first page; the API defaults the
  * size rather than returning everything.
  */
-export const listDocuments = (client: ApiClient, page: { before?: string | null } = {}) => {
+export const listDocuments = (
+	client: ApiClient,
+	page: { before?: string | null; limit?: number } = {}
+) => {
 	// URLSearchParams because the cursor carries `+` (the UTC offset) and `:` — and a raw `+` in a
 	// query string decodes to a space, which would corrupt the timestamp rather than merely look
 	// untidy. Hand-concatenating this is the bug that does not show up until a page boundary.
 	const qs = new URLSearchParams();
 	if (page.before) qs.set('before', page.before);
+	if (page.limit !== undefined) qs.set('limit', String(page.limit));
 	const suffix = qs.size > 0 ? `?${qs}` : '';
 	return client.get<ListDocumentsResponse>(`/documents${suffix}`);
 };
+
+/**
+ * The largest page the API will serve (`MAX_PAGE_LIMIT`, `handlers.rs`).
+ *
+ * Exported because the dashboard counts statuses over a single page and has to say so honestly when
+ * there are more — the API deliberately returns no `total`, since a count is the full table scan
+ * pagination exists to avoid.
+ */
+export const MAX_PAGE_LIMIT = 200;
 
 export const createUploadUrl = (client: ApiClient, body: UploadUrlBody) =>
 	client.post<UploadUrlResponse>('/documents/upload-url', body);
